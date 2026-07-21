@@ -28,6 +28,7 @@ void warm_up(Transformer *t) {
      *   - allocate scratch / device buffers
      *   - upload weights to the GPU
      * TODO(candidate). */
+     
     (void)t;
 }
 
