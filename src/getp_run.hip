@@ -440,7 +440,8 @@ static void gpu_forward_token(int host_token, const int *device_token,
             g.scores, g.qabs, g.qrope, layer_cache, NH, kv_len, KVD, KVL, QKR,
             c.softmax_scale);
         HIP_LAUNCH_CHECK();
-        softmax_rows_kernel<<<NH, HIP_BLOCK, 0, g.stream>>>(g.scores, NH, kv_len, kv_len);
+        softmax_rows_kernel<<<(NH + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
+                               HIP_BLOCK, 0, g.stream>>>(g.scores, NH, kv_len, kv_len);
         HIP_LAUNCH_CHECK();
         latent_context_kernel<<<(qabs_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
                                 HIP_BLOCK, 0, g.stream>>>(

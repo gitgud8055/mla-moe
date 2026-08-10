@@ -13,4 +13,10 @@ __device__ __forceinline__ float wave_sum(float value) {
     return value;
 }
 
+__device__ __forceinline__ float wave_max(float value) {
+    for (int offset = HIP_WAVE / 2; offset > 0; offset >>= 1)
+        value = fmaxf(value, __shfl_down(value, offset, HIP_WAVE));
+    return value;
+}
+
 #endif

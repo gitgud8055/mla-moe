@@ -23,34 +23,33 @@ __global__ void rope_copy_kernel(const float *src, float *dst, int heads,
 }
 
 __global__ void softmax_rows_kernel(float *x, int rows, int n, int stride) {
-    __shared__ float scratch[HIP_BLOCK];
-    int row = (int)blockIdx.x;
+    int wave = (int)threadIdx.x / HIP_WAVE;
+    int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    int row = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
     if (row >= rows) return;
+
     float *xr = x + (size_t)row * stride;
+
     float mx = -INFINITY;
-    for (int i = (int)threadIdx.x; i < n; i += HIP_BLOCK) mx = fmaxf(mx, xr[i]);
-    scratch[threadIdx.x] = mx;
-    __syncthreads();
-    for (int s = HIP_BLOCK / 2; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) scratch[threadIdx.x] = fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + s]);
-        __syncthreads();
+    for (int i = lane; i < n; i += HIP_WAVE) {
+        mx = fmaxf(mx, xr[i]);
     }
-    mx = scratch[0];
+    mx = wave_max(mx);
+    mx = __shfl(mx, 0, HIP_WAVE);
+
     float sum = 0.0f;
-    for (int i = (int)threadIdx.x; i < n; i += HIP_BLOCK) {
+    for (int i = lane; i < n; i += HIP_WAVE) {
         float v = xr[i];
         v = (v == -INFINITY) ? 0.0f : expf(v - mx);
         xr[i] = v;
         sum += v;
     }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = HIP_BLOCK / 2; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
-        __syncthreads();
+    sum = wave_sum(sum);
+    float inv = 1.0f / __shfl(sum, 0, HIP_WAVE);
+
+    for (int i = lane; i < n; i += HIP_WAVE) {
+        xr[i] *= inv;
     }
-    float inv = 1.0f / scratch[0];
-    for (int i = (int)threadIdx.x; i < n; i += HIP_BLOCK) xr[i] *= inv;
 }
 
 /* q_absorbed[h,r] = sum_d q_nope[h,d] * W_UK[h,d,r]. */
