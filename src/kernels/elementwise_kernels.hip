@@ -16,16 +16,22 @@ __global__ void embedding_kernel(float *x, const bf16_t *table, int host_token,
 
 __global__ void rmsnorm_kernel(float *y, const float *x, const bf16_t *w,
                                int n, float eps) {
-    __shared__ float scratch[HIP_BLOCK];
+    __shared__ float scratch[HIP_ROWS_PER_BLOCK];
     float ss = 0.0f;
     for (int i = (int)threadIdx.x; i < n; i += HIP_BLOCK) ss += x[i] * x[i];
-    scratch[threadIdx.x] = ss;
+    
+    ss = wave_sum(ss);
+    if (threadIdx.x % HIP_WAVE == 0) scratch[threadIdx.x / HIP_WAVE] = ss;
     __syncthreads();
-    for (int stride = HIP_BLOCK / 2; stride > 0; stride >>= 1) {
-        if ((int)threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-        __syncthreads();
+    
+    if (threadIdx.x == 0) {
+        float total_ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < HIP_ROWS_PER_BLOCK; ++i) {
+            total_ss += scratch[i];
+        }
+        scratch[0] = 1.0f / sqrtf(total_ss / (float)n + eps);
     }
-    if (threadIdx.x == 0) scratch[0] = 1.0f / sqrtf(scratch[0] / (float)n + eps);
     __syncthreads();
     float inv = scratch[0];
     for (int i = (int)threadIdx.x; i < n; i += HIP_BLOCK)
