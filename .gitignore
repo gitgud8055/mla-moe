@@ -22,3 +22,7 @@ __pycache__/
 venv/
 
 output.txt
+workloads/run/MI210/
+data/
+
+src/getp_eval.c
