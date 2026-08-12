@@ -1,5 +1,0 @@
-jobs:
-- pmc:
-  - SQ_WAVES_RESTORED
-  - SQ_WAVES_SAVED
-  - SQ_WAVE_CYCLES
