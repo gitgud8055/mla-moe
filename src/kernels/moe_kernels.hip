@@ -176,6 +176,164 @@ __global__ void router_topk_wave64_kernel(
     }
 }
 
+__global__ void moe_token_sort_kernel(const int *topk, int n_tokens, int k,
+                                      int *expert_counts) {
+    int token = (int)blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= n_tokens) return;
+    
+    for (int slot = 0; slot < k; ++slot) {
+        int expert = topk[token * k + slot];
+        atomicAdd(&expert_counts[expert], 1);
+    }
+}
+
+__global__ void expert_prefix_sum_kernel(int *offsets, const int *counts, int n) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int sum = 0;
+        for (int i = 0; i < n; ++i) {
+            offsets[i] = sum;
+            sum += counts[i];
+        }
+    }
+}
+
+__global__ void moe_token_scatter_kernel(const int *topk, int n_tokens, int k,
+                                         int *expert_offsets, int *sorted_tokens, int *sorted_experts, int *sorted_slots) {
+    int token = (int)blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= n_tokens) return;
+    
+    for (int slot = 0; slot < k; ++slot) {
+        int expert = topk[token * k + slot];
+        int pos = atomicAdd(&expert_offsets[expert], 1);
+        sorted_tokens[pos] = token;
+        sorted_experts[pos] = expert;
+        sorted_slots[pos] = slot;
+    }
+}
+
+__global__ void batched_sorted_routed_gate_up_kernel(
+    float *routed_hidden, const float *x, const char *pool,
+    const size_t *gate_offsets, const size_t *up_offsets,
+    const int *sorted_tokens, const int *sorted_experts, const int *sorted_slots,
+    int total_items, int k, int inter, int input_dim) {
+    
+    int wave = (int)threadIdx.x / HIP_WAVE;
+    int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    int j = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
+    int item = (int)blockIdx.y;
+    
+    if (j >= inter || item >= total_items) return;
+    
+    int expert = sorted_experts[item];
+    int token = sorted_tokens[item];
+    int slot = sorted_slots[item];
+    
+    const bf16_t *gate = reinterpret_cast<const bf16_t *>(pool + gate_offsets[expert]);
+    const bf16_t *up = reinterpret_cast<const bf16_t *>(pool + up_offsets[expert]);
+    
+    float *dst = routed_hidden + ((size_t)token * k + slot) * inter;
+    
+    const bf16_t *gr = gate + (size_t)j * input_dim;
+    const bf16_t *ur = up + (size_t)j * input_dim;
+    const float *xb = x + (size_t)token * input_dim;
+    
+    float gs = 0.0f, us = 0.0f;
+    for (int i = lane; i < input_dim; i += HIP_WAVE) {
+        float xv = xb[i];
+        gs += xv * gpu_bf16_to_f32(gr[i]);
+        us += xv * gpu_bf16_to_f32(ur[i]);
+    }
+    gs = wave_sum(gs);
+    us = wave_sum(us);
+    if (lane == 0) dst[j] = (gs / (1.0f + expf(-gs))) * us;
+}
+
+__global__ void batched_sorted_routed_down_kernel(
+    float *out, const float *routed_hidden, const char *pool,
+    const size_t *down_offsets, const int *sorted_tokens, const int *sorted_experts, const int *sorted_slots,
+    const float *topk_weights, int total_items, int k, int hidden_dim, int inter) {
+    
+    int wave = (int)threadIdx.x / HIP_WAVE;
+    int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    int d = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
+    int item = (int)blockIdx.y;
+    
+    if (d >= hidden_dim || item >= total_items) return;
+    
+    int expert = sorted_experts[item];
+    int token = sorted_tokens[item];
+    int slot = sorted_slots[item];
+    float weight = topk_weights[token * k + slot];
+    
+    const bf16_t *down = reinterpret_cast<const bf16_t *>(pool + down_offsets[expert]);
+    const float *hp = routed_hidden + ((size_t)token * k + slot) * inter;
+    const bf16_t *wr = down + (size_t)d * inter;
+    
+    float sum = 0.0f;
+    for (int j = lane; j < inter; j += HIP_WAVE) {
+        sum += hp[j] * gpu_bf16_to_f32(wr[j]);
+    }
+    sum = wave_sum(sum);
+    
+    if (lane == 0) {
+        float val = sum * weight;
+        atomicAdd(&out[token * hidden_dim + d], val);
+    }
+}
+
+__global__ void batched_shared_gate_up_kernel(
+    float *shared_hidden, const float *x,
+    const bf16_t *shared_gate, const bf16_t *shared_up,
+    int n_tokens, int shared_inter, int input_dim) {
+    
+    int wave = (int)threadIdx.x / HIP_WAVE;
+    int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    int j = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
+    int token = (int)blockIdx.y;
+    
+    if (j >= shared_inter || token >= n_tokens) return;
+    
+    float *dst = shared_hidden + (size_t)token * shared_inter;
+    const bf16_t *gr = shared_gate + (size_t)j * input_dim;
+    const bf16_t *ur = shared_up + (size_t)j * input_dim;
+    const float *xb = x + (size_t)token * input_dim;
+    
+    float gs = 0.0f, us = 0.0f;
+    for (int i = lane; i < input_dim; i += HIP_WAVE) {
+        float xv = xb[i];
+        gs += xv * gpu_bf16_to_f32(gr[i]);
+        us += xv * gpu_bf16_to_f32(ur[i]);
+    }
+    gs = wave_sum(gs);
+    us = wave_sum(us);
+    if (lane == 0) dst[j] = (gs / (1.0f + expf(-gs))) * us;
+}
+
+__global__ void batched_shared_down_kernel(
+    float *out, const float *shared_hidden,
+    const bf16_t *shared_down, int n_tokens, int hidden_dim, int shared_inter) {
+    
+    int wave = (int)threadIdx.x / HIP_WAVE;
+    int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    int d = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
+    int token = (int)blockIdx.y;
+    
+    if (d >= hidden_dim || token >= n_tokens) return;
+    
+    const float *hp = shared_hidden + (size_t)token * shared_inter;
+    const bf16_t *wr = shared_down + (size_t)d * shared_inter;
+    
+    float sum = 0.0f;
+    for (int j = lane; j < shared_inter; j += HIP_WAVE) {
+        sum += hp[j] * gpu_bf16_to_f32(wr[j]);
+    }
+    sum = wave_sum(sum);
+    
+    if (lane == 0) {
+        atomicAdd(&out[token * hidden_dim + d], sum);
+    }
+}
+
 __global__ void decode_routed_shared_gate_up_kernel(
     float *routed_hidden, float *shared_hidden, const float *x,
     const char *pool, const size_t *gate_offsets, const size_t *up_offsets,

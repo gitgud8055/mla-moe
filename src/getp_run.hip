@@ -101,6 +101,11 @@ struct GpuContext {
     float *prefill_ffn = nullptr;
     float *prefill_router = nullptr, *prefill_topk_weights = nullptr;
     float *prefill_hb = nullptr, *routed_hidden = nullptr;
+    
+    int *prefill_expert_offsets = nullptr;
+    int *prefill_sorted_tokens = nullptr;
+    int *prefill_sorted_experts = nullptr;
+    int *prefill_sorted_slots = nullptr;
     int prefill_capacity = 0;
 };
 
@@ -361,13 +366,18 @@ static void ensure_prefill_capacity(int required) {
     device_free(g.prefill_ffn);
     device_free(g.prefill_router); device_free(g.prefill_topk_weights);
     device_free(g.prefill_hb); device_free(g.routed_hidden);
+    
+    device_free(g.prefill_expert_offsets);
+    device_free(g.prefill_sorted_tokens);
+    device_free(g.prefill_sorted_experts);
+    device_free(g.prefill_sorted_slots);
 
     int H = c.hidden_size;
     int QHD = c.qk_nope_head_dim + c.qk_rope_head_dim;
     int QD = c.n_heads * QHD;
     int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
-    int shared = c.n_shared_experts * c.moe_inter_size;
-    int inter = std::max(c.dense_inter_size, std::max(shared, c.moe_inter_size));
+    int shared_inter = c.n_shared_experts * c.moe_inter_size;
+    int inter = std::max(c.dense_inter_size, std::max(shared_inter, c.moe_inter_size));
     int experts = std::max(1, c.n_routed_experts);
     int top_k = std::max(1, c.n_experts_per_tok);
     device_alloc(&g.prompt_tokens, cap);
@@ -391,6 +401,12 @@ static void ensure_prefill_capacity(int required) {
     device_alloc(&g.prefill_topk_weights, (size_t)cap * std::max(1, c.n_experts_per_tok));
     device_alloc(&g.prefill_expert_counts, experts);
     device_alloc(&g.prefill_expert_buckets, (size_t)experts * cap);
+    
+    device_alloc(&g.prefill_expert_offsets, experts);
+    device_alloc(&g.prefill_sorted_tokens, (size_t)cap * top_k);
+    device_alloc(&g.prefill_sorted_experts, (size_t)cap * top_k);
+    device_alloc(&g.prefill_sorted_slots, (size_t)cap * top_k);
+    
     device_alloc(&g.prefill_hb, (size_t)cap * inter);
     device_alloc(&g.routed_hidden,
                  (size_t)cap * std::max(1, c.n_experts_per_tok) * std::max(1, c.moe_inter_size));
@@ -430,6 +446,75 @@ static void gpu_ffn(const Config &c, const DeviceLayer &d, int l) {
             K, H, inter, shared);
     HIP_LAUNCH_CHECK();
 }
+
+static void batched_gpu_ffn(const Config &c, const DeviceLayer &d, int l, int n_prompt) {
+    const int H = c.hidden_size;
+    
+    // Clear expert counts to 0
+    HIP_CHECK(hipMemsetAsync(g.prefill_expert_counts, 0, c.n_routed_experts * sizeof(int), g.stream));
+    HIP_CHECK(hipMemsetAsync(g.prefill_expert_offsets, 0, c.n_routed_experts * sizeof(int), g.stream));
+    
+    int E = c.n_routed_experts;
+    int K = c.n_experts_per_tok;
+    int inter = c.moe_inter_size;
+    int shared = c.n_shared_experts * inter;
+    
+    dim3 grid_router((E + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+    batched_gemv_kernel<<<grid_router, HIP_BLOCK, 0, g.stream>>>(
+        g.prefill_router, g.prefill_xn, d.moe_gate, E, H, 0);
+    HIP_LAUNCH_CHECK();
+    
+    router_topk_wave64_kernel<<<n_prompt, HIP_BLOCK, 0, g.stream>>>(
+        g.prefill_router, d.moe_bias, g.prefill_topk, g.prefill_topk_weights,
+        n_prompt, E, K, c.router_sigmoid, c.norm_topk, c.routed_scaling);
+    HIP_LAUNCH_CHECK();
+    
+    int total_items = n_prompt * K;
+    int blocks_items = (n_prompt + HIP_BLOCK - 1) / HIP_BLOCK;
+    
+    moe_token_sort_kernel<<<blocks_items, HIP_BLOCK, 0, g.stream>>>(
+        g.prefill_topk, n_prompt, K, g.prefill_expert_counts);
+    HIP_LAUNCH_CHECK();
+    
+    expert_prefix_sum_kernel<<<1, 1, 0, g.stream>>>(
+        g.prefill_expert_offsets, g.prefill_expert_counts, E);
+    HIP_LAUNCH_CHECK();
+    
+    moe_token_scatter_kernel<<<blocks_items, HIP_BLOCK, 0, g.stream>>>(
+        g.prefill_topk, n_prompt, K, g.prefill_expert_offsets,
+        g.prefill_sorted_tokens, g.prefill_sorted_experts, g.prefill_sorted_slots);
+    HIP_LAUNCH_CHECK();
+    
+    dim3 grid_gate_up((inter + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, total_items);
+    batched_sorted_routed_gate_up_kernel<<<grid_gate_up, HIP_BLOCK, 0, g.stream>>>(
+        g.routed_hidden, g.prefill_xn, d.pool,
+        d.expert_gate_offsets, d.expert_up_offsets,
+        g.prefill_sorted_tokens, g.prefill_sorted_experts, g.prefill_sorted_slots,
+        total_items, K, inter, H);
+    HIP_LAUNCH_CHECK();
+    
+    dim3 grid_down((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, total_items);
+    batched_sorted_routed_down_kernel<<<grid_down, HIP_BLOCK, 0, g.stream>>>(
+        g.prefill_x, g.routed_hidden, d.pool,
+        d.expert_down_offsets, g.prefill_sorted_tokens, g.prefill_sorted_experts, g.prefill_sorted_slots,
+        g.prefill_topk_weights, total_items, K, H, inter);
+    HIP_LAUNCH_CHECK();
+    
+    if (shared > 0) {
+        dim3 shared_gate_up((shared + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+        batched_shared_gate_up_kernel<<<shared_gate_up, HIP_BLOCK, 0, g.stream>>>(
+            g.prefill_hb, g.prefill_xn, d.shared_gate, d.shared_up,
+            n_prompt, shared, H);
+        HIP_LAUNCH_CHECK();
+        
+        dim3 shared_down((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+        batched_shared_down_kernel<<<shared_down, HIP_BLOCK, 0, g.stream>>>(
+            g.prefill_x, g.prefill_hb, d.shared_down,
+            n_prompt, H, shared);
+        HIP_LAUNCH_CHECK();
+    }
+}
+
 
 static void gpu_forward_absorbed(int host_token, const int *device_token,
                               int *generated, int output_index,
@@ -619,25 +704,26 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
         HIP_LAUNCH_CHECK();
         // =====================================================================
 
-        // Fallback loop for O projection and MoE
+        // O-Projection and RMSNorm (can be looped since these are fast memory-bound ops)
         for(int r = 0; r < n_prompt; ++r) {
             launch_gemv(g.prefill_x + (size_t)r * H, g.prefill_ctx + (size_t)r * NH * VHD, d.o_proj, H, NH * VHD, true);
             launch_rmsnorm(g.prefill_xn + (size_t)r * H, g.prefill_x + (size_t)r * H, d.post_norm, H, c.rms_eps);
+        }
+        
+        // FFN / Batched MoE
+        if (l < c.first_k_dense) {
+            int inter = c.dense_inter_size;
+            dim3 grid_dense_gate_up((inter + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+            batched_gate_up_swiglu_kernel<<<grid_dense_gate_up, HIP_BLOCK, 0, g.stream>>>(
+                g.prefill_hb, g.prefill_xn, d.dense_gate, d.dense_up, inter, H);
+            HIP_LAUNCH_CHECK();
             
-            // FFN and MoE
-            if (l < c.first_k_dense) {
-                int inter = c.dense_inter_size;
-                launch_gate_up_swiglu(g.prefill_hb + (size_t)r * inter, g.prefill_xn + (size_t)r * H, d.dense_gate, d.dense_up, inter, H);
-                launch_gemv(g.prefill_x + (size_t)r * H, g.prefill_hb + (size_t)r * inter, d.dense_down, H, inter, true);
-            } else {
-                // MoE fallback: copy to single-token buffers and run unbatched MoE
-                HIP_CHECK(hipMemcpyAsync(g.x, g.prefill_x + (size_t)r * H, H * sizeof(float), hipMemcpyDeviceToDevice, g.stream));
-                HIP_CHECK(hipMemcpyAsync(g.xn, g.prefill_xn + (size_t)r * H, H * sizeof(float), hipMemcpyDeviceToDevice, g.stream));
-                
-                gpu_ffn(c, d, l); // Computes MoE from g.xn to g.x
-                
-                HIP_CHECK(hipMemcpyAsync(g.prefill_x + (size_t)r * H, g.x, H * sizeof(float), hipMemcpyDeviceToDevice, g.stream));
-            }
+            dim3 grid_dense_down((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+            batched_gemv_kernel<<<grid_dense_down, HIP_BLOCK, 0, g.stream>>>(
+                g.prefill_x, g.prefill_hb, d.dense_down, H, inter, 1);
+            HIP_LAUNCH_CHECK();
+        } else {
+            batched_gpu_ffn(c, d, l, n_prompt);
         }
     }
     
@@ -808,6 +894,8 @@ extern "C" void finish(Transformer *t) {
     device_free(g.kv_cache); device_free(g.next_token); device_free(g.generated);
     device_free(g.prompt_tokens); device_free(g.prefill_topk);
     device_free(g.prefill_expert_counts); device_free(g.prefill_expert_buckets);
+    device_free(g.prefill_expert_offsets); device_free(g.prefill_sorted_tokens);
+    device_free(g.prefill_sorted_experts); device_free(g.prefill_sorted_slots);
     device_free(g.prefill_x); device_free(g.prefill_xn);
     device_free(g.prefill_q); device_free(g.prefill_q_a); device_free(g.prefill_comp);
     device_free(g.prefill_qrope); device_free(g.prefill_knope); device_free(g.prefill_value);
