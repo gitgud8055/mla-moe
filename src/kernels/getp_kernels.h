@@ -87,4 +87,10 @@ extern __global__ void kv_norm_rope_rows_kernel(
     float *cache, const float *comp, const bf16_t *norm,
     int rows, int kv_rank, int kv_dim, int rope_dim, int position_base,
     const float *inv_freq, int interleaved, float eps);
+
+extern __global__ void fused_prefill_mla_kernel(
+    float *out_clat, const float *qabs, const float *qrope,
+    const float *kv_cache,
+    int rows, int heads, int KVL, int QKR, int KVD, float scale);
+
 #endif
