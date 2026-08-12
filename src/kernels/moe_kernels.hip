@@ -1,13 +1,17 @@
 #include "getp_kernels.h"
 #include "getp_kernels_device.h"
 
+namespace moe_kernels {
+
+template <int THREADS>
 __global__ void expert_gate_up_swiglu_kernel(
     float *y, const float *x, const char *pool,
     const size_t *gate_offsets, const size_t *up_offsets,
     const int *topk, int slot, int d_out, int n_in) {
+    static_assert(THREADS % HIP_WAVE == 0);
     int wave = (int)threadIdx.x / HIP_WAVE;
     int lane = (int)threadIdx.x & (HIP_WAVE - 1);
-    int row = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
+    int row = (int)blockIdx.x * (THREADS / HIP_WAVE) + wave;
     if (row >= d_out) return;
     int expert = topk[slot];
     const bf16_t *gate = reinterpret_cast<const bf16_t *>(pool + gate_offsets[expert]);
@@ -25,12 +29,14 @@ __global__ void expert_gate_up_swiglu_kernel(
     if (lane == 0) y[row] = (gs / (1.0f + expf(-gs))) * us;
 }
 
+template <int THREADS>
 __global__ void expert_down_accum_kernel(
     float *dst, const float *x, const char *pool, const size_t *down_offsets,
     const int *topk, const float *weights, int slot, int d_out, int n_in) {
+    static_assert(THREADS % HIP_WAVE == 0);
     int wave = (int)threadIdx.x / HIP_WAVE;
     int lane = (int)threadIdx.x & (HIP_WAVE - 1);
-    int row = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
+    int row = (int)blockIdx.x * (THREADS / HIP_WAVE) + wave;
     if (row >= d_out) return;
     int expert = topk[slot];
     const bf16_t *w = reinterpret_cast<const bf16_t *>(pool + down_offsets[expert]);
@@ -41,11 +47,12 @@ __global__ void expert_down_accum_kernel(
     sum = wave_sum(sum);
     if (lane == 0) dst[row] += weights[slot] * sum;
 }
+template <int THREADS>
 __global__ void router_topk_kernel(float *scores, const float *bias,
                                    int *indices, float *weights,
                                    int rows, int experts, int k, int use_sigmoid,
                                    int norm_topk, float routed_scale) {
-    __shared__ float scratch[HIP_BLOCK];
+    __shared__ float scratch[THREADS];
     __shared__ int chosen[16];
     int row = (int)blockIdx.x;
     if (row >= rows) return;
@@ -53,36 +60,36 @@ __global__ void router_topk_kernel(float *scores, const float *bias,
     indices += (size_t)row * k;
     weights += (size_t)row * k;
     if (use_sigmoid) {
-        for (int e = (int)threadIdx.x; e < experts; e += HIP_BLOCK)
+        for (int e = (int)threadIdx.x; e < experts; e += THREADS)
             scores[e] = 1.0f / (1.0f + expf(-scores[e]));
         __syncthreads();
     } else {
         float mx = -INFINITY;
-        for (int e = (int)threadIdx.x; e < experts; e += HIP_BLOCK)
+        for (int e = (int)threadIdx.x; e < experts; e += THREADS)
             mx = fmaxf(mx, scores[e]);
         scratch[threadIdx.x] = mx;
         __syncthreads();
-        for (int stride = HIP_BLOCK / 2; stride > 0; stride >>= 1) {
+        for (int stride = THREADS / 2; stride > 0; stride >>= 1) {
             if ((int)threadIdx.x < stride)
                 scratch[threadIdx.x] = fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + stride]);
             __syncthreads();
         }
         mx = scratch[0];
         float sum = 0.0f;
-        for (int e = (int)threadIdx.x; e < experts; e += HIP_BLOCK) {
+        for (int e = (int)threadIdx.x; e < experts; e += THREADS) {
             float v = expf(scores[e] - mx);
             scores[e] = v;
             sum += v;
         }
         scratch[threadIdx.x] = sum;
         __syncthreads();
-        for (int stride = HIP_BLOCK / 2; stride > 0; stride >>= 1) {
+        for (int stride = THREADS / 2; stride > 0; stride >>= 1) {
             if ((int)threadIdx.x < stride)
                 scratch[threadIdx.x] += scratch[threadIdx.x + stride];
             __syncthreads();
         }
         float inv = 1.0f / scratch[0];
-        for (int e = (int)threadIdx.x; e < experts; e += HIP_BLOCK) scores[e] *= inv;
+        for (int e = (int)threadIdx.x; e < experts; e += THREADS) scores[e] *= inv;
         __syncthreads();
     }
 
@@ -113,11 +120,13 @@ __global__ void router_topk_kernel(float *scores, const float *bias,
     for (int slot = 0; slot < k; ++slot) weights[slot] *= routed_scale;
 }
 
+template <int THREADS>
 __global__ void router_topk_wave64_kernel(
     float *scores, const float *bias, int *indices, float *weights,
     int rows, int experts, int k, int use_sigmoid,
     int norm_topk, float routed_scale) {
     int row = (int)blockIdx.x;
+    static_assert(THREADS == HIP_WAVE);
     int lane = (int)threadIdx.x;
     if (row >= rows || lane >= HIP_WAVE) return;
     scores += (size_t)row * experts;
@@ -176,14 +185,16 @@ __global__ void router_topk_wave64_kernel(
     }
 }
 
+template <int THREADS>
 __global__ void decode_routed_shared_gate_up_kernel(
     float *routed_hidden, float *shared_hidden, const float *x,
     const char *pool, const size_t *gate_offsets, const size_t *up_offsets,
     const int *topk, const bf16_t *shared_gate, const bf16_t *shared_up,
     int top_k, int inter, int shared_inter, int input_dim) {
+    static_assert(THREADS % HIP_WAVE == 0);
     int wave = (int)threadIdx.x / HIP_WAVE;
     int lane = (int)threadIdx.x & (HIP_WAVE - 1);
-    int row = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
+    int row = (int)blockIdx.x * (THREADS / HIP_WAVE) + wave;
     int routed_rows = top_k * inter;
     int total = routed_rows + shared_inter;
     if (row >= total) return;
@@ -219,14 +230,16 @@ __global__ void decode_routed_shared_gate_up_kernel(
         dst[j] = (gs / (1.0f + expf(-gs))) * us;
 }
 
+template <int THREADS>
 __global__ void decode_routed_shared_down_kernel(
     float *out, const float *routed_hidden, const float *shared_hidden,
     const char *pool, const size_t *down_offsets, const int *topk,
     const float *topk_weights, const bf16_t *shared_down,
     int top_k, int hidden_dim, int inter, int shared_inter) {
+    static_assert(THREADS % HIP_WAVE == 0);
     int wave = (int)threadIdx.x / HIP_WAVE;
     int lane = (int)threadIdx.x & (HIP_WAVE - 1);
-    int d = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
+    int d = (int)blockIdx.x * (THREADS / HIP_WAVE) + wave;
     if (d >= hidden_dim) return;
     float total = 0.0f;
     for (int slot = 0; slot < top_k; ++slot) {
@@ -250,3 +263,23 @@ __global__ void decode_routed_shared_down_kernel(
         out[d] += ffn;
     }
 }
+
+}  // namespace moe_kernels
+
+template __global__ void moe_kernels::expert_gate_up_swiglu_kernel<kernel_tuning::GEMV_THREADS>(
+    float *, const float *, const char *, const size_t *, const size_t *,
+    const int *, int, int, int);
+template __global__ void moe_kernels::expert_down_accum_kernel<kernel_tuning::GEMV_THREADS>(
+    float *, const float *, const char *, const size_t *, const int *,
+    const float *, int, int, int);
+template __global__ void moe_kernels::router_topk_kernel<kernel_tuning::ROUTER_THREADS>(
+    float *, const float *, int *, float *, int, int, int, int, int, float);
+template __global__ void moe_kernels::router_topk_wave64_kernel<kernel_tuning::ROUTER_WAVE_THREADS>(
+    float *, const float *, int *, float *, int, int, int, int, int, float);
+template __global__ void moe_kernels::decode_routed_shared_gate_up_kernel<kernel_tuning::GEMV_THREADS>(
+    float *, float *, const float *, const char *, const size_t *,
+    const size_t *, const int *, const bf16_t *, const bf16_t *, int, int,
+    int, int);
+template __global__ void moe_kernels::decode_routed_shared_down_kernel<kernel_tuning::GEMV_THREADS>(
+    float *, const float *, const float *, const char *, const size_t *,
+    const int *, const float *, const bf16_t *, int, int, int, int);

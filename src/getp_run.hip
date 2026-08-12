@@ -234,8 +234,10 @@ static void enqueue_layer_copy(const LayerLayout &a, void *pool) {
 
 static void launch_gemv(float *y, const float *x, const bf16_t *w,
                         int out, int in, bool add = false) {
-    int blocks = (out + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK;
-    gemv_kernel<<<blocks, HIP_BLOCK, 0, g.stream>>>(
+    constexpr int rows_per_block = kernel_tuning::GEMV_THREADS / HIP_WAVE;
+    int blocks = (out + rows_per_block - 1) / rows_per_block;
+    projection_kernels::gemv_kernel<kernel_tuning::GEMV_THREADS><<<
+        blocks, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
         y, x, w, out, in, add ? 1 : 0);
     HIP_LAUNCH_CHECK();
 }
@@ -244,8 +246,10 @@ static void launch_gate_up_swiglu(float *y, const float *x,
                                   const bf16_t *gate, const bf16_t *up,
                                   int out, int in)
 {
-    int blocks = (out + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK;
-    gate_up_swiglu_kernel<<<blocks, HIP_BLOCK, 0, g.stream>>>(
+    constexpr int rows_per_block = kernel_tuning::GEMV_THREADS / HIP_WAVE;
+    int blocks = (out + rows_per_block - 1) / rows_per_block;
+    projection_kernels::gate_up_swiglu_kernel<kernel_tuning::GEMV_THREADS><<<
+        blocks, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
         y, x, gate, up, out, in);
     HIP_LAUNCH_CHECK();
 }
@@ -253,7 +257,8 @@ static void launch_gate_up_swiglu(float *y, const float *x,
 
 static void launch_rmsnorm(float *y, const float *x, const bf16_t *w, int n, float eps)
 {
-    rmsnorm_kernel<<<1, HIP_BLOCK, 0, g.stream>>>(y, x, w, n, eps);
+    elementwise_kernels::rmsnorm_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<
+        1, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(y, x, w, n, eps);
     HIP_LAUNCH_CHECK();
 }
 
@@ -262,7 +267,8 @@ static void launch_kv_norm_rope(float *cache, const float *comp,
                                 int kv_rank, int kv_dim, int rope_dim,
                                 int position_base, float eps) {
     const Config &c = g.owner->config;
-    kv_norm_rope_rows_kernel<<<rows, HIP_BLOCK, 0, g.stream>>>(
+    attention_kernels::kv_norm_rope_rows_kernel<kernel_tuning::ATTENTION_THREADS><<<
+        rows, kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
         cache, comp, norm, rows, kv_rank, kv_dim, rope_dim, position_base,
         g.rope_inv_freq, c.rope_interleaved, eps);
     HIP_LAUNCH_CHECK();
@@ -274,8 +280,10 @@ static void launch_dual_gemv(
     float *y1, const bf16_t *w1, int out1,
     const float *x, int in) {
     int total = out0 + out1;
-    int blocks = (total + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK;
-    dual_gemv_kernel<<<blocks, HIP_BLOCK, 0, g.stream>>>(
+    constexpr int rows_per_block = kernel_tuning::GEMV_THREADS / HIP_WAVE;
+    int blocks = (total + rows_per_block - 1) / rows_per_block;
+    projection_kernels::dual_gemv_kernel<kernel_tuning::GEMV_THREADS><<<
+        blocks, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
         y0, w0, out0, y1, w1, out1, x, in);
     HIP_LAUNCH_CHECK();
 }
@@ -285,11 +293,13 @@ static void launch_router_topk(float *scores, const float *bias,
                                int experts, int k, int use_sigmoid,
                                int norm_topk, float routed_scale) {
     if (experts <= HIP_WAVE) {
-        router_topk_wave64_kernel<<<rows, HIP_WAVE, 0, g.stream>>>(
+        moe_kernels::router_topk_wave64_kernel<kernel_tuning::ROUTER_WAVE_THREADS><<<
+            rows, kernel_tuning::ROUTER_WAVE_THREADS, 0, g.stream>>>(
             scores, bias, indices, weights, rows, experts, k, use_sigmoid,
             norm_topk, routed_scale);
     } else {
-        router_topk_kernel<<<rows, HIP_BLOCK, 0, g.stream>>>(
+        moe_kernels::router_topk_kernel<kernel_tuning::ROUTER_THREADS><<<
+            rows, kernel_tuning::ROUTER_THREADS, 0, g.stream>>>(
             scores, bias, indices, weights, rows, experts, k, use_sigmoid,
             norm_topk, routed_scale);
     }
@@ -357,16 +367,17 @@ static void gpu_ffn(const Config &c, const DeviceLayer &d, int l) {
                        c.routed_scaling);
     int shared = c.n_shared_experts * inter;
     int gate_up_rows = K * inter + shared;
-    decode_routed_shared_gate_up_kernel<<<
-        (gate_up_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-        HIP_BLOCK, 0, g.stream>>>(
+    constexpr int rows_per_block = kernel_tuning::GEMV_THREADS / HIP_WAVE;
+    moe_kernels::decode_routed_shared_gate_up_kernel<kernel_tuning::GEMV_THREADS><<<
+        (gate_up_rows + rows_per_block - 1) / rows_per_block,
+        kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             g.routed_hidden, g.hb, g.xn, d.pool,
             d.expert_gate_offsets, d.expert_up_offsets,
             g.topk, d.shared_gate, d.shared_up, K, inter, shared, H);
     HIP_LAUNCH_CHECK();
-    decode_routed_shared_down_kernel<<<
-        (H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-        HIP_BLOCK, 0, g.stream>>>(
+    moe_kernels::decode_routed_shared_down_kernel<kernel_tuning::GEMV_THREADS><<<
+        (H + rows_per_block - 1) / rows_per_block,
+        kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             g.x, g.routed_hidden, g.hb, d.pool,
             d.expert_down_offsets, g.topk, g.topk_weights, d.shared_down,
             K, H, inter, shared);
@@ -395,7 +406,10 @@ static void gpu_forward_absorbed(int host_token, const int *device_token,
         std::fprintf(stderr, "HIP inference: position %d exceeds KV capacity %d\n", pos, g.kv_capacity);
         std::exit(EXIT_FAILURE);
     }
-    embedding_kernel<<<(H + HIP_BLOCK - 1) / HIP_BLOCK, HIP_BLOCK, 0, g.stream>>>(
+    elementwise_kernels::embedding_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<
+        (H + kernel_tuning::ELEMENTWISE_THREADS - 1) /
+            kernel_tuning::ELEMENTWISE_THREADS,
+        kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
         g.x, g.embed, host_token, device_token, generated, output_index, H);
     HIP_LAUNCH_CHECK();
 
@@ -423,30 +437,36 @@ static void gpu_forward_absorbed(int host_token, const int *device_token,
                             1, KVL, KVD, QKR, pos, c.mla_norm_eps);
 
         int qabs_rows = NH * KVL;
-        q_absorb_rope_kernel<<<
-            (qabs_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-            HIP_BLOCK, 0, g.stream>>>(
+        attention_kernels::q_absorb_rope_kernel<kernel_tuning::ATTENTION_THREADS><<<
+            (qabs_rows + kernel_tuning::ATTENTION_THREADS / HIP_WAVE - 1) /
+                (kernel_tuning::ATTENTION_THREADS / HIP_WAVE),
+            kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
                 g.qabs, g.qrope, g.q, d.W_UK_T, NH, QHD, QKN, QKR,
                 KVL, pos, g.rope_inv_freq, c.rope_interleaved);
         HIP_LAUNCH_CHECK();
         int score_rows = NH * kv_len;
-        attention_score_kernel<<<
-            (score_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-            HIP_BLOCK, 0, g.stream>>>(
+        attention_kernels::attention_score_kernel<kernel_tuning::ATTENTION_THREADS><<<
+            (score_rows + kernel_tuning::ATTENTION_THREADS / HIP_WAVE - 1) /
+                (kernel_tuning::ATTENTION_THREADS / HIP_WAVE),
+            kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
                 g.scores, g.qabs, g.qrope, layer_cache,
                 NH, kv_len, KVD, KVL, QKR, c.softmax_scale);
         HIP_LAUNCH_CHECK();
-        softmax_rows_kernel<<<NH, HIP_BLOCK, 0, g.stream>>>(
+        attention_kernels::softmax_rows_kernel<kernel_tuning::ATTENTION_THREADS><<<
+            NH, kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
             g.scores, NH, kv_len, kv_len, 0);
         HIP_LAUNCH_CHECK();
-        latent_context_kernel<<<
-            (qabs_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-            HIP_BLOCK, 0, g.stream>>>(
+        attention_kernels::latent_context_kernel<kernel_tuning::ATTENTION_THREADS><<<
+            (qabs_rows + kernel_tuning::ATTENTION_THREADS / HIP_WAVE - 1) /
+                (kernel_tuning::ATTENTION_THREADS / HIP_WAVE),
+            kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
                 g.clat, g.scores, layer_cache, NH, kv_len, KVD, KVL);
         HIP_LAUNCH_CHECK();
         int value_rows = NH * VHD;
-        value_up_kernel<<<(value_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-                            HIP_BLOCK, 0, g.stream>>>(
+        attention_kernels::value_up_kernel<kernel_tuning::ATTENTION_THREADS><<<
+            (value_rows + kernel_tuning::ATTENTION_THREADS / HIP_WAVE - 1) /
+                (kernel_tuning::ATTENTION_THREADS / HIP_WAVE),
+            kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
             g.ctx, g.clat, d.W_UV, NH, VHD, KVL, head_stride);
         HIP_LAUNCH_CHECK();
         launch_gemv(g.x, g.ctx, d.o_proj, H, NH * VHD, true);
@@ -459,7 +479,9 @@ static void gpu_forward_absorbed(int host_token, const int *device_token,
         return;
     launch_rmsnorm(g.xn, g.x, g.final_norm, H, c.rms_eps);
     launch_gemv(g.logits, g.xn, g.lm_head, c.vocab_size, H);
-    argmax_kernel<<<1, HIP_BLOCK, 0, g.stream>>>(g.logits, c.vocab_size, g.next_token);
+    elementwise_kernels::argmax_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<
+        1, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+        g.logits, c.vocab_size, g.next_token);
     HIP_LAUNCH_CHECK();
 }
 
@@ -484,7 +506,11 @@ extern "C" void warm_up(Transformer *t) {
         std::fprintf(stderr, "HIP baseline requires wavefront-64, device reports %d\n", prop.warpSize);
         std::exit(EXIT_FAILURE);
     }
-    if (HIP_BLOCK > prop.maxThreadsPerBlock || c.v_head_dim <= 0 ||
+    if (kernel_tuning::GEMV_THREADS > prop.maxThreadsPerBlock ||
+        kernel_tuning::ELEMENTWISE_THREADS > prop.maxThreadsPerBlock ||
+        kernel_tuning::ATTENTION_THREADS > prop.maxThreadsPerBlock ||
+        kernel_tuning::ROUTER_THREADS > prop.maxThreadsPerBlock ||
+        c.v_head_dim <= 0 ||
         c.v_head_dim > prop.maxThreadsPerBlock ||
         c.qk_rope_head_dim <= 0 || (c.qk_rope_head_dim & 1) ||
         c.qk_rope_head_dim / 2 > prop.maxThreadsPerBlock) {
