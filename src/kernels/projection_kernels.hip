@@ -2,7 +2,7 @@
 #include "getp_kernels_device.h"
 
 __global__ void gemv_kernel(float *y, const float *x, const bf16_t *w,
-                            int d_out, int n_in) {
+                            int d_out, int n_in, int add) {
     int wave = (int)threadIdx.x / HIP_WAVE;
     int lane = (int)threadIdx.x & (HIP_WAVE - 1);
     int row = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
@@ -12,7 +12,30 @@ __global__ void gemv_kernel(float *y, const float *x, const bf16_t *w,
     for (int i = lane; i < n_in; i += HIP_WAVE)
         sum += x[i] * gpu_bf16_to_f32(wr[i]);
     sum = wave_sum(sum);
-    if (lane == 0) y[row] = sum;
+    if (lane == 0) {
+        if (add) y[row] += sum;
+        else y[row] = sum;
+    }
+}
+
+__global__ void dual_gemv_kernel(
+    float *y0, const bf16_t *w0, int d_out0,
+    float *y1, const bf16_t *w1, int d_out1,
+    const float *x, int n_in) {
+    int wave = (int)threadIdx.x / HIP_WAVE;
+    int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    int row = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
+    int total = d_out0 + d_out1;
+    if (row >= total) return;
+    float *y = row < d_out0 ? y0 : y1;
+    const bf16_t *w = row < d_out0 ? w0 : w1;
+    int local_row = row < d_out0 ? row : row - d_out0;
+    const bf16_t *wr = w + (size_t)local_row * n_in;
+    float sum = 0.0f;
+    for (int i = lane; i < n_in; i += HIP_WAVE)
+        sum += x[i] * gpu_bf16_to_f32(wr[i]);
+    sum = wave_sum(sum);
+    if (lane == 0) y[local_row] = sum;
 }
 
 __global__ void gate_up_swiglu_kernel(float *y, const float *x,

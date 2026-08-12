@@ -22,3 +22,5 @@ __pycache__/
 venv/
 
 output.txt
+workloads/run/MI210/
+data/
