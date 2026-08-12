@@ -9,99 +9,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cassert>
 #include <limits>
 #include <vector>
 
 #include "getp.h"
 #include "tokenizer.h"
 #include "kernels/getp_kernels.h"
+#include "kernels/getp_utils.h"
+#include "kernels/getp_state.h"
+#include "kernels/prefill.h"
 
-
-static void hip_fail(hipError_t status, const char *expr, const char *file, int line)
-{
-    if (status == hipSuccess)
-        return;
-    std::fprintf(stderr, "HIP failure at %s:%d: %s: %s\n", file, line, expr,
-                 hipGetErrorString(status));
-    std::exit(EXIT_FAILURE);
-}
-
-#define HIP_CHECK(expr) hip_fail((expr), #expr, __FILE__, __LINE__)
-#define HIP_LAUNCH_CHECK() HIP_CHECK(hipGetLastError())
-
-struct CopyChunk
-{
-    const void *host;
-    size_t offset;
-    size_t bytes;
-};
-
-static const size_t NO_OFFSET = std::numeric_limits<size_t>::max();
-
-struct LayerLayout {
-    size_t bytes = 0;
-    std::vector<CopyChunk> chunks;
-    size_t q_proj = NO_OFFSET, q_a_proj = NO_OFFSET, q_b_proj = NO_OFFSET;
-    size_t kv_a_proj = NO_OFFSET, kv_b_proj = NO_OFFSET, wuk_t = NO_OFFSET;
-    size_t o_proj = NO_OFFSET;
-    size_t input_norm = NO_OFFSET, post_norm = NO_OFFSET;
-    size_t q_a_norm = NO_OFFSET, kv_a_norm = NO_OFFSET;
-    size_t dense_gate = NO_OFFSET, dense_up = NO_OFFSET, dense_down = NO_OFFSET;
-    size_t moe_gate = NO_OFFSET, moe_bias = NO_OFFSET;
-    size_t shared_gate = NO_OFFSET, shared_up = NO_OFFSET, shared_down = NO_OFFSET;
-    std::vector<size_t> expert_gate, expert_up, expert_down;
-};
-
-struct DeviceLayer
-{
-    const char *pool = nullptr;
-    const bf16_t *q_proj = nullptr, *q_a_proj = nullptr, *q_b_proj = nullptr;
-    const bf16_t *kv_a_proj = nullptr, *W_UK = nullptr, *W_UV = nullptr;
-    const bf16_t *W_UK_T = nullptr;
-    const bf16_t *o_proj = nullptr;
-    const bf16_t *input_norm = nullptr, *post_norm = nullptr;
-    const bf16_t *q_a_norm = nullptr, *kv_a_norm = nullptr;
-    const bf16_t *dense_gate = nullptr, *dense_up = nullptr, *dense_down = nullptr;
-    const bf16_t *moe_gate = nullptr;
-    const float *moe_bias = nullptr;
-    const bf16_t *shared_gate = nullptr, *shared_up = nullptr, *shared_down = nullptr;
-    const size_t *expert_gate_offsets = nullptr;
-    const size_t *expert_up_offsets = nullptr;
-    const size_t *expert_down_offsets = nullptr;
-};
-
-struct GpuContext {
-    Transformer *owner = nullptr;
-    hipStream_t stream = nullptr;
-    bf16_t *embed = nullptr, *final_norm = nullptr, *lm_head = nullptr;
-    float *rope_inv_freq = nullptr;
-    std::vector<LayerLayout> layouts;
-    std::vector<std::vector<bf16_t>> host_wuk_t;
-    std::vector<DeviceLayer> layers;
-    std::vector<void *> layer_pools;
-    size_t *expert_offsets = nullptr;
-
-    float *x = nullptr, *xn = nullptr;
-    float *q = nullptr, *q_a = nullptr, *comp = nullptr;
-    float *qrope = nullptr, *qabs = nullptr, *scores = nullptr, *clat = nullptr;
-    float *ctx = nullptr, *hb = nullptr, *router = nullptr;
-    float *logits = nullptr, *kv_cache = nullptr;
-    int *topk = nullptr, *next_token = nullptr, *generated = nullptr;
-    float *topk_weights = nullptr;
-    int kv_capacity = 0;
-
-    /* Layer-major unabsorbed prefill workspace. */
-    int *prompt_tokens = nullptr, *prefill_topk = nullptr;
-    int *prefill_expert_counts = nullptr, *prefill_expert_buckets = nullptr;
-    float *prefill_x = nullptr, *prefill_xn = nullptr;
-    float *prefill_q = nullptr, *prefill_q_a = nullptr, *prefill_comp = nullptr;
-    float *prefill_qrope = nullptr, *prefill_knope = nullptr, *prefill_value = nullptr;
-    float *prefill_scores = nullptr, *prefill_ctx = nullptr;
-    float *prefill_ffn = nullptr;
-    float *prefill_router = nullptr, *prefill_topk_weights = nullptr;
-    float *prefill_hb = nullptr, *routed_hidden = nullptr;
-    int prefill_capacity = 0;
-};
 
 static GpuContext g;
 
@@ -306,49 +224,6 @@ static void launch_router_topk(float *scores, const float *bias,
     HIP_LAUNCH_CHECK();
 }
 
-static hipError_t try_allocate_sequence_buffers(const Config &c, int cap)
-{
-    const int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
-    hipError_t status = hipMalloc(reinterpret_cast<void **>(&g.kv_cache),
-                                  (size_t)c.n_layers * cap * KVD * sizeof(float));
-    if (status != hipSuccess)
-        return status;
-
-    status = hipMalloc(reinterpret_cast<void **>(&g.scores),
-                       (size_t)c.n_heads * cap * sizeof(float));
-    if (status != hipSuccess)
-    {
-        hipError_t cleanup = hipFree(g.kv_cache);
-        g.kv_cache = nullptr;
-        if (cleanup != hipSuccess)
-            return cleanup;
-    }
-    return status;
-}
-
-static void ensure_sequence_capacity(int required)
-{
-    const Config &c = g.owner->config;
-    if (required <= g.kv_capacity)
-        return;
-    int cap = std::max(1, g.kv_capacity);
-    while (cap < required && cap < c.max_seq_len)
-    {
-        long long doubled = (long long)cap * 2;
-        cap = (int)std::min<long long>(doubled, c.max_seq_len);
-    }
-    if (cap < required)
-        cap = required;
-    HIP_CHECK(hipStreamSynchronize(g.stream));
-    device_free(g.kv_cache);
-    device_free(g.scores);
-    g.kv_capacity = 0;
-
-    hipError_t status = try_allocate_sequence_buffers(c, cap);
-    HIP_CHECK(status);
-    g.kv_capacity = cap;
-}
-
 static void gpu_ffn(const Config &c, const DeviceLayer &d, int l) {
     const int H = c.hidden_size;
     if (l < c.first_k_dense) {
@@ -542,7 +417,6 @@ extern "C" void warm_up(Transformer *t) {
     }
     size_t global_bytes = ((size_t)2 * c.vocab_size * c.hidden_size + c.hidden_size) * sizeof(bf16_t)
                         + (size_t)(c.qk_rope_head_dim / 2) * sizeof(float);
-    int initial_cap = std::max(1, std::min(c.max_seq_len, 2048));
     size_t free_bytes = 0, total_bytes = 0;
     HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
 
@@ -595,6 +469,10 @@ extern "C" void warm_up(Transformer *t) {
     int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
     int shared = c.n_shared_experts * c.moe_inter_size;
     int inter = std::max(c.dense_inter_size, std::max(shared, c.moe_inter_size));
+
+    // prefill
+    device_alloc(&g.xs, constants::datasets::MAX_SEQ * c.hidden_size);
+
     device_alloc(&g.x, c.hidden_size);
     device_alloc(&g.xn, c.hidden_size);
     device_alloc(&g.q, (size_t)c.n_heads * QHD);
@@ -611,12 +489,24 @@ extern "C" void warm_up(Transformer *t) {
     device_alloc(&g.topk_weights, std::max(1, c.n_experts_per_tok));
     device_alloc(&g.logits, c.vocab_size);
     device_alloc(&g.next_token, 1);
-    device_alloc(&g.generated, c.max_seq_len);
-    g.kv_capacity = 0;
-    ensure_sequence_capacity(initial_cap);
+    device_alloc(&g.generated, constants::datasets::MAX_SEQ);
+
+    /* KV + attention scores for the full dataset bound, allocated once here.
+     * inference() never resizes; a position past this is caught by the
+     * pos >= g.kv_capacity check in gpu_forward_absorbed(). */
+    g.kv_capacity = std::max(1, std::min(c.max_seq_len,
+                                         (int)constants::datasets::MAX_SEQ));
+    device_alloc(&g.kv_cache, (size_t)c.n_layers * g.kv_capacity * KVD);
+    device_alloc(&g.scores, (size_t)c.n_heads * g.kv_capacity);
+
+    g.prompts.resize(constants::datasets::MAX_REQS);
+    for (std::vector<int> &p : g.prompts)
+        p.reserve(constants::datasets::MAX_N_PROMPT);
+    g.h_generated.resize(constants::datasets::MAX_SEQ);
+
     HIP_CHECK(hipStreamSynchronize(g.stream));
 
-    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident initial_kv=%d\n",
+    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv_cap=%d\n",
                  prop.name, (double)total_bytes / (double)(1ULL << 30),
                  (double)(global_bytes + layer_total) / (double)(1ULL << 30),
                  g.kv_capacity);
@@ -626,6 +516,10 @@ extern "C" void finish(Transformer *t) {
     (void)t;
     if (!g.owner) return;
     HIP_CHECK(hipStreamSynchronize(g.stream));
+
+    // prefill
+    device_free(g.xs);
+
     device_free(g.embed);
     device_free(g.final_norm);
     device_free(g.lm_head);
@@ -664,38 +558,43 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
         std::fprintf(stderr, "inference: model_dir has no tokenizer.json\n");
         std::exit(EXIT_FAILURE);
     }
-    const int max_seq = t->config.max_seq_len;
+    if ((size_t)reqs->num_reqs > constants::datasets::MAX_REQS)
+    {
+        std::fprintf(stderr, "inference: %d requests exceeds MAX_REQS %zu\n",
+                     reqs->num_reqs, constants::datasets::MAX_REQS);
+        std::exit(EXIT_FAILURE);
+    }
+    /* Buffers were all sized in warm_up() from constants::datasets, so nothing
+     * below allocates: prompts[] is MAX_REQS x MAX_N_PROMPT, h_generated is
+     * MAX_SEQ, and the KV cache is fixed at g.kv_capacity. */
+    const int prompt_cap = (int)constants::datasets::MAX_N_PROMPT;
     const int eos = tokenizer_eos_id(t->tokenizer);
-    std::vector<std::vector<int>> prompts((size_t)reqs->num_reqs);
-    int required_capacity = 1;
+    std::vector<std::vector<int>> &prompts = g.prompts;
+    std::vector<int> &generated = g.h_generated;
     for (int r = 0; r < reqs->num_reqs; ++r)
     {
-        prompts[r].resize(max_seq);
+        prompts[r].resize((size_t)prompt_cap);
         int n = tokenizer_encode(t->tokenizer, reqs->prompts[r], 0,
-                                 prompts[r].data(), max_seq);
+                                 prompts[r].data(), prompt_cap);
         if (n < 0)
             n = 0;
         prompts[r].resize((size_t)n);
-        int budget = max_seq - n;
-        int steps = std::min(reqs->max_steps, budget);
-        if (steps < 0)
-            steps = 0;
-        required_capacity = std::max(required_capacity, n + steps);
     }
-    ensure_sequence_capacity(required_capacity);
 
     long long total = 0;
-    std::vector<int> generated((size_t)std::max(0, reqs->max_steps));
     for (int r = 0; r < reqs->num_reqs; ++r)
     {
         reqs->out_lens[r] = 0;
         int n_prompt = (int)prompts[r].size();
         if (n_prompt < 1)
             continue;
-        int budget = max_seq - n_prompt;
+        /* Cap generation so prompt + decode stays within the KV cache. */
+        int budget = g.kv_capacity - n_prompt;
         int steps = std::min(reqs->max_steps, budget);
         if (steps < 0)
             steps = 0;
+
+        // prefill::run(g, prompts[r]);
 
         for (int p = 0; p < n_prompt; ++p)
             gpu_forward_absorbed(prompts[r][p], nullptr, nullptr, 0,
