@@ -20,3 +20,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+output.txt
+
+data
