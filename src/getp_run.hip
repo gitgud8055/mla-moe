@@ -96,10 +96,16 @@ struct GpuContext {
     float *prefill_x = nullptr, *prefill_xn = nullptr;
     float *prefill_q = nullptr, *prefill_q_a = nullptr, *prefill_comp = nullptr;
     float *prefill_qrope = nullptr, *prefill_knope = nullptr, *prefill_value = nullptr;
+    float *prefill_qabs = nullptr, *prefill_clat = nullptr;
     float *prefill_scores = nullptr, *prefill_ctx = nullptr;
     float *prefill_ffn = nullptr;
     float *prefill_router = nullptr, *prefill_topk_weights = nullptr;
     float *prefill_hb = nullptr, *routed_hidden = nullptr;
+    
+    int *prefill_expert_offsets = nullptr;
+    int *prefill_sorted_tokens = nullptr;
+    int *prefill_sorted_experts = nullptr;
+    int *prefill_sorted_slots = nullptr;
     int prefill_capacity = 0;
 };
 
@@ -339,6 +345,74 @@ static void ensure_sequence_capacity(int required)
     g.kv_capacity = cap;
 }
 
+static void ensure_prefill_capacity(int required) {
+    const Config &c = g.owner->config;
+    if (required <= g.prefill_capacity) return;
+    int cap = std::max(1, g.prefill_capacity);
+    while (cap < required && cap < c.max_seq_len) {
+        long long doubled = (long long)cap * 2;
+        cap = (int)std::min<long long>(doubled, c.max_seq_len);
+    }
+    if (cap < required) cap = required;
+    HIP_CHECK(hipStreamSynchronize(g.stream));
+
+    device_free(g.prompt_tokens); device_free(g.prefill_topk);
+    device_free(g.prefill_expert_counts); device_free(g.prefill_expert_buckets);
+    device_free(g.prefill_x); device_free(g.prefill_xn);
+    device_free(g.prefill_q); device_free(g.prefill_q_a); device_free(g.prefill_comp);
+    device_free(g.prefill_qrope); device_free(g.prefill_knope); device_free(g.prefill_value);
+    device_free(g.prefill_qabs); device_free(g.prefill_clat);
+    device_free(g.prefill_scores); device_free(g.prefill_ctx);
+    device_free(g.prefill_ffn);
+    device_free(g.prefill_router); device_free(g.prefill_topk_weights);
+    device_free(g.prefill_hb); device_free(g.routed_hidden);
+    
+    device_free(g.prefill_expert_offsets);
+    device_free(g.prefill_sorted_tokens);
+    device_free(g.prefill_sorted_experts);
+    device_free(g.prefill_sorted_slots);
+
+    int H = c.hidden_size;
+    int QHD = c.qk_nope_head_dim + c.qk_rope_head_dim;
+    int QD = c.n_heads * QHD;
+    int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
+    int shared_inter = c.n_shared_experts * c.moe_inter_size;
+    int inter = std::max(c.dense_inter_size, std::max(shared_inter, c.moe_inter_size));
+    int experts = std::max(1, c.n_routed_experts);
+    int top_k = std::max(1, c.n_experts_per_tok);
+    device_alloc(&g.prompt_tokens, cap);
+    device_alloc(&g.prefill_x, (size_t)cap * H);
+    device_alloc(&g.prefill_xn, (size_t)cap * H);
+    device_alloc(&g.prefill_q, (size_t)cap * QD);
+    device_alloc(&g.prefill_q_a, (size_t)cap * std::max(1, c.q_lora_rank));
+    device_alloc(&g.prefill_comp, (size_t)cap * KVD);
+    device_alloc(&g.prefill_qrope, (size_t)cap * c.n_heads * c.qk_rope_head_dim);
+    device_alloc(&g.prefill_qabs, (size_t)cap * c.n_heads * c.kv_lora_rank);
+    device_alloc(&g.prefill_clat, (size_t)cap * c.n_heads * c.kv_lora_rank);
+    device_alloc(&g.prefill_knope, (size_t)c.n_heads * cap * c.qk_nope_head_dim);
+    device_alloc(&g.prefill_value, (size_t)c.n_heads * cap * c.v_head_dim);
+    size_t attention_elems = (size_t)c.n_heads * cap * cap;
+    size_t slot_down_elems = (size_t)cap * top_k * H;
+    device_alloc(&g.prefill_scores, std::max(attention_elems, slot_down_elems));
+    device_alloc(&g.prefill_ctx, (size_t)cap * c.n_heads * c.v_head_dim);
+    device_alloc(&g.prefill_ffn, (size_t)cap * H);
+    device_alloc(&g.prefill_router, (size_t)cap * std::max(1, c.n_routed_experts));
+    device_alloc(&g.prefill_topk, (size_t)cap * std::max(1, c.n_experts_per_tok));
+    device_alloc(&g.prefill_topk_weights, (size_t)cap * std::max(1, c.n_experts_per_tok));
+    device_alloc(&g.prefill_expert_counts, experts);
+    device_alloc(&g.prefill_expert_buckets, (size_t)experts * cap);
+    
+    device_alloc(&g.prefill_expert_offsets, experts);
+    device_alloc(&g.prefill_sorted_tokens, (size_t)cap * top_k);
+    device_alloc(&g.prefill_sorted_experts, (size_t)cap * top_k);
+    device_alloc(&g.prefill_sorted_slots, (size_t)cap * top_k);
+    
+    device_alloc(&g.prefill_hb, (size_t)cap * inter);
+    device_alloc(&g.routed_hidden,
+                 (size_t)cap * std::max(1, c.n_experts_per_tok) * std::max(1, c.moe_inter_size));
+    g.prefill_capacity = cap;
+}
+
 static void gpu_ffn(const Config &c, const DeviceLayer &d, int l) {
     const int H = c.hidden_size;
     if (l < c.first_k_dense) {
@@ -372,6 +446,75 @@ static void gpu_ffn(const Config &c, const DeviceLayer &d, int l) {
             K, H, inter, shared);
     HIP_LAUNCH_CHECK();
 }
+
+static void batched_gpu_ffn(const Config &c, const DeviceLayer &d, int l, int n_prompt) {
+    const int H = c.hidden_size;
+    
+    // Clear expert counts to 0
+    HIP_CHECK(hipMemsetAsync(g.prefill_expert_counts, 0, c.n_routed_experts * sizeof(int), g.stream));
+    HIP_CHECK(hipMemsetAsync(g.prefill_expert_offsets, 0, c.n_routed_experts * sizeof(int), g.stream));
+    
+    int E = c.n_routed_experts;
+    int K = c.n_experts_per_tok;
+    int inter = c.moe_inter_size;
+    int shared = c.n_shared_experts * inter;
+    
+    dim3 grid_router((E + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+    batched_gemv_kernel<<<grid_router, HIP_BLOCK, 0, g.stream>>>(
+        g.prefill_router, g.prefill_xn, d.moe_gate, E, H, 0);
+    HIP_LAUNCH_CHECK();
+    
+    router_topk_wave64_kernel<<<n_prompt, HIP_BLOCK, 0, g.stream>>>(
+        g.prefill_router, d.moe_bias, g.prefill_topk, g.prefill_topk_weights,
+        n_prompt, E, K, c.router_sigmoid, c.norm_topk, c.routed_scaling);
+    HIP_LAUNCH_CHECK();
+    
+    int total_items = n_prompt * K;
+    int blocks_items = (n_prompt + HIP_BLOCK - 1) / HIP_BLOCK;
+    
+    moe_token_sort_kernel<<<blocks_items, HIP_BLOCK, 0, g.stream>>>(
+        g.prefill_topk, n_prompt, K, g.prefill_expert_counts);
+    HIP_LAUNCH_CHECK();
+    
+    expert_prefix_sum_kernel<<<1, 1, 0, g.stream>>>(
+        g.prefill_expert_offsets, g.prefill_expert_counts, E);
+    HIP_LAUNCH_CHECK();
+    
+    moe_token_scatter_kernel<<<blocks_items, HIP_BLOCK, 0, g.stream>>>(
+        g.prefill_topk, n_prompt, K, g.prefill_expert_offsets,
+        g.prefill_sorted_tokens, g.prefill_sorted_experts, g.prefill_sorted_slots);
+    HIP_LAUNCH_CHECK();
+    
+    dim3 grid_gate_up((inter + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, total_items);
+    batched_sorted_routed_gate_up_kernel<<<grid_gate_up, HIP_BLOCK, 0, g.stream>>>(
+        g.routed_hidden, g.prefill_xn, d.pool,
+        d.expert_gate_offsets, d.expert_up_offsets,
+        g.prefill_sorted_tokens, g.prefill_sorted_experts, g.prefill_sorted_slots,
+        total_items, K, inter, H);
+    HIP_LAUNCH_CHECK();
+    
+    dim3 grid_down((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, total_items);
+    batched_sorted_routed_down_kernel<<<grid_down, HIP_BLOCK, 0, g.stream>>>(
+        g.prefill_x, g.routed_hidden, d.pool,
+        d.expert_down_offsets, g.prefill_sorted_tokens, g.prefill_sorted_experts, g.prefill_sorted_slots,
+        g.prefill_topk_weights, total_items, K, H, inter);
+    HIP_LAUNCH_CHECK();
+    
+    if (shared > 0) {
+        dim3 shared_gate_up((shared + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+        batched_shared_gate_up_kernel<<<shared_gate_up, HIP_BLOCK, 0, g.stream>>>(
+            g.prefill_hb, g.prefill_xn, d.shared_gate, d.shared_up,
+            n_prompt, shared, H);
+        HIP_LAUNCH_CHECK();
+        
+        dim3 shared_down((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+        batched_shared_down_kernel<<<shared_down, HIP_BLOCK, 0, g.stream>>>(
+            g.prefill_x, g.prefill_hb, d.shared_down,
+            n_prompt, H, shared);
+        HIP_LAUNCH_CHECK();
+    }
+}
+
 
 static void gpu_forward_absorbed(int host_token, const int *device_token,
                               int *generated, int output_index,
@@ -461,6 +604,142 @@ static void gpu_forward_absorbed(int host_token, const int *device_token,
     launch_gemv(g.logits, g.xn, g.lm_head, c.vocab_size, H);
     argmax_kernel<<<1, HIP_BLOCK, 0, g.stream>>>(g.logits, c.vocab_size, g.next_token);
     HIP_LAUNCH_CHECK();
+}
+
+extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt,
+                                          double *nll_out, void *tf)
+{
+    // C-compatible wrapper for prefill logic using FlashAttention-2
+    if (!g.owner) return nullptr;
+    const Config &c = g.owner->config;
+    const int H = c.hidden_size;
+    const int NH = c.n_heads;
+    const int QKN = c.qk_nope_head_dim;
+    const int QKR = c.qk_rope_head_dim;
+    const int QHD = QKN + QKR;
+    const int QD = NH * QHD;
+    const int KVL = c.kv_lora_rank;
+    const int KVD = KVL + QKR;
+    const int VHD = c.v_head_dim;
+    const size_t head_stride = (size_t)(QKN + VHD) * KVL;
+
+    ensure_prefill_capacity(n_prompt);
+
+    HIP_CHECK(hipMemcpyAsync(g.prompt_tokens, tokens, (size_t)n_prompt * sizeof(int),
+                             hipMemcpyHostToDevice, g.stream));
+    
+    // Embed all tokens one by one (since embedding_kernel is hardcoded to 1 token)
+    for (int r = 0; r < n_prompt; ++r) {
+        embedding_kernel<<<(H + HIP_BLOCK - 1) / HIP_BLOCK,
+                           HIP_BLOCK, 0, g.stream>>>(
+            g.prefill_x + (size_t)r * H, g.embed, 0, g.prompt_tokens + r, nullptr, 0, H);
+    }
+    HIP_LAUNCH_CHECK();
+    
+    // Note: Since batched MoE kernels are missing in mla-moe, 
+    // we use a loop over rows for projections (fallback for incomplete mla-moe branch)
+    for (int l = 0; l < c.n_layers; ++l) {
+        const DeviceLayer &d = g.layers[l];
+        // Loop for RMSNorm and Q projections
+        for (int r = 0; r < n_prompt; ++r) {
+            launch_rmsnorm(g.prefill_xn + (size_t)r * H, g.prefill_x + (size_t)r * H, d.input_norm, H, c.rms_eps);
+            
+            if (c.q_lora_rank > 0) {
+                launch_gemv(g.prefill_q_a + (size_t)r * c.q_lora_rank, g.prefill_xn + (size_t)r * H, d.q_a_proj, c.q_lora_rank, H);
+                launch_rmsnorm(g.prefill_q_a + (size_t)r * c.q_lora_rank, g.prefill_q_a + (size_t)r * c.q_lora_rank, d.q_a_norm, c.q_lora_rank, c.mla_norm_eps);
+                launch_gemv(g.prefill_q + (size_t)r * QD, g.prefill_q_a + (size_t)r * c.q_lora_rank, d.q_b_proj, QD, c.q_lora_rank);
+            } else {
+                launch_gemv(g.prefill_q + (size_t)r * QD, g.prefill_xn + (size_t)r * H, d.q_proj, QD, H);
+            }
+            launch_gemv(g.prefill_comp + (size_t)r * KVD, g.prefill_xn + (size_t)r * H, d.kv_a_proj, KVD, H);
+            
+            // rope + cache
+            float *layer_cache = g.kv_cache + (size_t)l * g.kv_capacity * KVD + (size_t)r * KVD;
+            launch_kv_norm_rope(layer_cache, g.prefill_comp + (size_t)r * KVD, d.kv_a_norm,
+                                1, KVL, KVD, QKR, r, c.mla_norm_eps);
+        }
+
+        // =====================================================================
+        // Compute Q_proj (qabs) and qrope for all tokens in prompt
+        // =====================================================================
+        for (int r = 0; r < n_prompt; ++r) {
+            int qabs_rows = NH * KVL;
+            q_absorb_rope_kernel<<<
+                (qabs_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
+                HIP_BLOCK, 0, g.stream>>>(
+                    g.prefill_qabs + (size_t)r * NH * KVL, 
+                    g.prefill_qrope + (size_t)r * NH * QKR, 
+                    g.prefill_q + (size_t)r * QD, 
+                    d.W_UK_T, NH, QHD, QKN, QKR,
+                    KVL, r, g.rope_inv_freq, c.rope_interleaved);
+        }
+        HIP_LAUNCH_CHECK();
+
+        // =====================================================================
+        // Wave-level Fused FA2 MLA Kernel
+        // =====================================================================
+        dim3 grid(n_prompt, NH);
+        dim3 block(64); // One HIP_WAVE
+        float *layer_cache_base = g.kv_cache + (size_t)l * g.kv_capacity * KVD;
+        
+        fused_prefill_mla_kernel<<<grid, block, 0, g.stream>>>(
+            g.prefill_clat, 
+            g.prefill_qabs, 
+            g.prefill_qrope, 
+            layer_cache_base,
+            n_prompt, NH, KVL, QKR, KVD, c.softmax_scale);
+        HIP_LAUNCH_CHECK();
+        
+        // =====================================================================
+        // Post-compute V-projection (Ctx = O_latent * W_UV)
+        // =====================================================================
+        for (int r = 0; r < n_prompt; ++r) {
+            int value_rows = NH * VHD;
+            value_up_kernel<<<(value_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
+                                HIP_BLOCK, 0, g.stream>>>(
+                g.prefill_ctx + (size_t)r * NH * VHD, 
+                g.prefill_clat + (size_t)r * NH * KVL, 
+                d.W_UV, NH, VHD, KVL, head_stride);
+        }
+        HIP_LAUNCH_CHECK();
+        // =====================================================================
+
+        // O-Projection and RMSNorm (can be looped since these are fast memory-bound ops)
+        for(int r = 0; r < n_prompt; ++r) {
+            launch_gemv(g.prefill_x + (size_t)r * H, g.prefill_ctx + (size_t)r * NH * VHD, d.o_proj, H, NH * VHD, true);
+            launch_rmsnorm(g.prefill_xn + (size_t)r * H, g.prefill_x + (size_t)r * H, d.post_norm, H, c.rms_eps);
+        }
+        
+        // FFN / Batched MoE
+        if (l < c.first_k_dense) {
+            int inter = c.dense_inter_size;
+            dim3 grid_dense_gate_up((inter + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+            batched_gate_up_swiglu_kernel<<<grid_dense_gate_up, HIP_BLOCK, 0, g.stream>>>(
+                g.prefill_hb, g.prefill_xn, d.dense_gate, d.dense_up, inter, H);
+            HIP_LAUNCH_CHECK();
+            
+            dim3 grid_dense_down((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+            batched_gemv_kernel<<<grid_dense_down, HIP_BLOCK, 0, g.stream>>>(
+                g.prefill_x, g.prefill_hb, d.dense_down, H, inter, 1);
+            HIP_LAUNCH_CHECK();
+        } else {
+            batched_gpu_ffn(c, d, l, n_prompt);
+        }
+    }
+    
+    // Final logits
+    float *host_logits = (float*)malloc((size_t)c.vocab_size * sizeof(float));
+    launch_rmsnorm(g.xn, g.prefill_x + (size_t)(n_prompt - 1) * H, g.final_norm, H, c.rms_eps);
+    launch_gemv(g.logits, g.xn, g.lm_head, c.vocab_size, H);
+    
+    // Sample the next token!
+    argmax_kernel<<<1, HIP_BLOCK, 0, g.stream>>>(g.logits, c.vocab_size, g.next_token);
+    HIP_LAUNCH_CHECK();
+    
+    HIP_CHECK(hipMemcpyAsync(host_logits, g.logits, c.vocab_size * sizeof(float),
+                             hipMemcpyDeviceToHost, g.stream));
+    HIP_CHECK(hipStreamSynchronize(g.stream));
+    return host_logits;
 }
 
 extern "C" void warm_up(Transformer *t) {
@@ -615,9 +894,12 @@ extern "C" void finish(Transformer *t) {
     device_free(g.kv_cache); device_free(g.next_token); device_free(g.generated);
     device_free(g.prompt_tokens); device_free(g.prefill_topk);
     device_free(g.prefill_expert_counts); device_free(g.prefill_expert_buckets);
+    device_free(g.prefill_expert_offsets); device_free(g.prefill_sorted_tokens);
+    device_free(g.prefill_sorted_experts); device_free(g.prefill_sorted_slots);
     device_free(g.prefill_x); device_free(g.prefill_xn);
     device_free(g.prefill_q); device_free(g.prefill_q_a); device_free(g.prefill_comp);
     device_free(g.prefill_qrope); device_free(g.prefill_knope); device_free(g.prefill_value);
+    device_free(g.prefill_qabs); device_free(g.prefill_clat);
     device_free(g.prefill_scores); device_free(g.prefill_ctx);
     device_free(g.prefill_ffn);
     device_free(g.prefill_router); device_free(g.prefill_topk_weights);
@@ -671,9 +953,8 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
         if (steps < 0)
             steps = 0;
 
-        for (int p = 0; p < n_prompt; ++p)
-            gpu_forward_absorbed(prompts[r][p], nullptr, nullptr, 0,
-                              p, p == n_prompt - 1);
+        // Use FlashAttention-2 prefill instead of naive loop
+        gpu_forward_unabsorbed(t, prompts[r].data(), n_prompt, nullptr, nullptr);
         int pos = n_prompt;
         for (int step = 0; step < steps; ++step)
         {

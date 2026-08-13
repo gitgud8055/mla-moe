@@ -223,3 +223,78 @@ __global__ void kv_norm_rope_rows_kernel(
         }
     }
 }
+
+// ==============================================================================
+// Wave-level Fused Absorbed MLA Kernel (Registers)
+// Mathematically exact, avoids N^2 score matrix writes, no LDS constraints.
+// ==============================================================================
+__global__ void fused_prefill_mla_kernel(
+    float *out_clat,            // [rows, NH, KVL]
+    const float *qabs,          // [rows, NH, KVL]
+    const float *qrope,         // [rows, NH, QKR]
+    const float *kv_cache,      // [max_seq, KVD]
+    int rows, int heads, int KVL, int QKR, int KVD, float scale) 
+{
+    // One wavefront (64 threads) processes exactly one query row for one head.
+    // blockDim.x = 64. gridDim.x = rows, gridDim.y = heads.
+    int row = blockIdx.x;
+    int h = blockIdx.y;
+    int lane = threadIdx.x; // 0 to 63
+    
+    if (row >= rows) return;
+    
+    const float *qabs_h = qabs + ((size_t)row * heads + h) * KVL;
+    const float *qrope_h = qrope + ((size_t)row * heads + h) * QKR;
+    
+    float m = -INFINITY;
+    float l = 0.0f;
+    
+    // clat accumulator in registers. KVL is 512, wave is 64 -> 8 registers per thread.
+    float clat_acc[8] = {0};
+    
+    for (int k = 0; k <= row; ++k) {
+        const float *ckv = kv_cache + (size_t)k * KVD;
+        const float *kpe = ckv + KVL;
+        
+        // 1. Compute dot product for S
+        float sum = 0.0f;
+        for (int i = lane; i < KVL; i += HIP_WAVE) {
+            sum += qabs_h[i] * ckv[i];
+        }
+        for (int i = lane; i < QKR; i += HIP_WAVE) {
+            sum += qrope_h[i] * kpe[i];
+        }
+        
+        // Wave reduction sum
+        sum = wave_sum(sum);
+        // wave_sum uses shfl_down and results in the correct sum only on lane 0.
+        // We broadcast it to all lanes in the wave.
+        sum = __shfl(sum, 0, HIP_WAVE);
+        
+        // 2. Online Softmax
+        float s = sum * scale;
+        float m_new = fmaxf(m, s);
+        float exp_old = expf(m - m_new);
+        float exp_new = expf(s - m_new);
+        
+        l = l * exp_old + exp_new;
+        m = m_new;
+        
+        // 3. Accumulate latent context
+        for (int i = 0; i < 8; ++i) {
+            int idx = lane + i * HIP_WAVE;
+            if (idx < KVL) {
+                clat_acc[i] = clat_acc[i] * exp_old + exp_new * ckv[idx];
+            }
+        }
+    }
+    
+    // 4. Normalize and write to global memory
+    float *out_h = out_clat + ((size_t)row * heads + h) * KVL;
+    for (int i = 0; i < 8; ++i) {
+        int idx = lane + i * HIP_WAVE;
+        if (idx < KVL) {
+            out_h[idx] = clat_acc[i] / l;
+        }
+    }
+}

@@ -13,6 +13,13 @@
 
 extern __global__ void gemv_kernel(float *y, const float *x, const bf16_t *w,
                                    int d_out, int n_in, int add);
+
+extern __global__ void batched_gemv_kernel(float *y, const float *x, const bf16_t *w,
+                                           int d_out, int n_in, int add);
+
+extern __global__ void batched_gate_up_swiglu_kernel(float *y, const float *x,
+                                                     const bf16_t *gate, const bf16_t *up,
+                                                     int d_out, int n_in);
 extern __global__ void gate_up_swiglu_kernel(float *y, const float *x,
                                              const bf16_t *gate,
                                              const bf16_t *up, int d_out,
@@ -67,9 +74,36 @@ extern __global__ void q_absorb_rope_kernel(
     const float *inv_freq, int interleaved);
 
 extern __global__ void router_topk_wave64_kernel(
-    float *scores, const float *bias, int *indices, float *weights,
-    int rows, int experts, int k, int use_sigmoid,
-    int norm_topk, float routed_scale);
+    float *scores, const float *bias, int *indices, float *weights, int rows,
+    int experts, int k, int use_sigmoid, int norm_topk, float routed_scale);
+
+extern __global__ void moe_token_sort_kernel(const int *topk, int n_tokens, int k,
+                                             int *expert_counts);
+
+extern __global__ void expert_prefix_sum_kernel(int *offsets, const int *counts, int n);
+
+extern __global__ void moe_token_scatter_kernel(const int *topk, int n_tokens, int k,
+                                                int *expert_offsets, int *sorted_tokens, int *sorted_experts, int *sorted_slots);
+
+extern __global__ void batched_sorted_routed_gate_up_kernel(
+    float *routed_hidden, const float *x, const char *pool,
+    const size_t *gate_offsets, const size_t *up_offsets,
+    const int *sorted_tokens, const int *sorted_experts, const int *sorted_slots,
+    int total_items, int k, int inter, int input_dim);
+
+extern __global__ void batched_sorted_routed_down_kernel(
+    float *out, const float *routed_hidden, const char *pool,
+    const size_t *down_offsets, const int *sorted_tokens, const int *sorted_experts, const int *sorted_slots,
+    const float *topk_weights, int total_items, int k, int hidden_dim, int inter);
+
+extern __global__ void batched_shared_gate_up_kernel(
+    float *shared_hidden, const float *x,
+    const bf16_t *shared_gate, const bf16_t *shared_up,
+    int n_tokens, int shared_inter, int input_dim);
+
+extern __global__ void batched_shared_down_kernel(
+    float *out, const float *shared_hidden,
+    const bf16_t *shared_down, int n_tokens, int hidden_dim, int shared_inter);
 
 extern __global__ void decode_routed_shared_gate_up_kernel(
     float *routed_hidden, float *shared_hidden, const float *x,
@@ -87,4 +121,10 @@ extern __global__ void kv_norm_rope_rows_kernel(
     float *cache, const float *comp, const bf16_t *norm,
     int rows, int kv_rank, int kv_dim, int rope_dim, int position_base,
     const float *inv_freq, int interleaved, float eps);
+
+extern __global__ void fused_prefill_mla_kernel(
+    float *out_clat, const float *qabs, const float *qrope,
+    const float *kv_cache,
+    int rows, int heads, int KVL, int QKR, int KVD, float scale);
+
 #endif
