@@ -638,41 +638,41 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
     
     // Note: Since batched MoE kernels are missing in mla-moe, 
     // we use a loop over rows for projections (fallback for incomplete mla-moe branch)
+    // Update: Loops refactored into batched kernels for Q/K/V/O projections!
     for (int l = 0; l < c.n_layers; ++l) {
         const DeviceLayer &d = g.layers[l];
-        // Loop for RMSNorm and Q projections
-        for (int r = 0; r < n_prompt; ++r) {
-            launch_rmsnorm(g.prefill_xn + (size_t)r * H, g.prefill_x + (size_t)r * H, d.input_norm, H, c.rms_eps);
-            
-            if (c.q_lora_rank > 0) {
-                launch_gemv(g.prefill_q_a + (size_t)r * c.q_lora_rank, g.prefill_xn + (size_t)r * H, d.q_a_proj, c.q_lora_rank, H);
-                launch_rmsnorm(g.prefill_q_a + (size_t)r * c.q_lora_rank, g.prefill_q_a + (size_t)r * c.q_lora_rank, d.q_a_norm, c.q_lora_rank, c.mla_norm_eps);
-                launch_gemv(g.prefill_q + (size_t)r * QD, g.prefill_q_a + (size_t)r * c.q_lora_rank, d.q_b_proj, QD, c.q_lora_rank);
-            } else {
-                launch_gemv(g.prefill_q + (size_t)r * QD, g.prefill_xn + (size_t)r * H, d.q_proj, QD, H);
-            }
-            launch_gemv(g.prefill_comp + (size_t)r * KVD, g.prefill_xn + (size_t)r * H, d.kv_a_proj, KVD, H);
-            
-            // rope + cache
-            float *layer_cache = g.kv_cache + (size_t)l * g.kv_capacity * KVD + (size_t)r * KVD;
-            launch_kv_norm_rope(layer_cache, g.prefill_comp + (size_t)r * KVD, d.kv_a_norm,
-                                1, KVL, KVD, QKR, r, c.mla_norm_eps);
+        
+        dim3 grid_b(1, n_prompt);
+        batched_rmsnorm_kernel<<<grid_b, HIP_BLOCK, 0, g.stream>>>(g.prefill_xn, g.prefill_x, d.input_norm, H, c.rms_eps);
+        
+        dim3 grid_q_lora((c.q_lora_rank + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+        dim3 grid_q((QD + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+        dim3 grid_kv((KVD + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+
+        if (c.q_lora_rank > 0) {
+            batched_gemv_kernel<<<grid_q_lora, HIP_BLOCK, 0, g.stream>>>(g.prefill_q_a, g.prefill_xn, d.q_a_proj, c.q_lora_rank, H, 0);
+            batched_rmsnorm_kernel<<<grid_b, HIP_BLOCK, 0, g.stream>>>(g.prefill_q_a, g.prefill_q_a, d.q_a_norm, c.q_lora_rank, c.mla_norm_eps);
+            batched_gemv_kernel<<<grid_q, HIP_BLOCK, 0, g.stream>>>(g.prefill_q, g.prefill_q_a, d.q_b_proj, QD, c.q_lora_rank, 0);
+        } else {
+            batched_gemv_kernel<<<grid_q, HIP_BLOCK, 0, g.stream>>>(g.prefill_q, g.prefill_xn, d.q_proj, QD, H, 0);
         }
+        batched_gemv_kernel<<<grid_kv, HIP_BLOCK, 0, g.stream>>>(g.prefill_comp, g.prefill_xn, d.kv_a_proj, KVD, H, 0);
+        
+        // rope + cache
+        float *layer_cache_base = g.kv_cache + (size_t)l * g.kv_capacity * KVD;
+        dim3 grid_kv_rope(1, n_prompt);
+        batched_kv_norm_rope_rows_kernel<<<grid_kv_rope, HIP_BLOCK, 0, g.stream>>>(
+            layer_cache_base, g.prefill_comp, d.kv_a_norm, KVL, KVD, QKR, 0, g.rope_inv_freq, c.rope_interleaved, c.mla_norm_eps);
+        HIP_LAUNCH_CHECK();
 
         // =====================================================================
         // Compute Q_proj (qabs) and qrope for all tokens in prompt
         // =====================================================================
-        for (int r = 0; r < n_prompt; ++r) {
-            int qabs_rows = NH * KVL;
-            q_absorb_rope_kernel<<<
-                (qabs_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-                HIP_BLOCK, 0, g.stream>>>(
-                    g.prefill_qabs + (size_t)r * NH * KVL, 
-                    g.prefill_qrope + (size_t)r * NH * QKR, 
-                    g.prefill_q + (size_t)r * QD, 
-                    d.W_UK_T, NH, QHD, QKN, QKR,
-                    KVL, r, g.rope_inv_freq, c.rope_interleaved);
-        }
+        int qabs_rows = NH * KVL;
+        dim3 grid_qabs((qabs_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+        batched_q_absorb_rope_kernel<<<grid_qabs, HIP_BLOCK, 0, g.stream>>>(
+            g.prefill_qabs, g.prefill_qrope, g.prefill_q, d.W_UK_T,
+            NH, QHD, QKN, QKR, KVL, 0, g.rope_inv_freq, c.rope_interleaved);
         HIP_LAUNCH_CHECK();
 
         // =====================================================================
@@ -680,7 +680,6 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
         // =====================================================================
         dim3 grid(n_prompt, NH);
         dim3 block(64); // One HIP_WAVE
-        float *layer_cache_base = g.kv_cache + (size_t)l * g.kv_capacity * KVD;
         
         fused_prefill_mla_kernel<<<grid, block, 0, g.stream>>>(
             g.prefill_clat, 
@@ -693,22 +692,18 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
         // =====================================================================
         // Post-compute V-projection (Ctx = O_latent * W_UV)
         // =====================================================================
-        for (int r = 0; r < n_prompt; ++r) {
-            int value_rows = NH * VHD;
-            value_up_kernel<<<(value_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-                                HIP_BLOCK, 0, g.stream>>>(
-                g.prefill_ctx + (size_t)r * NH * VHD, 
-                g.prefill_clat + (size_t)r * NH * KVL, 
-                d.W_UV, NH, VHD, KVL, head_stride);
-        }
+        int value_rows = NH * VHD;
+        dim3 grid_vup((value_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+        batched_value_up_kernel<<<grid_vup, HIP_BLOCK, 0, g.stream>>>(
+            g.prefill_ctx, g.prefill_clat, d.W_UV, NH, VHD, KVL, head_stride);
         HIP_LAUNCH_CHECK();
         // =====================================================================
 
-        // O-Projection and RMSNorm (can be looped since these are fast memory-bound ops)
-        for(int r = 0; r < n_prompt; ++r) {
-            launch_gemv(g.prefill_x + (size_t)r * H, g.prefill_ctx + (size_t)r * NH * VHD, d.o_proj, H, NH * VHD, true);
-            launch_rmsnorm(g.prefill_xn + (size_t)r * H, g.prefill_x + (size_t)r * H, d.post_norm, H, c.rms_eps);
-        }
+        // O-Projection and RMSNorm
+        dim3 grid_o((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+        batched_gemv_kernel<<<grid_o, HIP_BLOCK, 0, g.stream>>>(g.prefill_x, g.prefill_ctx, d.o_proj, H, NH * VHD, 1);
+        batched_rmsnorm_kernel<<<grid_b, HIP_BLOCK, 0, g.stream>>>(g.prefill_xn, g.prefill_x, d.post_norm, H, c.rms_eps);
+        HIP_LAUNCH_CHECK();
         
         // FFN / Batched MoE
         if (l < c.first_k_dense) {

@@ -113,6 +113,56 @@ __global__ void q_absorb_rope_kernel(
     }
 }
 
+__global__ void batched_q_absorb_rope_kernel(
+    float *qabs, float *qrope, const float *q, const bf16_t *wuk_t,
+    int heads, int q_head_dim, int qk_nope, int rope_dim,
+    int kv_rank, int pos_base,
+    const float *inv_freq, int interleaved)
+{
+    int wave = (int)threadIdx.x / HIP_WAVE;
+    int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    int row = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
+    int b = (int)blockIdx.y;
+    int total = heads * kv_rank;
+    if (row >= total)
+        return;
+
+    float *qabs_b = qabs + (size_t)b * heads * kv_rank;
+    float *qrope_b = qrope + (size_t)b * heads * rope_dim;
+    const float *q_b = q + (size_t)b * heads * q_head_dim;
+    int pos = pos_base + b;
+
+    int h = row / kv_rank, r = row - h * kv_rank;
+    const float *qh = q_b + (size_t)h * q_head_dim;
+    const bf16_t *wr = wuk_t + ((size_t)h * kv_rank + r) * qk_nope;
+    float sum = 0.0f;
+    for (int d = lane; d < qk_nope; d += HIP_WAVE)
+        sum += qh[d] * gpu_bf16_to_f32(wr[d]);
+    sum = wave_sum(sum);
+    if (lane == 0)
+        qabs_b[row] = sum;
+
+    if (r == 0 && lane < rope_dim / 2)
+    {
+        const float *v = qh + qk_nope;
+        float *o = qrope_b + (size_t)h * rope_dim;
+        float angle = (float)pos * inv_freq[lane];
+        float co = cosf(angle), si = sinf(angle);
+        float even = v[2 * lane], odd = v[2 * lane + 1];
+        if (!interleaved)
+        {
+            o[2 * lane] = even * co - odd * si;
+            o[2 * lane + 1] = even * si + odd * co;
+        }
+        else
+        {
+            int half = rope_dim / 2;
+            o[lane] = even * co - odd * si;
+            o[half + lane] = odd * co + even * si;
+        }
+    }
+}
+
 __global__ void attention_score_kernel(float *scores, const float *qabs,
                                        const float *qrope, const float *cache,
                                        int heads, int kv_len, int kv_dim,
@@ -180,6 +230,32 @@ __global__ void value_up_kernel(float *ctx, const float *clat, const bf16_t *wuv
         ctx[row] = sum;
 }
 
+__global__ void batched_value_up_kernel(float *ctx, const float *clat, const bf16_t *wuv,
+                                        int heads, int value_dim, int kv_rank,
+                                        size_t head_stride)
+{
+    int wave = (int)threadIdx.x / HIP_WAVE;
+    int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    int row = (int)blockIdx.x * HIP_ROWS_PER_BLOCK + wave;
+    int b = (int)blockIdx.y;
+    int total = heads * value_dim;
+    if (row >= total)
+        return;
+
+    float *ctx_b = ctx + (size_t)b * heads * value_dim;
+    const float *clat_b = clat + (size_t)b * heads * kv_rank;
+
+    int h = row / value_dim, d = row - h * value_dim;
+    const float *ch = clat_b + (size_t)h * kv_rank;
+    const bf16_t *wh = wuv + (size_t)h * head_stride + (size_t)d * kv_rank;
+    float sum = 0.0f;
+    for (int r = lane; r < kv_rank; r += HIP_WAVE)
+        sum += ch[r] * gpu_bf16_to_f32(wh[r]);
+    sum = wave_sum(sum);
+    if (lane == 0)
+        ctx_b[row] = sum;
+}
+
 __global__ void kv_norm_rope_rows_kernel(
     float *cache, const float *comp, const bf16_t *norm,
     int rows, int kv_rank, int kv_dim, int rope_dim, int position_base,
@@ -212,6 +288,50 @@ __global__ void kv_norm_rope_rows_kernel(
         const float *v = src + kv_rank;
         float *o = dst + kv_rank;
         float angle = (float)(position_base + row) * inv_freq[j];
+        float co = cosf(angle), si = sinf(angle);
+        float even = v[2 * j], odd = v[2 * j + 1];
+        if (!interleaved) {
+            o[2 * j] = even * co - odd * si;
+            o[2 * j + 1] = even * si + odd * co;
+        } else {
+            o[j] = even * co - odd * si;
+            o[half + j] = odd * co + even * si;
+        }
+    }
+}
+
+__global__ void batched_kv_norm_rope_rows_kernel(
+    float *cache, const float *comp, const bf16_t *norm,
+    int kv_rank, int kv_dim, int rope_dim, int position_base,
+    const float *inv_freq, int interleaved, float eps) {
+    __shared__ float scratch[HIP_BLOCK];
+    int b = (int)blockIdx.y;
+    const float *src = comp + (size_t)b * kv_dim;
+    float *dst = cache + (size_t)b * kv_dim;
+
+    float ss = 0.0f;
+    for (int i = (int)threadIdx.x; i < kv_rank; i += HIP_BLOCK)
+        ss += src[i] * src[i];
+    scratch[threadIdx.x] = ss;
+    __syncthreads();
+    for (int stride = HIP_BLOCK / 2; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride)
+            scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        scratch[0] = 1.0f / sqrtf(scratch[0] / (float)kv_rank + eps);
+    __syncthreads();
+    float inv = scratch[0];
+    for (int i = (int)threadIdx.x; i < kv_rank; i += HIP_BLOCK)
+        dst[i] = src[i] * inv * gpu_bf16_to_f32(norm[i]);
+
+    int j = (int)threadIdx.x;
+    int half = rope_dim / 2;
+    if (j < half) {
+        const float *v = src + kv_rank;
+        float *o = dst + kv_rank;
+        float angle = (float)(position_base + b) * inv_freq[j];
         float co = cosf(angle), si = sinf(angle);
         float even = v[2 * j], odd = v[2 * j + 1];
         if (!interleaved) {

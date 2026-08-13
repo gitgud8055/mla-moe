@@ -38,6 +38,34 @@ __global__ void rmsnorm_kernel(float *y, const float *x, const bf16_t *w,
         y[i] = x[i] * inv * gpu_bf16_to_f32(w[i]);
 }
 
+__global__ void batched_rmsnorm_kernel(float *y, const float *x, const bf16_t *w,
+                                       int n, float eps) {
+    int b = (int)blockIdx.y;
+    const float *xb = x + (size_t)b * n;
+    float *yb = y + (size_t)b * n;
+
+    __shared__ float scratch[HIP_ROWS_PER_BLOCK];
+    float ss = 0.0f;
+    for (int i = (int)threadIdx.x; i < n; i += HIP_BLOCK) ss += xb[i] * xb[i];
+    
+    ss = wave_sum(ss);
+    if (threadIdx.x % HIP_WAVE == 0) scratch[threadIdx.x / HIP_WAVE] = ss;
+    __syncthreads();
+    
+    if (threadIdx.x == 0) {
+        float total_ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < HIP_ROWS_PER_BLOCK; ++i) {
+            total_ss += scratch[i];
+        }
+        scratch[0] = 1.0f / sqrtf(total_ss / (float)n + eps);
+    }
+    __syncthreads();
+    float inv = scratch[0];
+    for (int i = (int)threadIdx.x; i < n; i += HIP_BLOCK)
+        yb[i] = xb[i] * inv * gpu_bf16_to_f32(w[i]);
+}
+
 __global__ void add_kernel(float *dst, const float *src, int n) {
     int i = (int)blockIdx.x * blockDim.x + (int)threadIdx.x;
     if (i < n) dst[i] += src[i];
