@@ -71,8 +71,8 @@ static int g_max_batch = 1;
 
 static int configured_batch_size()
 {
-    constexpr int default_batch = 256;
-    constexpr int max_batch = 256;
+    constexpr int default_batch = 512;
+    constexpr int max_batch = 512;
     const char *text = std::getenv("GETP_BATCH_SIZE");
     if (!text || !*text) return default_batch;
     char *end = nullptr;
@@ -1040,9 +1040,14 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
                 const int *generated = steps > 0
                     ? host_generated.data() + (size_t)b * steps : nullptr;
                 int n_out = 0;
-                while (n_out < steps && generated[n_out] != eos) {
-                    reqs->out_tokens[r][n_out] = generated[n_out];
+                while (n_out < steps) {
+                    const int token = generated[n_out];
+                    reqs->out_tokens[r][n_out] = token;
                     ++n_out;
+                    // Hugging Face generate() includes the EOS token in the
+                    // returned completion.  Keep it in the output as well,
+                    // then discard the speculative tokens generated after it.
+                    if (token == eos) break;
                 }
                 reqs->out_lens[r] = n_out;
                 total += n_out;
