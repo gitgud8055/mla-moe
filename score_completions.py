@@ -6,7 +6,8 @@ Run one command per model:
 
 METEOR and BERTScore operate on text. This script therefore decodes both files
 with the selected target model's tokenizer; token IDs from the two models are
-not interchangeable.
+not interchangeable. Pass/fail uses only METEOR > 0.3 and BERTScore-F1 > 0.8
+by default; exact-sequence and token accuracy are diagnostic only.
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ from typing import Sequence
 
 REPO = Path(__file__).resolve().parent
 MODEL_ENV = {"dsv2lite": "DSV", "glm47": "GLM"}
+DEFAULT_METEOR_THRESHOLD = 0.3
+DEFAULT_BERTSCORE_F1_THRESHOLD = 0.8
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +58,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lang", default="en", help="BERTScore language (default: en)")
     parser.add_argument("--batch-size", type=int, default=16, help="BERTScore batch size")
     parser.add_argument("--device", default=None, help="BERTScore device, e.g. cpu or cuda:0")
+    parser.add_argument(
+        "--meteor-threshold", type=float, default=DEFAULT_METEOR_THRESHOLD,
+        help=f"strict METEOR pass threshold (default: {DEFAULT_METEOR_THRESHOLD})",
+    )
+    parser.add_argument(
+        "--bertscore-f1-threshold", type=float,
+        default=DEFAULT_BERTSCORE_F1_THRESHOLD,
+        help=(
+            "strict BERTScore-F1 pass threshold "
+            f"(default: {DEFAULT_BERTSCORE_F1_THRESHOLD})"
+        ),
+    )
     parser.add_argument("--json", type=Path, default=None, help="also write scores as JSON")
     return parser.parse_args()
 
@@ -260,6 +275,12 @@ def main() -> None:
     print(f"[{args.model}] computing BERTScore...")
     bs_precision, bs_recall, bs_f1 = bert_scores(prediction_text, reference_text, args)
 
+    meteor = mean(meteor_per_request)
+    bertscore_f1 = mean(bs_f1)
+    passed = (
+        meteor > args.meteor_threshold
+        and bertscore_f1 > args.bertscore_f1_threshold
+    )
     result = {
         "model": args.model,
         "output": str(args.output),
@@ -269,10 +290,15 @@ def main() -> None:
         "missing_output_tokens": missing_tokens,
         "missing_token_locations": missing_locations,
         "text_metrics_include_extra_tokens": args.keep_extra_tokens,
-        "meteor": mean(meteor_per_request),
+        "meteor": meteor,
         "bertscore_precision": mean(bs_precision),
         "bertscore_recall": mean(bs_recall),
-        "bertscore_f1": mean(bs_f1),
+        "bertscore_f1": bertscore_f1,
+        "thresholds": {
+            "meteor": args.meteor_threshold,
+            "bertscore_f1": args.bertscore_f1_threshold,
+        },
+        "passed": passed,
     }
 
     print()
@@ -290,6 +316,12 @@ def main() -> None:
     print(f"BERTScore Precision: {result['bertscore_precision']:.4f}")
     print(f"BERTScore Recall   : {result['bertscore_recall']:.4f}")
     print(f"BERTScore F1       : {result['bertscore_f1']:.4f}")
+    print(
+        "Quality gate       : "
+        f"METEOR > {args.meteor_threshold:g} and "
+        f"BERTScore F1 > {args.bertscore_f1_threshold:g}"
+    )
+    print(f"RESULT             : {'PASS' if passed else 'FAIL'}")
     if extra_tokens and not args.keep_extra_tokens:
         print(f"Note                : ignored {extra_tokens} extra output tokens in text metrics")
     if missing_tokens:
@@ -299,6 +331,8 @@ def main() -> None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         print(f"JSON report         : {args.json}")
+
+    raise SystemExit(0 if passed else 1)
 
 
 if __name__ == "__main__":

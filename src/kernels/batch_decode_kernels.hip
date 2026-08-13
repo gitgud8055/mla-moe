@@ -5,14 +5,9 @@ namespace batch_decode_kernels {
 
 constexpr int THREADS = kernel_tuning::GEMV_THREADS;
 constexpr int WAVES = THREADS / HIP_WAVE;
-/* Eight requests amortize each dense/shared weight read while keeping the two
- * accumulator arrays in gate_up below within a practical VGPR budget. */
+
 constexpr int BATCH_TILE = 2;
 
-/* Batched projections are the dominant work for the public throughput set.
- * A block computes a 16x64 output tile with four wave64 MFMA instructions.
- * Inputs remain fp32 in the engine and are converted to bf16 only in LDS; the
- * checkpoint weights are consumed directly in their native bf16 layout. */
 using bf16x4 = short __attribute__((ext_vector_type(4)));
 using bf16x8 = short __attribute__((ext_vector_type(8)));
 using float4v = float __attribute__((ext_vector_type(4)));
@@ -90,6 +85,164 @@ __global__ void mfma_gemm(float *__restrict__ y,
             if (r < rows) {
                 float *dst = y + (size_t)r * d_out + col;
                 if (add) *dst += acc[q]; else *dst = acc[q];
+            }
+        }
+    }
+}
+
+/* Batched per-head projection.  The activation and result are both
+ * [batch, head, dim], while weights are independently row-major per head. */
+__global__ void mfma_head_gemm(float *__restrict__ y,
+                               const float *__restrict__ x,
+                               const bf16_t *__restrict__ w,
+                               int rows, int heads, int d_out, int n_in,
+                               int x_head_dim, int y_head_dim,
+                               size_t weight_head_stride) {
+    __shared__ bf16_t sx[MFMA_M][MFMA_LDS_K];
+    __shared__ bf16_t sw[MFMA_N][MFMA_LDS_K];
+
+    const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    const int wave = (int)threadIdx.x / HIP_WAVE;
+    const int head = (int)blockIdx.z;
+    const int row0 = (int)blockIdx.y * MFMA_M;
+    const int col0 = (int)blockIdx.x * MFMA_N;
+    const int col = col0 + wave * 16 + (lane & 15);
+    const int k4 = 4 * (lane >> 4);
+    float4v acc = {};
+
+    for (int bk = 0; bk < n_in; bk += MFMA_K) {
+        for (int i = (int)threadIdx.x; i < MFMA_M * MFMA_K;
+             i += (int)blockDim.x) {
+            const int r = i / MFMA_K;
+            const int k = i - r * MFMA_K;
+            const int gr = row0 + r;
+            sx[r][k] = gr < rows && bk + k < n_in
+                ? gpu_f32_to_bf16(
+                    x[((size_t)gr * heads + head) * x_head_dim + bk + k])
+                : (bf16_t)0;
+        }
+        for (int i = (int)threadIdx.x; i < MFMA_N * (MFMA_K / 8);
+             i += (int)blockDim.x) {
+            const int c = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            const int gc = col0 + c;
+            bf16x8 value = {};
+            if (gc < d_out && bk + k + 8 <= n_in)
+                value = *reinterpret_cast<const bf16x8 *>(
+                    w + (size_t)head * weight_head_stride
+                      + (size_t)gc * n_in + bk + k);
+            else if (gc < d_out) {
+#pragma unroll
+                for (int q = 0; q < 8; ++q)
+                    if (bk + k + q < n_in)
+                        value[q] = reinterpret_cast<const short *>(w)[
+                            (size_t)head * weight_head_stride
+                          + (size_t)gc * n_in + bk + k + q];
+            }
+            *reinterpret_cast<bf16x8 *>(&sw[c][k]) = value;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < MFMA_K; k += 16) {
+            const bf16x4 av = *reinterpret_cast<const bf16x4 *>(
+                &sx[lane & 15][k + k4]);
+            const bf16x4 bv = *reinterpret_cast<const bf16x4 *>(
+                &sw[wave * 16 + (lane & 15)][k + k4]);
+            acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+                av, bv, acc, 0, 0, 0);
+        }
+        __syncthreads();
+    }
+
+    if (col < d_out) {
+        const int r0 = row0 + 4 * (lane >> 4);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const int r = r0 + q;
+            if (r < rows)
+                y[((size_t)r * heads + head) * y_head_dim + col] = acc[q];
+        }
+    }
+}
+
+/* Gate and up projections share the same activation tile.  Computing both in
+ * one block also writes only the final SwiGLU activation, avoiding two fp32
+ * intermediates and a separate elementwise kernel. */
+__global__ void mfma_gate_up_swiglu(float *__restrict__ y,
+                                    const float *__restrict__ x,
+                                    const bf16_t *__restrict__ gate,
+                                    const bf16_t *__restrict__ up,
+                                    int rows, int d_out, int n_in) {
+    __shared__ bf16_t sx[MFMA_M][MFMA_LDS_K];
+    __shared__ bf16_t sg[MFMA_N][MFMA_LDS_K];
+    __shared__ bf16_t su[MFMA_N][MFMA_LDS_K];
+
+    const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    const int wave = (int)threadIdx.x / HIP_WAVE;
+    const int row0 = (int)blockIdx.y * MFMA_M;
+    const int col0 = (int)blockIdx.x * MFMA_N;
+    const int col = col0 + wave * 16 + (lane & 15);
+    const int k4 = 4 * (lane >> 4);
+    float4v gate_acc[MFMA_M / 16] = {};
+    float4v up_acc[MFMA_M / 16] = {};
+
+    for (int bk = 0; bk < n_in; bk += MFMA_K) {
+        for (int i = (int)threadIdx.x; i < MFMA_M * MFMA_K;
+             i += (int)blockDim.x) {
+            const int r = i / MFMA_K;
+            const int k = i - r * MFMA_K;
+            const int gr = row0 + r;
+            sx[r][k] = gr < rows && bk + k < n_in
+                ? gpu_f32_to_bf16(x[(size_t)gr * n_in + bk + k])
+                : (bf16_t)0;
+        }
+        for (int i = (int)threadIdx.x; i < MFMA_N * (MFMA_K / 8);
+             i += (int)blockDim.x) {
+            const int c = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            const int gc = col0 + c;
+            bf16x8 gv = {}, uv = {};
+            if (gc < d_out && bk + k + 8 <= n_in) {
+                gv = *reinterpret_cast<const bf16x8 *>(
+                    gate + (size_t)gc * n_in + bk + k);
+                uv = *reinterpret_cast<const bf16x8 *>(
+                    up + (size_t)gc * n_in + bk + k);
+            }
+            *reinterpret_cast<bf16x8 *>(&sg[c][k]) = gv;
+            *reinterpret_cast<bf16x8 *>(&su[c][k]) = uv;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < MFMA_K; k += 16) {
+            const bf16x4 bg = *reinterpret_cast<const bf16x4 *>(
+                &sg[wave * 16 + (lane & 15)][k + k4]);
+            const bf16x4 bu = *reinterpret_cast<const bf16x4 *>(
+                &su[wave * 16 + (lane & 15)][k + k4]);
+#pragma unroll
+            for (int mt = 0; mt < MFMA_M / 16; ++mt) {
+                const bf16x4 av = *reinterpret_cast<const bf16x4 *>(
+                    &sx[mt * 16 + (lane & 15)][k + k4]);
+                gate_acc[mt] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+                    av, bg, gate_acc[mt], 0, 0, 0);
+                up_acc[mt] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+                    av, bu, up_acc[mt], 0, 0, 0);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (col < d_out) {
+#pragma unroll
+        for (int mt = 0; mt < MFMA_M / 16; ++mt) {
+            const int r0 = row0 + mt * 16 + 4 * (lane >> 4);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int r = r0 + q;
+                if (r < rows) {
+                    const float gv = gate_acc[mt][q];
+                    y[(size_t)r * d_out + col] =
+                        (gv / (1.0f + expf(-gv))) * up_acc[mt][q];
+                }
             }
         }
     }
@@ -443,7 +596,7 @@ __global__ void gate_up_swiglu(float *y, const float *x, const bf16_t *gate,
     }
 }
 
-__global__ void kv_norm_rope(float *cache, const float *comp, const bf16_t *norm,
+__global__ void kv_norm_rope(bf16_t *cache, const float *comp, const bf16_t *norm,
                              int batch, int capacity, int pos, int kv_rank,
                              int kv_dim, int rope_dim, const float *inv_freq,
                              int interleaved, float eps) {
@@ -451,7 +604,7 @@ __global__ void kv_norm_rope(float *cache, const float *comp, const bf16_t *norm
     int b = (int)blockIdx.x;
     if (b >= batch) return;
     const float *src = comp + (size_t)b * kv_dim;
-    float *dst = cache + ((size_t)b * capacity + pos) * kv_dim;
+    bf16_t *dst = cache + ((size_t)b * capacity + pos) * kv_dim;
     float ss = 0.0f;
     for (int i = (int)threadIdx.x; i < kv_rank; i += THREADS) ss += src[i] * src[i];
     scratch[threadIdx.x] = ss;
@@ -462,16 +615,22 @@ __global__ void kv_norm_rope(float *cache, const float *comp, const bf16_t *norm
     }
     float inv = rsqrtf(scratch[0] / (float)kv_rank + eps);
     for (int i = (int)threadIdx.x; i < kv_rank; i += THREADS)
-        dst[i] = src[i] * inv * gpu_bf16_to_f32(norm[i]);
+        dst[i] = gpu_f32_to_bf16(src[i] * inv * gpu_bf16_to_f32(norm[i]));
     int j = (int)threadIdx.x;
     if (j < rope_dim / 2) {
         const float *v = src + kv_rank;
-        float *o = dst + kv_rank;
+        bf16_t *o = dst + kv_rank;
         float angle = (float)pos * inv_freq[j];
         float co = cosf(angle), si = sinf(angle);
         float even = v[2 * j], odd = v[2 * j + 1];
-        if (!interleaved) { o[2*j] = even*co - odd*si; o[2*j+1] = even*si + odd*co; }
-        else { int half=rope_dim/2; o[j]=even*co-odd*si; o[half+j]=odd*co+even*si; }
+        if (!interleaved) {
+            o[2*j] = gpu_f32_to_bf16(even*co - odd*si);
+            o[2*j+1] = gpu_f32_to_bf16(even*si + odd*co);
+        } else {
+            int half=rope_dim/2;
+            o[j]=gpu_f32_to_bf16(even*co-odd*si);
+            o[half+j]=gpu_f32_to_bf16(odd*co+even*si);
+        }
     }
 }
 
@@ -511,8 +670,30 @@ __global__ void q_absorb_rope(float *qabs, float *qrope, const float *q,
     }
 }
 
+__global__ void q_rope(float *qrope, const float *q, int batch, int heads,
+                       int q_head_dim, int qk_nope, int rope_dim, int pos,
+                       const float *inv_freq, int interleaved) {
+    const int wave = (int)threadIdx.x / HIP_WAVE;
+    const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    const int row = (int)blockIdx.x * WAVES + wave;
+    if (row >= batch * heads || lane >= rope_dim / 2) return;
+    const float *v = q + (size_t)row * q_head_dim + qk_nope;
+    float *o = qrope + (size_t)row * rope_dim;
+    const float angle = (float)pos * inv_freq[lane];
+    const float co = cosf(angle), si = sinf(angle);
+    const float even = v[2 * lane], odd = v[2 * lane + 1];
+    if (!interleaved) {
+        o[2 * lane] = even * co - odd * si;
+        o[2 * lane + 1] = even * si + odd * co;
+    } else {
+        const int half = rope_dim / 2;
+        o[lane] = even * co - odd * si;
+        o[half + lane] = odd * co + even * si;
+    }
+}
+
 __global__ void attention_score(float *scores, const float *qabs,
-                                const float *qrope, const float *cache,
+                                const float *qrope, const bf16_t *cache,
                                 int batch, int heads, int kv_len, int capacity,
                                 int kv_dim, int kv_rank, int rope_dim, float scale) {
     int wave=(int)threadIdx.x/HIP_WAVE, lane=(int)threadIdx.x&(HIP_WAVE-1);
@@ -521,15 +702,108 @@ __global__ void attention_score(float *scores, const float *qabs,
     int h=row/kv_len,k=row-h*kv_len;
     const float *qa=qabs+((size_t)b*heads+h)*kv_rank;
     const float *qp=qrope+((size_t)b*heads+h)*rope_dim;
-    const float *ckv=cache+((size_t)b*capacity+k)*kv_dim;
+    const bf16_t *ckv=cache+((size_t)b*capacity+k)*kv_dim;
     float sn=0.0f,sp=0.0f;
-    for(int r=lane;r<kv_rank;r+=HIP_WAVE)sn+=qa[r]*ckv[r];
-    for(int d=lane;d<rope_dim;d+=HIP_WAVE)sp+=qp[d]*ckv[kv_rank+d];
+    for(int r=lane;r<kv_rank;r+=HIP_WAVE)sn+=qa[r]*gpu_bf16_to_f32(ckv[r]);
+    for(int d=lane;d<rope_dim;d+=HIP_WAVE)sp+=qp[d]*gpu_bf16_to_f32(ckv[kv_rank+d]);
     sn=wave_sum(sn);sp=wave_sum(sp);
     if(lane==0)scores[((size_t)b*heads+h)*capacity+k]=(sn+sp)*scale;
 }
 
-__global__ void latent_context(float *clat, const float *scores, const float *cache,
+/* Flash decode for absorbed MLA.  One wave owns one (batch, head) row and
+ * streams the latent KV cache once.  The online softmax keeps only its running
+ * max/denominator and the 512-wide latent context in registers, eliminating
+ * the materialized score matrix and the separate softmax/context launches. */
+__global__ void flash_decode(float *__restrict__ clat,
+                             const float *__restrict__ qabs,
+                             const float *__restrict__ qrope,
+                             const bf16_t *__restrict__ cache,
+                             int batch, int heads, int kv_len, int capacity,
+                             int kv_dim, int kv_rank, int rope_dim, float scale) {
+    extern __shared__ bf16_t shared_cache[];
+    const int wave = (int)threadIdx.x / HIP_WAVE;
+    const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    const int waves = (int)blockDim.x / HIP_WAVE;
+    const int b = (int)blockIdx.y;
+    const int h = (int)blockIdx.x * waves + wave;
+    const bool active = b < batch && h < heads;
+    const float *qa = active
+        ? qabs + ((size_t)b * heads + h) * kv_rank : nullptr;
+    const float *qp = active
+        ? qrope + ((size_t)b * heads + h) * rope_dim : nullptr;
+    const bf16_t *cache_b = cache + (size_t)b * capacity * kv_dim;
+    constexpr int VALUES_PER_LANE = 8;
+    constexpr int KV_TILE = 8;
+    float acc[VALUES_PER_LANE] = {};
+    float running_max = -INFINITY;
+    float denominator = 0.0f;
+
+    for (int k0 = 0; k0 < kv_len; k0 += KV_TILE) {
+        const int tile = min(KV_TILE, kv_len - k0);
+        for (int i = (int)threadIdx.x; i < tile * kv_dim;
+             i += (int)blockDim.x)
+            shared_cache[i] = cache_b[(size_t)k0 * kv_dim + i];
+        __syncthreads();
+
+        float scores[KV_TILE];
+#pragma unroll
+        for (int t = 0; t < KV_TILE; ++t) {
+            float score_nope = 0.0f;
+            const bf16_t *ckv = shared_cache + t * kv_dim;
+#pragma unroll
+            for (int q = 0; q < VALUES_PER_LANE; ++q) {
+                const int r = lane + q * HIP_WAVE;
+                if (active && t < tile && r < kv_rank)
+                    score_nope += qa[r] * gpu_bf16_to_f32(ckv[r]);
+            }
+            float score_rope = active && t < tile && lane < rope_dim
+                ? qp[lane] * gpu_bf16_to_f32(ckv[kv_rank + lane]) : 0.0f;
+            score_nope = wave_sum(score_nope);
+            score_rope = wave_sum(score_rope);
+            scores[t] = t < tile
+                ? __shfl((score_nope + score_rope) * scale, 0, HIP_WAVE)
+                : -INFINITY;
+        }
+
+        float tile_max = scores[0];
+#pragma unroll
+        for (int t = 1; t < KV_TILE; ++t)
+            tile_max = fmaxf(tile_max, scores[t]);
+        const float next_max = fmaxf(running_max, tile_max);
+        const float rescale = expf(running_max - next_max);
+        denominator *= rescale;
+#pragma unroll
+        for (int q = 0; q < VALUES_PER_LANE; ++q)
+            acc[q] *= rescale;
+#pragma unroll
+        for (int t = 0; t < KV_TILE; ++t) {
+            if (t >= tile) break;
+            const float weight = expf(scores[t] - next_max);
+            denominator += weight;
+            const bf16_t *ckv = shared_cache + t * kv_dim;
+#pragma unroll
+            for (int q = 0; q < VALUES_PER_LANE; ++q) {
+                const int r = lane + q * HIP_WAVE;
+                if (active && r < kv_rank)
+                    acc[q] += gpu_bf16_to_f32(ckv[r]) * weight;
+            }
+        }
+        running_max = next_max;
+        __syncthreads();
+    }
+
+    if (!active) return;
+    const float inv_denominator = 1.0f / denominator;
+#pragma unroll
+    for (int q = 0; q < VALUES_PER_LANE; ++q) {
+        const int r = lane + q * HIP_WAVE;
+        if (r < kv_rank)
+            clat[((size_t)b * heads + h) * kv_rank + r] =
+                acc[q] * inv_denominator;
+    }
+}
+
+__global__ void latent_context(float *clat, const float *scores, const bf16_t *cache,
                                int batch, int heads, int kv_len, int capacity,
                                int kv_dim, int kv_rank) {
     int wave=(int)threadIdx.x/HIP_WAVE,lane=(int)threadIdx.x&(HIP_WAVE-1);
@@ -537,9 +811,10 @@ __global__ void latent_context(float *clat, const float *scores, const float *ca
     if(row>=heads*kv_rank||b>=batch)return;
     int h=row/kv_rank,r=row-h*kv_rank;
     const float *a=scores+((size_t)b*heads+h)*capacity;
-    const float *cb=cache+(size_t)b*capacity*kv_dim;
+    const bf16_t *cb=cache+(size_t)b*capacity*kv_dim;
     float sum=0.0f;
-    for(int k=lane;k<kv_len;k+=HIP_WAVE)sum+=a[k]*cb[(size_t)k*kv_dim+r];
+    for(int k=lane;k<kv_len;k+=HIP_WAVE)
+        sum+=a[k]*gpu_bf16_to_f32(cb[(size_t)k*kv_dim+r]);
     sum=wave_sum(sum);
     if(lane==0)clat[((size_t)b*heads+h)*kv_rank+r]=sum;
 }

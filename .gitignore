@@ -25,3 +25,9 @@ output.txt
 workloads/run/MI210/
 mfma.cpp
 moe.c
+
+output.mfma.txt
+output.tile8.txt
+output.tile16.txt
+mv-mi250-08/
+profile/
