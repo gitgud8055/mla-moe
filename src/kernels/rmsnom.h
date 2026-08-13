@@ -4,6 +4,10 @@
 #include "tensor.h"
 #include "utils.h"
 
+namespace mct = utils::constants::model;
+namespace gct = utils::constants::gpu;
+namespace types = utils::types;
+
 namespace utils {
   namespace rmsnorm {
     template<
@@ -11,7 +15,7 @@ namespace utils {
       size_t THREADS,
       size_t BLOCK_TILE_R
     >
-    __global__ void rmsnorm_kernel(
+    __global__ void rmsnorm(
       float *y, // [r x c]
       const float *x, // [r x c]
       const bf16_t *w, // [c]
@@ -19,9 +23,6 @@ namespace utils {
       size_t c,
       float eps
     ) {
-      namespace mct = utils::constants::model;
-      namespace gct = utils::constants::gpu;
-      namespace types = utils::types;
       // c is oneof
       // q_lora_rank = null(DSV) || 768(GLM)
       // kv_lora_rank = 512
@@ -37,13 +38,27 @@ namespace utils {
       __shared__ float s_sum[THREADS];
       __shared__ float inv;
 
+      constexpr size_t SM_SIZ_2 = SM_SIZ_1 + mct::HIDDEN_SIZE * sizeof(bf16_t);
+      static_assert(SM_SIZ_2 <= gct::LDS);
+      __shared__ bf16_t s_w[mct::HIDDEN_SIZE];
+
+      constexpr size_t VEC_C = 4;
+      static_assert(mct::HIDDEN_SIZE % VEC_C == 0);
+      constexpr size_t VEC_C_BF16 = 8;
+      static_assert(mct::HIDDEN_SIZE % VEC_C_BF16 == 0);
+
       size_t tix = threadIdx.x;
       size_t bix = blockIdx.x;
+      
+      for (size_t thread_c_vec = tix; thread_c_vec < c / VEC_C_BF16; thread_c_vec += THREADS) {
+          size_t thread_c_offset = thread_c_vec * VEC_C_BF16;
+          types::bf16v8 reg = *reinterpret_cast<const types::bf16v8 *>(w + thread_c_offset);
+          *reinterpret_cast<types::bf16v8 *>(s_w + thread_c_offset) = reg;
+      }
+
       for (size_t block_r_offset = bix * BLOCK_TILE_R; block_r_offset < r; block_r_offset += BLOCKS * BLOCK_TILE_R) {
         for (size_t block_r = block_r_offset; block_r < block_r_offset + BLOCK_TILE_R && block_r < r; ++block_r) {
           const float *block_x = x + block_r * c;
-          constexpr size_t VEC_C = 4;
-          static_assert(mct::HIDDEN_SIZE % VEC_C == 0);
           types::fp32v4 fp32_reg;
           float thread_sum = 0.f;
           for (size_t thread_c_vec = tix; thread_c_vec < c / VEC_C; thread_c_vec += THREADS) {
@@ -66,17 +81,17 @@ namespace utils {
           }
 
           if (tix == 0) {
-            inv = 1.f / sqrtf(s_sum[0] / static_cast<float>(c) + eps);
+            inv = __ocml_rsqrt_f32(s_sum[0] / static_cast<float>(c) + eps);
           }
+          // __ocml_rsqrt_f32
           __syncthreads();
           
-          constexpr size_t VEC_C_BF16 = 8;
           types::bf16v8 bf16_reg;
           types::fp32v4 fp32_reg_y;
           float *block_y = y + block_r * c;
           for (size_t thread_c_vec = tix; thread_c_vec < c / VEC_C_BF16; thread_c_vec += THREADS) {
             size_t thread_c_offset = thread_c_vec * VEC_C_BF16;
-            bf16_reg = *reinterpret_cast<const types::bf16v8 *>(w + thread_c_offset);
+            bf16_reg = *reinterpret_cast<const types::bf16v8 *>(s_w + thread_c_offset);
             
             for (size_t i = 0; i < VEC_C_BF16 / VEC_C; ++i) {
               fp32_reg = *reinterpret_cast<types::fp32v4 *>(s_x + thread_c_offset + i * VEC_C);

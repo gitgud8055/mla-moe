@@ -37,6 +37,7 @@ namespace utils {
   namespace types {
     typedef unsigned short bf16v8 __attribute__((ext_vector_type(8)));
     typedef float fp32v4 __attribute__((ext_vector_type(4)));
+    typedef float fp32v8 __attribute__((ext_vector_type(8)));
   }
 }
 

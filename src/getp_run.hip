@@ -17,7 +17,6 @@
 #include "kernels/getp_kernels.h"
 #include "kernels/utils.h"
 #include "kernels/prefill.h"
-#include "kernels/rmsnom.h"
 
 struct CopyChunk
 {
@@ -619,13 +618,15 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
 
     HIP_CHECK(hipMemcpyAsync(g.prompt_tokens, tokens, (size_t)n_prompt * sizeof(int),
                              hipMemcpyHostToDevice, g.stream));
-    constexpr bool BATCHING = true;
-    printf("BATCH MODE: %b\n", BATCHING);
+    constexpr bool MODE = true;
+    printf("MODE: %b\n", MODE);
     // Embed all tokens one by one (since embedding_kernel is hardcoded to 1 token)
-    if constexpr (BATCHING) {
+    if constexpr (MODE) {
         constexpr size_t EMBED_BLOCKS = 512;
         constexpr size_t EMBED_THREADS = gct::WAVE * 4;
-        prefill::embed::embed<mct::HIDDEN_SIZE, EMBED_BLOCKS, EMBED_THREADS><<<EMBED_BLOCKS, EMBED_THREADS>>>(
+        prefill::embed::embed
+        <mct::HIDDEN_SIZE, EMBED_BLOCKS, EMBED_THREADS>
+        <<<EMBED_BLOCKS, EMBED_THREADS, 0, g.stream>>>(
             n_prompt, 
             g.prefill_x,
             g.embed,
@@ -647,21 +648,59 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
         const DeviceLayer &d = g.layers[l];
         
         dim3 grid_b(1, n_prompt);
-        batched_rmsnorm_kernel<<<grid_b, HIP_BLOCK, 0, g.stream>>>(g.prefill_xn, g.prefill_x, d.input_norm, H, c.rms_eps);
-        
+        if constexpr (MODE) {
+            constexpr size_t BLOCKS = 256;
+            constexpr size_t THREADS = gct::WAVE * 4;
+            constexpr size_t BLOCK_TILE_R = 1;
+            utils::rmsnorm::rmsnorm
+            <BLOCKS, THREADS, BLOCK_TILE_R>
+            <<<BLOCKS, THREADS, 0, g.stream>>>(
+                g.prefill_xn, g.prefill_x, d.input_norm, n_prompt, H, c.rms_eps
+            );
+        } else {
+            batched_rmsnorm_kernel<<<grid_b, HIP_BLOCK, 0, g.stream>>>(g.prefill_xn, g.prefill_x, d.input_norm, H, c.rms_eps);
+        }
+
         dim3 grid_q_lora((c.q_lora_rank + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
         dim3 grid_q((QD + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
         dim3 grid_kv((KVD + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
 
         if (c.q_lora_rank > 0) {
-            batched_gemv_kernel<<<grid_q_lora, HIP_BLOCK, 0, g.stream>>>(g.prefill_q_a, g.prefill_xn, d.q_a_proj, c.q_lora_rank, H, 0);
-            batched_rmsnorm_kernel<<<grid_b, HIP_BLOCK, 0, g.stream>>>(g.prefill_q_a, g.prefill_q_a, d.q_a_norm, c.q_lora_rank, c.mla_norm_eps);
-            batched_gemv_kernel<<<grid_q, HIP_BLOCK, 0, g.stream>>>(g.prefill_q, g.prefill_q_a, d.q_b_proj, QD, c.q_lora_rank, 0);
+            if constexpr (MODE) {
+                utils::gemm::gemm(g.prefill_q_a, g.prefill_xn, d.q_a_proj, n_prompt, c.q_lora_rank, H, g.stream);
+            }
+            else {
+                batched_gemv_kernel<<<grid_q_lora, HIP_BLOCK, 0, g.stream>>>(g.prefill_q_a, g.prefill_xn, d.q_a_proj, c.q_lora_rank, H, 0);
+            }
+            if constexpr (MODE) {
+                constexpr size_t BLOCKS = 256;
+                constexpr size_t THREADS = gct::WAVE * 4;
+                constexpr size_t BLOCK_TILE_R = 1;
+                utils::rmsnorm::rmsnorm
+                <BLOCKS, THREADS, BLOCK_TILE_R>
+                <<<BLOCKS, THREADS, 0, g.stream>>>(
+                    g.prefill_q_a, g.prefill_q_a, d.q_a_norm, n_prompt, c.q_lora_rank, c.rms_eps
+                );
+            } else {
+                batched_rmsnorm_kernel<<<grid_b, HIP_BLOCK, 0, g.stream>>>(g.prefill_q_a, g.prefill_q_a, d.q_a_norm, c.q_lora_rank, c.mla_norm_eps);
+            }
+            if constexpr (MODE) {
+                utils::gemm::gemm(g.prefill_q, g.prefill_q_a, d.q_b_proj, n_prompt, QD, c.q_lora_rank, g.stream);
+            } else {
+                batched_gemv_kernel<<<grid_q, HIP_BLOCK, 0, g.stream>>>(g.prefill_q, g.prefill_q_a, d.q_b_proj, QD, c.q_lora_rank, 0);
+            }
         } else {
-            batched_gemv_kernel<<<grid_q, HIP_BLOCK, 0, g.stream>>>(g.prefill_q, g.prefill_xn, d.q_proj, QD, H, 0);
+            if constexpr (MODE) {
+                utils::gemm::gemm(g.prefill_q, g.prefill_xn, d.q_proj, n_prompt, QD, H, g.stream);
+            } else {
+                batched_gemv_kernel<<<grid_q, HIP_BLOCK, 0, g.stream>>>(g.prefill_q, g.prefill_xn, d.q_proj, QD, H, 0);
+            }
         }
-        batched_gemv_kernel<<<grid_kv, HIP_BLOCK, 0, g.stream>>>(g.prefill_comp, g.prefill_xn, d.kv_a_proj, KVD, H, 0);
-        
+        if constexpr (MODE) {
+            utils::gemm::gemm(g.prefill_comp, g.prefill_xn, d.kv_a_proj, n_prompt, KVD, H, g.stream);
+        } else {
+            batched_gemv_kernel<<<grid_kv, HIP_BLOCK, 0, g.stream>>>(g.prefill_comp, g.prefill_xn, d.kv_a_proj, KVD, H, 0);
+        }
         // rope + cache
         float *layer_cache_base = g.kv_cache + (size_t)l * g.kv_capacity * KVD;
         dim3 grid_kv_rope(1, n_prompt);
@@ -705,8 +744,23 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
 
         // O-Projection and RMSNorm
         dim3 grid_o((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
-        batched_gemv_kernel<<<grid_o, HIP_BLOCK, 0, g.stream>>>(g.prefill_x, g.prefill_ctx, d.o_proj, H, NH * VHD, 1);
-        batched_rmsnorm_kernel<<<grid_b, HIP_BLOCK, 0, g.stream>>>(g.prefill_xn, g.prefill_x, d.post_norm, H, c.rms_eps);
+        if constexpr (MODE) {
+            utils::gemm::gemm(g.prefill_x, g.prefill_ctx, d.o_proj, n_prompt, H, NH * VHD, g.stream, true);
+        } else {
+            batched_gemv_kernel<<<grid_o, HIP_BLOCK, 0, g.stream>>>(g.prefill_x, g.prefill_ctx, d.o_proj, H, NH * VHD, 1);
+        }
+        if constexpr (MODE) {
+            constexpr size_t BLOCKS = 256;
+            constexpr size_t THREADS = gct::WAVE * 4;
+            constexpr size_t BLOCK_TILE_R = 1;
+            utils::rmsnorm::rmsnorm
+            <BLOCKS, THREADS, BLOCK_TILE_R>
+            <<<BLOCKS, THREADS, 0, g.stream>>>(
+                g.prefill_xn, g.prefill_x, d.post_norm, n_prompt, H, c.rms_eps
+            );
+        } else {
+            batched_rmsnorm_kernel<<<grid_b, HIP_BLOCK, 0, g.stream>>>(g.prefill_xn, g.prefill_x, d.post_norm, H, c.rms_eps);
+        }
         HIP_LAUNCH_CHECK();
         
         // FFN / Batched MoE
@@ -718,8 +772,11 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
             HIP_LAUNCH_CHECK();
             
             dim3 grid_dense_down((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
-            batched_gemv_kernel<<<grid_dense_down, HIP_BLOCK, 0, g.stream>>>(
-                g.prefill_x, g.prefill_hb, d.dense_down, H, inter, 1);
+            if constexpr (MODE) {
+                utils::gemm::gemm(g.prefill_x, g.prefill_hb, d.dense_down, n_prompt, H, inter, g.stream, 1);
+            } else {
+                batched_gemv_kernel<<<grid_dense_down, HIP_BLOCK, 0, g.stream>>>(g.prefill_x, g.prefill_hb, d.dense_down, H, inter, 1);
+            }
             HIP_LAUNCH_CHECK();
         } else {
             batched_gpu_ffn(c, d, l, n_prompt);
