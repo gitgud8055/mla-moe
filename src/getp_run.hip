@@ -15,19 +15,9 @@
 #include "getp.h"
 #include "tokenizer.h"
 #include "kernels/getp_kernels.h"
-
-
-static void hip_fail(hipError_t status, const char *expr, const char *file, int line)
-{
-    if (status == hipSuccess)
-        return;
-    std::fprintf(stderr, "HIP failure at %s:%d: %s: %s\n", file, line, expr,
-                 hipGetErrorString(status));
-    std::exit(EXIT_FAILURE);
-}
-
-#define HIP_CHECK(expr) hip_fail((expr), #expr, __FILE__, __LINE__)
-#define HIP_LAUNCH_CHECK() HIP_CHECK(hipGetLastError())
+#include "kernels/utils.h"
+#include "kernels/prefill.h"
+#include "kernels/rmsnom.h"
 
 struct CopyChunk
 {
@@ -609,6 +599,8 @@ static void gpu_forward_absorbed(int host_token, const int *device_token,
 extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int n_prompt,
                                           double *nll_out, void *tf)
 {
+    namespace gct = utils::constants::gpu;
+    namespace mct = utils::constants::model;
     // C-compatible wrapper for prefill logic using FlashAttention-2
     if (!g.owner) return nullptr;
     const Config &c = g.owner->config;
@@ -627,12 +619,24 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
 
     HIP_CHECK(hipMemcpyAsync(g.prompt_tokens, tokens, (size_t)n_prompt * sizeof(int),
                              hipMemcpyHostToDevice, g.stream));
-    
+    constexpr bool BATCHING = true;
+    printf("BATCH MODE: %b\n", BATCHING);
     // Embed all tokens one by one (since embedding_kernel is hardcoded to 1 token)
-    for (int r = 0; r < n_prompt; ++r) {
-        embedding_kernel<<<(H + HIP_BLOCK - 1) / HIP_BLOCK,
-                           HIP_BLOCK, 0, g.stream>>>(
-            g.prefill_x + (size_t)r * H, g.embed, 0, g.prompt_tokens + r, nullptr, 0, H);
+    if constexpr (BATCHING) {
+        constexpr size_t EMBED_BLOCKS = 512;
+        constexpr size_t EMBED_THREADS = gct::WAVE * 4;
+        prefill::embed::embed<mct::HIDDEN_SIZE, EMBED_BLOCKS, EMBED_THREADS><<<EMBED_BLOCKS, EMBED_THREADS>>>(
+            n_prompt, 
+            g.prefill_x,
+            g.embed,
+            g.prompt_tokens
+        );
+    } else {
+        for (int r = 0; r < n_prompt; ++r) {
+            embedding_kernel<<<(H + HIP_BLOCK - 1) / HIP_BLOCK,
+                            HIP_BLOCK, 0, g.stream>>>(
+                g.prefill_x + (size_t)r * H, g.embed, 0, g.prompt_tokens + r, nullptr, 0, H);
+        }
     }
     HIP_LAUNCH_CHECK();
     
