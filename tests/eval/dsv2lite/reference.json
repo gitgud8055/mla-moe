@@ -1,38 +1,38 @@
 {
   "model": "dsv2lite",
   "model_dir": "/remote/vast0/share-mv/deepseek-ai/DeepSeek-V2-Lite",
-  "max_new": 32,
+  "max_new": 64,
   "transformers_version": "5.12.1",
   "requests": [
     {
       "prompt_len": 5,
-      "completion_len": 32,
-      "hf_nll": 31.29302406311035,
-      "hf_ntok": 36
+      "completion_len": 64,
+      "hf_nll": 39.48000717163086,
+      "hf_ntok": 68
     },
     {
       "prompt_len": 25,
-      "completion_len": 32,
-      "hf_nll": 103.62401580810547,
-      "hf_ntok": 56
+      "completion_len": 64,
+      "hf_nll": 105.27960205078125,
+      "hf_ntok": 88
     },
     {
       "prompt_len": 11,
-      "completion_len": 32,
-      "hf_nll": 33.305091857910156,
-      "hf_ntok": 42
+      "completion_len": 64,
+      "hf_nll": 54.503849029541016,
+      "hf_ntok": 74
     },
     {
       "prompt_len": 9,
-      "completion_len": 32,
-      "hf_nll": 32.572940826416016,
-      "hf_ntok": 40
+      "completion_len": 64,
+      "hf_nll": 37.798458099365234,
+      "hf_ntok": 72
     },
     {
       "prompt_len": 942,
-      "completion_len": 32,
-      "hf_nll": 877.9202270507812,
-      "hf_ntok": 973
+      "completion_len": 64,
+      "hf_nll": 880.7147827148438,
+      "hf_ntok": 1005
     }
   ]
 }

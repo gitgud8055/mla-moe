@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cassert>
 #include <limits>
 #include <vector>
 
@@ -18,88 +19,29 @@
 #include "kernels/utils.h"
 #include "kernels/prefill.h"
 #include "kernels/rmsnom.h"
+#include "kernels/getp_state.h"
 
-struct CopyChunk
-{
-    const void *host;
-    size_t offset;
-    size_t bytes;
-};
 
-static const size_t NO_OFFSET = std::numeric_limits<size_t>::max();
-
-struct LayerLayout {
-    size_t bytes = 0;
-    std::vector<CopyChunk> chunks;
-    size_t q_proj = NO_OFFSET, q_a_proj = NO_OFFSET, q_b_proj = NO_OFFSET;
-    size_t kv_a_proj = NO_OFFSET, kv_b_proj = NO_OFFSET, wuk_t = NO_OFFSET;
-    size_t o_proj = NO_OFFSET;
-    size_t input_norm = NO_OFFSET, post_norm = NO_OFFSET;
-    size_t q_a_norm = NO_OFFSET, kv_a_norm = NO_OFFSET;
-    size_t dense_gate = NO_OFFSET, dense_up = NO_OFFSET, dense_down = NO_OFFSET;
-    size_t moe_gate = NO_OFFSET, moe_bias = NO_OFFSET;
-    size_t shared_gate = NO_OFFSET, shared_up = NO_OFFSET, shared_down = NO_OFFSET;
-    std::vector<size_t> expert_gate, expert_up, expert_down;
-};
-
-struct DeviceLayer
-{
-    const char *pool = nullptr;
-    const bf16_t *q_proj = nullptr, *q_a_proj = nullptr, *q_b_proj = nullptr;
-    const bf16_t *kv_a_proj = nullptr, *W_UK = nullptr, *W_UV = nullptr;
-    const bf16_t *W_UK_T = nullptr;
-    const bf16_t *o_proj = nullptr;
-    const bf16_t *input_norm = nullptr, *post_norm = nullptr;
-    const bf16_t *q_a_norm = nullptr, *kv_a_norm = nullptr;
-    const bf16_t *dense_gate = nullptr, *dense_up = nullptr, *dense_down = nullptr;
-    const bf16_t *moe_gate = nullptr;
-    const float *moe_bias = nullptr;
-    const bf16_t *shared_gate = nullptr, *shared_up = nullptr, *shared_down = nullptr;
-    const size_t *expert_gate_offsets = nullptr;
-    const size_t *expert_up_offsets = nullptr;
-    const size_t *expert_down_offsets = nullptr;
-};
-
-struct GpuContext {
-    Transformer *owner = nullptr;
-    hipStream_t stream = nullptr;
-    bf16_t *embed = nullptr, *final_norm = nullptr, *lm_head = nullptr;
-    float *rope_inv_freq = nullptr;
-    std::vector<LayerLayout> layouts;
-    std::vector<std::vector<bf16_t>> host_wuk_t;
-    std::vector<DeviceLayer> layers;
-    std::vector<void *> layer_pools;
-    size_t *expert_offsets = nullptr;
-
-    float *x = nullptr, *xn = nullptr;
-    float *q = nullptr, *q_a = nullptr, *comp = nullptr;
-    float *qrope = nullptr, *qabs = nullptr, *scores = nullptr, *clat = nullptr;
-    float *ctx = nullptr, *hb = nullptr, *router = nullptr;
-    float *logits = nullptr, *kv_cache = nullptr;
-    int *topk = nullptr, *next_token = nullptr, *generated = nullptr;
-    float *topk_weights = nullptr;
-    int kv_capacity = 0;
-
-    /* Layer-major unabsorbed prefill workspace. */
-    int *prompt_tokens = nullptr, *prefill_topk = nullptr;
-    int *prefill_expert_counts = nullptr, *prefill_expert_buckets = nullptr;
-    float *prefill_x = nullptr, *prefill_xn = nullptr;
-    float *prefill_q = nullptr, *prefill_q_a = nullptr, *prefill_comp = nullptr;
-    float *prefill_qrope = nullptr, *prefill_knope = nullptr, *prefill_value = nullptr;
-    float *prefill_qabs = nullptr, *prefill_clat = nullptr;
-    float *prefill_scores = nullptr, *prefill_ctx = nullptr;
-    float *prefill_ffn = nullptr;
-    float *prefill_router = nullptr, *prefill_topk_weights = nullptr;
-    float *prefill_hb = nullptr, *routed_hidden = nullptr;
-    
-    int *prefill_expert_offsets = nullptr;
-    int *prefill_sorted_tokens = nullptr;
-    int *prefill_sorted_experts = nullptr;
-    int *prefill_sorted_slots = nullptr;
-    int prefill_capacity = 0;
-};
 
 static GpuContext g;
+static int g_max_batch = 1;
+
+static int configured_batch_size()
+{
+    constexpr int default_batch = 512;
+    constexpr int max_batch = 512;
+    const char *text = std::getenv("GETP_BATCH_SIZE");
+    if (!text || !*text) return default_batch;
+    char *end = nullptr;
+    long value = std::strtol(text, &end, 10);
+    if (*end != '\0' || value < 1 || value > max_batch) {
+        std::fprintf(stderr,
+            "GETP_BATCH_SIZE must be an integer in [1,%d] (got '%s')\n",
+            max_batch, text);
+        std::exit(EXIT_FAILURE);
+    }
+    return (int)value;
+}
 
 static size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -230,8 +172,10 @@ static void enqueue_layer_copy(const LayerLayout &a, void *pool) {
 
 static void launch_gemv(float *y, const float *x, const bf16_t *w,
                         int out, int in, bool add = false) {
-    int blocks = (out + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK;
-    gemv_kernel<<<blocks, HIP_BLOCK, 0, g.stream>>>(
+    constexpr int rows_per_block = kernel_tuning::GEMV_THREADS / HIP_WAVE;
+    int blocks = (out + rows_per_block - 1) / rows_per_block;
+    projection_kernels::gemv_kernel<kernel_tuning::GEMV_THREADS><<<
+        blocks, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
         y, x, w, out, in, add ? 1 : 0);
     HIP_LAUNCH_CHECK();
 }
@@ -240,8 +184,10 @@ static void launch_gate_up_swiglu(float *y, const float *x,
                                   const bf16_t *gate, const bf16_t *up,
                                   int out, int in)
 {
-    int blocks = (out + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK;
-    gate_up_swiglu_kernel<<<blocks, HIP_BLOCK, 0, g.stream>>>(
+    constexpr int rows_per_block = kernel_tuning::GEMV_THREADS / HIP_WAVE;
+    int blocks = (out + rows_per_block - 1) / rows_per_block;
+    projection_kernels::gate_up_swiglu_kernel<kernel_tuning::GEMV_THREADS><<<
+        blocks, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
         y, x, gate, up, out, in);
     HIP_LAUNCH_CHECK();
 }
@@ -249,7 +195,8 @@ static void launch_gate_up_swiglu(float *y, const float *x,
 
 static void launch_rmsnorm(float *y, const float *x, const bf16_t *w, int n, float eps)
 {
-    rmsnorm_kernel<<<1, HIP_BLOCK, 0, g.stream>>>(y, x, w, n, eps);
+    elementwise_kernels::rmsnorm_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<
+        1, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(y, x, w, n, eps);
     HIP_LAUNCH_CHECK();
 }
 
@@ -258,7 +205,8 @@ static void launch_kv_norm_rope(float *cache, const float *comp,
                                 int kv_rank, int kv_dim, int rope_dim,
                                 int position_base, float eps) {
     const Config &c = g.owner->config;
-    kv_norm_rope_rows_kernel<<<rows, HIP_BLOCK, 0, g.stream>>>(
+    attention_kernels::kv_norm_rope_rows_kernel<kernel_tuning::ATTENTION_THREADS><<<
+        rows, kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
         cache, comp, norm, rows, kv_rank, kv_dim, rope_dim, position_base,
         g.rope_inv_freq, c.rope_interleaved, eps);
     HIP_LAUNCH_CHECK();
@@ -270,8 +218,10 @@ static void launch_dual_gemv(
     float *y1, const bf16_t *w1, int out1,
     const float *x, int in) {
     int total = out0 + out1;
-    int blocks = (total + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK;
-    dual_gemv_kernel<<<blocks, HIP_BLOCK, 0, g.stream>>>(
+    constexpr int rows_per_block = kernel_tuning::GEMV_THREADS / HIP_WAVE;
+    int blocks = (total + rows_per_block - 1) / rows_per_block;
+    projection_kernels::dual_gemv_kernel<kernel_tuning::GEMV_THREADS><<<
+        blocks, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
         y0, w0, out0, y1, w1, out1, x, in);
     HIP_LAUNCH_CHECK();
 }
@@ -281,27 +231,31 @@ static void launch_router_topk(float *scores, const float *bias,
                                int experts, int k, int use_sigmoid,
                                int norm_topk, float routed_scale) {
     if (experts <= HIP_WAVE) {
-        router_topk_wave64_kernel<<<rows, HIP_WAVE, 0, g.stream>>>(
+        moe_kernels::router_topk_wave64_kernel<kernel_tuning::ROUTER_WAVE_THREADS><<<
+            rows, kernel_tuning::ROUTER_WAVE_THREADS, 0, g.stream>>>(
             scores, bias, indices, weights, rows, experts, k, use_sigmoid,
             norm_topk, routed_scale);
     } else {
-        router_topk_kernel<<<rows, HIP_BLOCK, 0, g.stream>>>(
+        moe_kernels::router_topk_kernel<kernel_tuning::ROUTER_THREADS><<<
+            rows, kernel_tuning::ROUTER_THREADS, 0, g.stream>>>(
             scores, bias, indices, weights, rows, experts, k, use_sigmoid,
             norm_topk, routed_scale);
     }
     HIP_LAUNCH_CHECK();
 }
 
+
+
 static hipError_t try_allocate_sequence_buffers(const Config &c, int cap)
 {
     const int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
     hipError_t status = hipMalloc(reinterpret_cast<void **>(&g.kv_cache),
-                                  (size_t)c.n_layers * cap * KVD * sizeof(float));
+                                  (size_t)c.n_layers * g_max_batch * cap * KVD * sizeof(float));
     if (status != hipSuccess)
         return status;
 
     status = hipMalloc(reinterpret_cast<void **>(&g.scores),
-                       (size_t)c.n_heads * cap * sizeof(float));
+                       (size_t)g_max_batch * c.n_heads * cap * sizeof(float));
     if (status != hipSuccess)
     {
         hipError_t cleanup = hipFree(g.kv_cache);
@@ -421,16 +375,16 @@ static void gpu_ffn(const Config &c, const DeviceLayer &d, int l) {
                        c.routed_scaling);
     int shared = c.n_shared_experts * inter;
     int gate_up_rows = K * inter + shared;
-    decode_routed_shared_gate_up_kernel<<<
-        (gate_up_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-        HIP_BLOCK, 0, g.stream>>>(
+    moe_kernels::decode_routed_shared_gate_up_kernel<kernel_tuning::GEMV_THREADS><<<
+        (gate_up_rows + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE),
+        kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             g.routed_hidden, g.hb, g.xn, d.pool,
             d.expert_gate_offsets, d.expert_up_offsets,
             g.topk, d.shared_gate, d.shared_up, K, inter, shared, H);
     HIP_LAUNCH_CHECK();
-    decode_routed_shared_down_kernel<<<
-        (H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-        HIP_BLOCK, 0, g.stream>>>(
+    moe_kernels::decode_routed_shared_down_kernel<kernel_tuning::GEMV_THREADS><<<
+        (H + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE),
+        kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             g.x, g.routed_hidden, g.hb, d.pool,
             d.expert_down_offsets, g.topk, g.topk_weights, d.shared_down,
             K, H, inter, shared);
@@ -449,56 +403,56 @@ static void batched_gpu_ffn(const Config &c, const DeviceLayer &d, int l, int n_
     int inter = c.moe_inter_size;
     int shared = c.n_shared_experts * inter;
     
-    dim3 grid_router((E + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
-    batched_gemv_kernel<<<grid_router, HIP_BLOCK, 0, g.stream>>>(
+    dim3 grid_router((E + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), n_prompt);
+    projection_kernels::batched_gemv_kernel<kernel_tuning::GEMV_THREADS><<<grid_router, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
         g.prefill_router, g.prefill_xn, d.moe_gate, E, H, 0);
     HIP_LAUNCH_CHECK();
     
-    router_topk_wave64_kernel<<<n_prompt, HIP_BLOCK, 0, g.stream>>>(
+    moe_kernels::router_topk_wave64_kernel<kernel_tuning::ROUTER_WAVE_THREADS><<<n_prompt, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
         g.prefill_router, d.moe_bias, g.prefill_topk, g.prefill_topk_weights,
         n_prompt, E, K, c.router_sigmoid, c.norm_topk, c.routed_scaling);
     HIP_LAUNCH_CHECK();
     
     int total_items = n_prompt * K;
-    int blocks_items = (n_prompt + HIP_BLOCK - 1) / HIP_BLOCK;
+    int blocks_items = (n_prompt + kernel_tuning::GEMV_THREADS - 1) / kernel_tuning::GEMV_THREADS;
     
-    moe_token_sort_kernel<<<blocks_items, HIP_BLOCK, 0, g.stream>>>(
+    moe_kernels::moe_token_sort_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<blocks_items, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
         g.prefill_topk, n_prompt, K, g.prefill_expert_counts);
     HIP_LAUNCH_CHECK();
     
-    expert_prefix_sum_kernel<<<1, 1, 0, g.stream>>>(
+    moe_kernels::expert_prefix_sum_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<1, 1, 0, g.stream>>>(
         g.prefill_expert_offsets, g.prefill_expert_counts, E);
     HIP_LAUNCH_CHECK();
     
-    moe_token_scatter_kernel<<<blocks_items, HIP_BLOCK, 0, g.stream>>>(
+    moe_kernels::moe_token_scatter_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<blocks_items, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
         g.prefill_topk, n_prompt, K, g.prefill_expert_offsets,
         g.prefill_sorted_tokens, g.prefill_sorted_experts, g.prefill_sorted_slots);
     HIP_LAUNCH_CHECK();
     
-    dim3 grid_gate_up((inter + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, total_items);
-    batched_sorted_routed_gate_up_kernel<<<grid_gate_up, HIP_BLOCK, 0, g.stream>>>(
+    dim3 grid_gate_up((inter + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), total_items);
+    moe_kernels::batched_sorted_routed_gate_up_kernel<kernel_tuning::GEMV_THREADS><<<grid_gate_up, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
         g.routed_hidden, g.prefill_xn, d.pool,
         d.expert_gate_offsets, d.expert_up_offsets,
         g.prefill_sorted_tokens, g.prefill_sorted_experts, g.prefill_sorted_slots,
         total_items, K, inter, H);
     HIP_LAUNCH_CHECK();
     
-    dim3 grid_down((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, total_items);
-    batched_sorted_routed_down_kernel<<<grid_down, HIP_BLOCK, 0, g.stream>>>(
+    dim3 grid_down((H + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), total_items);
+    moe_kernels::batched_sorted_routed_down_kernel<kernel_tuning::GEMV_THREADS><<<grid_down, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
         g.prefill_x, g.routed_hidden, d.pool,
         d.expert_down_offsets, g.prefill_sorted_tokens, g.prefill_sorted_experts, g.prefill_sorted_slots,
         g.prefill_topk_weights, total_items, K, H, inter);
     HIP_LAUNCH_CHECK();
     
     if (shared > 0) {
-        dim3 shared_gate_up((shared + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
-        batched_shared_gate_up_kernel<<<shared_gate_up, HIP_BLOCK, 0, g.stream>>>(
+        dim3 shared_gate_up((shared + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), n_prompt);
+        moe_kernels::batched_shared_gate_up_kernel<kernel_tuning::GEMV_THREADS><<<shared_gate_up, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             g.prefill_hb, g.prefill_xn, d.shared_gate, d.shared_up,
             n_prompt, shared, H);
         HIP_LAUNCH_CHECK();
         
-        dim3 shared_down((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
-        batched_shared_down_kernel<<<shared_down, HIP_BLOCK, 0, g.stream>>>(
+        dim3 shared_down((H + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), n_prompt);
+        moe_kernels::batched_shared_down_kernel<kernel_tuning::GEMV_THREADS><<<shared_down, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             g.prefill_x, g.prefill_hb, d.shared_down,
             n_prompt, H, shared);
         HIP_LAUNCH_CHECK();
@@ -528,7 +482,10 @@ static void gpu_forward_absorbed(int host_token, const int *device_token,
         std::fprintf(stderr, "HIP inference: position %d exceeds KV capacity %d\n", pos, g.kv_capacity);
         std::exit(EXIT_FAILURE);
     }
-    embedding_kernel<<<(H + HIP_BLOCK - 1) / HIP_BLOCK, HIP_BLOCK, 0, g.stream>>>(
+    elementwise_kernels::embedding_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<
+        (H + kernel_tuning::ELEMENTWISE_THREADS - 1) /
+            kernel_tuning::ELEMENTWISE_THREADS,
+        kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
         g.x, g.embed, host_token, device_token, generated, output_index, H);
     HIP_LAUNCH_CHECK();
 
@@ -556,30 +513,30 @@ static void gpu_forward_absorbed(int host_token, const int *device_token,
                             1, KVL, KVD, QKR, pos, c.mla_norm_eps);
 
         int qabs_rows = NH * KVL;
-        q_absorb_rope_kernel<<<
-            (qabs_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-            HIP_BLOCK, 0, g.stream>>>(
+        attention_kernels::q_absorb_rope_kernel<kernel_tuning::ATTENTION_THREADS><<<
+            (qabs_rows + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE),
+            kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 g.qabs, g.qrope, g.q, d.W_UK_T, NH, QHD, QKN, QKR,
                 KVL, pos, g.rope_inv_freq, c.rope_interleaved);
         HIP_LAUNCH_CHECK();
         int score_rows = NH * kv_len;
-        attention_score_kernel<<<
-            (score_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-            HIP_BLOCK, 0, g.stream>>>(
+        attention_kernels::attention_score_kernel<kernel_tuning::ATTENTION_THREADS><<<
+            (score_rows + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE),
+            kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 g.scores, g.qabs, g.qrope, layer_cache,
                 NH, kv_len, KVD, KVL, QKR, c.softmax_scale);
         HIP_LAUNCH_CHECK();
-        softmax_rows_kernel<<<NH, HIP_BLOCK, 0, g.stream>>>(
+        attention_kernels::softmax_rows_kernel<kernel_tuning::ATTENTION_THREADS><<<NH, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             g.scores, NH, kv_len, kv_len, 0);
         HIP_LAUNCH_CHECK();
-        latent_context_kernel<<<
-            (qabs_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-            HIP_BLOCK, 0, g.stream>>>(
+        attention_kernels::latent_context_kernel<kernel_tuning::ATTENTION_THREADS><<<
+            (qabs_rows + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE),
+            kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 g.clat, g.scores, layer_cache, NH, kv_len, KVD, KVL);
         HIP_LAUNCH_CHECK();
         int value_rows = NH * VHD;
-        value_up_kernel<<<(value_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK,
-                            HIP_BLOCK, 0, g.stream>>>(
+        attention_kernels::value_up_kernel<kernel_tuning::ATTENTION_THREADS><<<(value_rows + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE),
+                            kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             g.ctx, g.clat, d.W_UV, NH, VHD, KVL, head_stride);
         HIP_LAUNCH_CHECK();
         launch_gemv(g.x, g.ctx, d.o_proj, H, NH * VHD, true);
@@ -592,7 +549,9 @@ static void gpu_forward_absorbed(int host_token, const int *device_token,
         return;
     launch_rmsnorm(g.xn, g.x, g.final_norm, H, c.rms_eps);
     launch_gemv(g.logits, g.xn, g.lm_head, c.vocab_size, H);
-    argmax_kernel<<<1, HIP_BLOCK, 0, g.stream>>>(g.logits, c.vocab_size, g.next_token);
+    elementwise_kernels::argmax_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<
+        1, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+        g.logits, c.vocab_size, g.next_token);
     HIP_LAUNCH_CHECK();
 }
 
@@ -633,8 +592,8 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
         );
     } else {
         for (int r = 0; r < n_prompt; ++r) {
-            embedding_kernel<<<(H + HIP_BLOCK - 1) / HIP_BLOCK,
-                            HIP_BLOCK, 0, g.stream>>>(
+            elementwise_kernels::embedding_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<(H + kernel_tuning::GEMV_THREADS - 1) / kernel_tuning::GEMV_THREADS,
+                            kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 g.prefill_x + (size_t)r * H, g.embed, 0, g.prompt_tokens + r, nullptr, 0, H);
         }
     }
@@ -647,25 +606,25 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
         const DeviceLayer &d = g.layers[l];
         
         dim3 grid_b(1, n_prompt);
-        batched_rmsnorm_kernel<<<grid_b, HIP_BLOCK, 0, g.stream>>>(g.prefill_xn, g.prefill_x, d.input_norm, H, c.rms_eps);
+        elementwise_kernels::batched_rmsnorm_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<grid_b, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(g.prefill_xn, g.prefill_x, d.input_norm, H, c.rms_eps);
         
-        dim3 grid_q_lora((c.q_lora_rank + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
-        dim3 grid_q((QD + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
-        dim3 grid_kv((KVD + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
+        dim3 grid_q_lora((c.q_lora_rank + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), n_prompt);
+        dim3 grid_q((QD + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), n_prompt);
+        dim3 grid_kv((KVD + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), n_prompt);
 
         if (c.q_lora_rank > 0) {
-            batched_gemv_kernel<<<grid_q_lora, HIP_BLOCK, 0, g.stream>>>(g.prefill_q_a, g.prefill_xn, d.q_a_proj, c.q_lora_rank, H, 0);
-            batched_rmsnorm_kernel<<<grid_b, HIP_BLOCK, 0, g.stream>>>(g.prefill_q_a, g.prefill_q_a, d.q_a_norm, c.q_lora_rank, c.mla_norm_eps);
-            batched_gemv_kernel<<<grid_q, HIP_BLOCK, 0, g.stream>>>(g.prefill_q, g.prefill_q_a, d.q_b_proj, QD, c.q_lora_rank, 0);
+            projection_kernels::batched_gemv_kernel<kernel_tuning::GEMV_THREADS><<<grid_q_lora, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(g.prefill_q_a, g.prefill_xn, d.q_a_proj, c.q_lora_rank, H, 0);
+            elementwise_kernels::batched_rmsnorm_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<grid_b, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(g.prefill_q_a, g.prefill_q_a, d.q_a_norm, c.q_lora_rank, c.mla_norm_eps);
+            projection_kernels::batched_gemv_kernel<kernel_tuning::GEMV_THREADS><<<grid_q, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(g.prefill_q, g.prefill_q_a, d.q_b_proj, QD, c.q_lora_rank, 0);
         } else {
-            batched_gemv_kernel<<<grid_q, HIP_BLOCK, 0, g.stream>>>(g.prefill_q, g.prefill_xn, d.q_proj, QD, H, 0);
+            projection_kernels::batched_gemv_kernel<kernel_tuning::GEMV_THREADS><<<grid_q, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(g.prefill_q, g.prefill_xn, d.q_proj, QD, H, 0);
         }
-        batched_gemv_kernel<<<grid_kv, HIP_BLOCK, 0, g.stream>>>(g.prefill_comp, g.prefill_xn, d.kv_a_proj, KVD, H, 0);
+        projection_kernels::batched_gemv_kernel<kernel_tuning::GEMV_THREADS><<<grid_kv, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(g.prefill_comp, g.prefill_xn, d.kv_a_proj, KVD, H, 0);
         
         // rope + cache
         float *layer_cache_base = g.kv_cache + (size_t)l * g.kv_capacity * KVD;
         dim3 grid_kv_rope(1, n_prompt);
-        batched_kv_norm_rope_rows_kernel<<<grid_kv_rope, HIP_BLOCK, 0, g.stream>>>(
+        attention_kernels::batched_kv_norm_rope_rows_kernel<kernel_tuning::ATTENTION_THREADS><<<grid_kv_rope, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             layer_cache_base, g.prefill_comp, d.kv_a_norm, KVL, KVD, QKR, 0, g.rope_inv_freq, c.rope_interleaved, c.mla_norm_eps);
         HIP_LAUNCH_CHECK();
 
@@ -673,8 +632,8 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
         // Compute Q_proj (qabs) and qrope for all tokens in prompt
         // =====================================================================
         int qabs_rows = NH * KVL;
-        dim3 grid_qabs((qabs_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
-        batched_q_absorb_rope_kernel<<<grid_qabs, HIP_BLOCK, 0, g.stream>>>(
+        dim3 grid_qabs((qabs_rows + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), n_prompt);
+        attention_kernels::batched_q_absorb_rope_kernel<kernel_tuning::ATTENTION_THREADS><<<grid_qabs, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             g.prefill_qabs, g.prefill_qrope, g.prefill_q, d.W_UK_T,
             NH, QHD, QKN, QKR, KVL, 0, g.rope_inv_freq, c.rope_interleaved);
         HIP_LAUNCH_CHECK();
@@ -685,7 +644,7 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
         dim3 grid(n_prompt, NH);
         dim3 block(64); // One HIP_WAVE
         
-        fused_prefill_mla_kernel<<<grid, block, 0, g.stream>>>(
+        attention_kernels::fused_prefill_mla_kernel<kernel_tuning::ATTENTION_THREADS><<<grid, block, 0, g.stream>>>(
             g.prefill_clat, 
             g.prefill_qabs, 
             g.prefill_qrope, 
@@ -697,28 +656,28 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
         // Post-compute V-projection (Ctx = O_latent * W_UV)
         // =====================================================================
         int value_rows = NH * VHD;
-        dim3 grid_vup((value_rows + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
-        batched_value_up_kernel<<<grid_vup, HIP_BLOCK, 0, g.stream>>>(
+        dim3 grid_vup((value_rows + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), n_prompt);
+        attention_kernels::batched_value_up_kernel<kernel_tuning::ATTENTION_THREADS><<<grid_vup, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             g.prefill_ctx, g.prefill_clat, d.W_UV, NH, VHD, KVL, head_stride);
         HIP_LAUNCH_CHECK();
         // =====================================================================
 
         // O-Projection and RMSNorm
-        dim3 grid_o((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
-        batched_gemv_kernel<<<grid_o, HIP_BLOCK, 0, g.stream>>>(g.prefill_x, g.prefill_ctx, d.o_proj, H, NH * VHD, 1);
-        batched_rmsnorm_kernel<<<grid_b, HIP_BLOCK, 0, g.stream>>>(g.prefill_xn, g.prefill_x, d.post_norm, H, c.rms_eps);
+        dim3 grid_o((H + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), n_prompt);
+        projection_kernels::batched_gemv_kernel<kernel_tuning::GEMV_THREADS><<<grid_o, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(g.prefill_x, g.prefill_ctx, d.o_proj, H, NH * VHD, 1);
+        elementwise_kernels::batched_rmsnorm_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<grid_b, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(g.prefill_xn, g.prefill_x, d.post_norm, H, c.rms_eps);
         HIP_LAUNCH_CHECK();
         
         // FFN / Batched MoE
         if (l < c.first_k_dense) {
             int inter = c.dense_inter_size;
-            dim3 grid_dense_gate_up((inter + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
-            batched_gate_up_swiglu_kernel<<<grid_dense_gate_up, HIP_BLOCK, 0, g.stream>>>(
+            dim3 grid_dense_gate_up((inter + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), n_prompt);
+            projection_kernels::batched_gate_up_swiglu_kernel<kernel_tuning::GEMV_THREADS><<<grid_dense_gate_up, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 g.prefill_hb, g.prefill_xn, d.dense_gate, d.dense_up, inter, H);
             HIP_LAUNCH_CHECK();
             
-            dim3 grid_dense_down((H + HIP_ROWS_PER_BLOCK - 1) / HIP_ROWS_PER_BLOCK, n_prompt);
-            batched_gemv_kernel<<<grid_dense_down, HIP_BLOCK, 0, g.stream>>>(
+            dim3 grid_dense_down((H + (kernel_tuning::GEMV_THREADS / HIP_WAVE) - 1) / (kernel_tuning::GEMV_THREADS / HIP_WAVE), n_prompt);
+            projection_kernels::batched_gemv_kernel<kernel_tuning::GEMV_THREADS><<<grid_dense_down, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 g.prefill_x, g.prefill_hb, d.dense_down, H, inter, 1);
             HIP_LAUNCH_CHECK();
         } else {
@@ -732,7 +691,7 @@ extern "C" float* gpu_forward_unabsorbed(Transformer *t, const int *tokens, int 
     launch_gemv(g.logits, g.xn, g.lm_head, c.vocab_size, H);
     
     // Sample the next token!
-    argmax_kernel<<<1, HIP_BLOCK, 0, g.stream>>>(g.logits, c.vocab_size, g.next_token);
+    elementwise_kernels::argmax_kernel<kernel_tuning::ELEMENTWISE_THREADS><<<1, kernel_tuning::GEMV_THREADS, 0, g.stream>>>(g.logits, c.vocab_size, g.next_token);
     HIP_LAUNCH_CHECK();
     
     HIP_CHECK(hipMemcpyAsync(host_logits, g.logits, c.vocab_size * sizeof(float),
@@ -746,6 +705,9 @@ extern "C" void warm_up(Transformer *t) {
         std::fprintf(stderr, "warm_up: HIP context is already initialized\n");
         std::exit(EXIT_FAILURE);
     }
+
+    if (t->config.rope_interleaved && t->config.q_lora_rank > 0)
+        t->config.max_seq_len = 512 + 64;
     const Config &c = t->config;
     if (c.n_routed_experts < 1 || c.n_routed_experts > 1024 ||
         c.n_experts_per_tok < 1 || c.n_experts_per_tok > 16 ||
@@ -754,6 +716,7 @@ extern "C" void warm_up(Transformer *t) {
         std::exit(EXIT_FAILURE);
     }
     g.owner = t;
+    g_max_batch = configured_batch_size();
     int device = 0;
     HIP_CHECK(hipGetDevice(&device));
     hipDeviceProp_t prop;
@@ -762,7 +725,7 @@ extern "C" void warm_up(Transformer *t) {
         std::fprintf(stderr, "HIP baseline requires wavefront-64, device reports %d\n", prop.warpSize);
         std::exit(EXIT_FAILURE);
     }
-    if (HIP_BLOCK > prop.maxThreadsPerBlock || c.v_head_dim <= 0 ||
+    if (kernel_tuning::GEMV_THREADS > prop.maxThreadsPerBlock || c.v_head_dim <= 0 ||
         c.v_head_dim > prop.maxThreadsPerBlock ||
         c.qk_rope_head_dim <= 0 || (c.qk_rope_head_dim & 1) ||
         c.qk_rope_head_dim / 2 > prop.maxThreadsPerBlock) {
@@ -847,37 +810,83 @@ extern "C" void warm_up(Transformer *t) {
     int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
     int shared = c.n_shared_experts * c.moe_inter_size;
     int inter = std::max(c.dense_inter_size, std::max(shared, c.moe_inter_size));
-    device_alloc(&g.x, c.hidden_size);
-    device_alloc(&g.xn, c.hidden_size);
-    device_alloc(&g.q, (size_t)c.n_heads * QHD);
-    device_alloc(&g.q_a, std::max(1, c.q_lora_rank));
-    device_alloc(&g.comp, KVD);
-    device_alloc(&g.qrope, (size_t)c.n_heads * c.qk_rope_head_dim);
-    device_alloc(&g.qabs, (size_t)c.n_heads * c.kv_lora_rank);
-    device_alloc(&g.clat, (size_t)c.n_heads * c.kv_lora_rank);
-    device_alloc(&g.ctx, (size_t)c.n_heads * c.v_head_dim);
-    device_alloc(&g.hb, inter);
-    device_alloc(&g.routed_hidden, (size_t)c.n_experts_per_tok * c.moe_inter_size);
-    device_alloc(&g.router, std::max(1, c.n_routed_experts));
-    device_alloc(&g.topk, std::max(1, c.n_experts_per_tok));
-    device_alloc(&g.topk_weights, std::max(1, c.n_experts_per_tok));
-    device_alloc(&g.logits, c.vocab_size);
-    device_alloc(&g.next_token, 1);
-    device_alloc(&g.generated, c.max_seq_len);
+
+    size_t free_after_weights = 0;
+    HIP_CHECK(hipMemGetInfo(&free_after_weights, &total_bytes));
+    size_t per_batch_floats =
+        (size_t)2 * c.hidden_size + (size_t)c.n_heads * QHD
+        + (size_t)std::max(1, c.q_lora_rank) + KVD
+        + (size_t)c.n_heads * c.qk_rope_head_dim
+        + (size_t)2 * c.n_heads * c.kv_lora_rank
+        + (size_t)c.n_heads * c.v_head_dim + inter
+        + (size_t)c.n_experts_per_tok * c.moe_inter_size
+        + (size_t)std::max(1, c.n_routed_experts)
+        + (size_t)std::max(1, c.n_experts_per_tok) + c.vocab_size
+        + (size_t)c.n_heads * initial_cap
+        + (size_t)c.n_layers * initial_cap * KVD;
+    size_t per_batch_bytes = per_batch_floats * sizeof(float)
+        + ((size_t)std::max(1, c.n_experts_per_tok) + 1 + c.max_seq_len)
+            * sizeof(int);
+    constexpr size_t vram_reserve = (size_t)512 << 20;
+    size_t memory_batch = free_after_weights > vram_reserve
+        ? (free_after_weights - vram_reserve) / per_batch_bytes : 0;
+    if (memory_batch < 1) {
+        std::fprintf(stderr, "HIP inference: insufficient VRAM for batch buffers\n");
+        std::exit(EXIT_FAILURE);
+    }
+    if ((size_t)g_max_batch > memory_batch) {
+        std::fprintf(stderr,
+            "[getp HIP] reducing batch %d -> %zu to fit available VRAM\n",
+            g_max_batch, memory_batch);
+        g_max_batch = (int)memory_batch;
+    }
+
+    const size_t B = (size_t)g_max_batch;
+    device_alloc(&g.x, B * c.hidden_size);
+    device_alloc(&g.xn, B * c.hidden_size);
+    device_alloc(&g.q, B * c.n_heads * QHD);
+    device_alloc(&g.q_a, B * std::max(1, c.q_lora_rank));
+    device_alloc(&g.comp, B * KVD);
+    device_alloc(&g.qrope, B * c.n_heads * c.qk_rope_head_dim);
+    device_alloc(&g.qabs, B * c.n_heads * c.kv_lora_rank);
+    device_alloc(&g.clat, B * c.n_heads * c.kv_lora_rank);
+    device_alloc(&g.ctx, B * c.n_heads * c.v_head_dim);
+    device_alloc(&g.hb, B * inter);
+    device_alloc(&g.prefill_hb, B * inter);
+    device_alloc(&g.routed_hidden,
+                 B * c.n_experts_per_tok * c.moe_inter_size);
+    const size_t max_padded_routes =
+        B * c.n_experts_per_tok + (size_t)c.n_routed_experts * 63;
+    device_alloc(&g.prefill_topk, max_padded_routes);
+    device_alloc(&g.prefill_expert_counts,
+                 (max_padded_routes + 63) / 64);
+    device_alloc(&g.prefill_expert_buckets, 1);
+    device_alloc(&g.prefill_ffn,
+                 B * c.n_experts_per_tok * c.hidden_size);
+    device_alloc(&g.router, B * std::max(1, c.n_routed_experts));
+    device_alloc(&g.topk, B * std::max(1, c.n_experts_per_tok));
+    device_alloc(&g.topk_weights, B * std::max(1, c.n_experts_per_tok));
+    device_alloc(&g.logits, B * c.vocab_size);
+    device_alloc(&g.next_token, B);
+    device_alloc(&g.generated, B * c.max_seq_len);
     g.kv_capacity = 0;
     ensure_sequence_capacity(initial_cap);
     HIP_CHECK(hipStreamSynchronize(g.stream));
 
-    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident initial_kv=%d\n",
+    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident batch=%d initial_kv=%d\n",
                  prop.name, (double)total_bytes / (double)(1ULL << 30),
                  (double)(global_bytes + layer_total) / (double)(1ULL << 30),
-                 g.kv_capacity);
+                 g_max_batch, g.kv_capacity);
 }
 
 extern "C" void finish(Transformer *t) {
     (void)t;
     if (!g.owner) return;
     HIP_CHECK(hipStreamSynchronize(g.stream));
+
+    // prefill
+    device_free(g.xs);
+
     device_free(g.embed);
     device_free(g.final_norm);
     device_free(g.lm_head);
@@ -905,6 +914,7 @@ extern "C" void finish(Transformer *t) {
     device_free(g.prefill_hb); device_free(g.routed_hidden);
     HIP_CHECK(hipStreamDestroy(g.stream));
     g = GpuContext();
+    g_max_batch = 1;
 }
 
 extern "C" long long inference(Transformer *t, Requests *reqs)
@@ -920,14 +930,20 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
         std::exit(EXIT_FAILURE);
     }
     const int max_seq = t->config.max_seq_len;
+    const bool glm_runtime_cap =
+        t->config.rope_interleaved && t->config.q_lora_rank > 0;
+
+    const int prompt_cap = glm_runtime_cap
+        ? std::max(1, max_seq - std::min(reqs->max_steps, 64))
+        : max_seq;
     const int eos = tokenizer_eos_id(t->tokenizer);
     std::vector<std::vector<int>> prompts((size_t)reqs->num_reqs);
     int required_capacity = 1;
     for (int r = 0; r < reqs->num_reqs; ++r)
     {
-        prompts[r].resize(max_seq);
+        prompts[r].resize(prompt_cap);
         int n = tokenizer_encode(t->tokenizer, reqs->prompts[r], 0,
-                                 prompts[r].data(), max_seq);
+                                 prompts[r].data(), prompt_cap);
         if (n < 0)
             n = 0;
         prompts[r].resize((size_t)n);
