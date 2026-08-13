@@ -2,6 +2,8 @@
 #define PREFILL_H
 
 #include "utils.h"
+#include "gemm.h"
+#include "rmsnorm.h"
 
 namespace prefill {
   namespace embed {
