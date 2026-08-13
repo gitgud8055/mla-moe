@@ -24,3 +24,5 @@ venv/
 output.txt
 workloads/run/MI210/
 data/
+mfma.cpp
+moe.c
