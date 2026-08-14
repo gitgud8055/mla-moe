@@ -1,0 +1,30 @@
+Kernel_Name,Count,Sum(us),Mean(us),Median(us),Pct
+"batch_decode_kernels::mfma_gemm(float*, float const*, unsigned short const*, int, int, int, int)",540,51781.811,95.8922425925926,85.6,40.700454213916565
+"void batch_decode_kernels::grouped_expert_gate_up<16, 1>(float const*, char const*, unsigned long const*, unsigned long const*, int const*, int const*, float*, unsigned short*, int, int, int, int, int)",104,19711.598,189.53459615384617,136.4805,15.493297286997734
+"void batch_decode_kernels::grouped_expert_down<16, 1>(float const*, unsigned short const*, char const*, unsigned long const*, int const*, int const*, float*, int, int, int, int)",104,11605.811,111.59433653846153,80.32,9.122156411657159
+"batch_decode_kernels::mfma_gate_up_swiglu(float*, float const*, unsigned short const*, unsigned short const*, int, int, int)",108,10147.877,93.96182407407407,88.64,7.976221673802737
+"batch_decode_kernels::mfma_head_gemm(float*, float const*, unsigned short const*, int, int, int, int, int, int, unsigned long)",216,4299.704,19.906037037037038,20.24,3.379563256012693
+"batch_decode_kernels::rmsnorm(float*, float const*, unsigned short const*, int, int, float)",275,3556.021,12.930985454545455,12.801,2.7950291250768693
+"batch_decode_kernels::reduce_routes_add(float*, float const*, float const*, int, int, int)",104,3088.013,29.69243269230769,29.92,2.427175282040235
+"batch_decode_kernels::latent_context(float*, float const*, unsigned short const*, int, int, int, int, int, int)",108,3048.813,28.22975,34.0,2.3963641193100336
+"batch_decode_kernels::gemv(float*, float const*, unsigned short const*, int, int, int, int)",81,2636.812,32.553234567901235,23.04,2.0725317250241746
+"batch_decode_kernels::routed_shared_gate_up(float*, float*, float const*, char const*, unsigned long const*, unsigned long const*, int const*, unsigned short const*, unsigned short const*, int, int, int, int, int)",26,2400.169,92.31419230769231,92.481,1.8865305520149132
+"void moe_kernels::router_topk_wave64_kernel<64>(float*, float const*, int*, float*, int, int, int, int, int, float)",130,2098.573,16.142869230769232,16.0,1.6494763827603773
+"batch_decode_kernels::align_routes(int const*, int, int, int, int*, int*, int*)",104,1829.449,17.59085576923077,17.12,1.4379451746327576
+"batch_decode_kernels::routed_shared_down(float*, float const*, float const*, char const*, unsigned long const*, int const*, float const*, unsigned short const*, int, int, int, int, int)",26,1690.565,65.02173076923077,64.8,1.3287824826781331
+"batch_decode_kernels::kv_norm_rope(unsigned short*, float const*, unsigned short const*, int, int, int, int, int, int, float const*, int, float)",108,1107.364,10.253370370370371,9.92,0.870387051162415
+"batch_decode_kernels::attention_score(float*, float const*, float const*, unsigned short const*, int, int, int, int, int, int, int, float)",108,1077.925,9.980787037037036,9.92,0.8472480251518435
+"batch_decode_kernels::dual_gemv(float*, unsigned short const*, int, float*, unsigned short const*, int, float const*, int, int)",27,1045.765,38.73203703703704,38.72,0.8219702957282908
+"batch_decode_kernels::gate_up_swiglu(float*, float const*, unsigned short const*, unsigned short const*, int, int, int)",27,1042.244,38.60162962962963,35.68,0.8192027930759173
+"batch_decode_kernels::argmax(float const*, int, int*, int)",5,915.204,183.0408,182.561,0.7193494738604892
+"void batch_decode_kernels::flash_prefill<8>(float*, float const*, float const*, unsigned short const*, int, int, int, int, int, int, int, float)",27,910.887,33.736555555555555,33.761,0.7159563159649208
+"void attention_kernels::softmax_rows_kernel<256>(float*, int, int, int, int)",108,870.566,8.060796296296296,8.0,0.6842640483005218
+"batch_decode_kernels::q_rope(float*, float const*, int, int, int, int, int, int, float const*, int)",81,602.242,7.435086419753087,7.36,0.4733616394122936
+__amd_rocclr_copyBuffer,89,479.52,5.387865168539326,5.12,0.3769022640914832
+"batch_decode_kernels::q_absorb_rope(float*, float*, float const*, unsigned short const*, int, int, int, int, int, int, int, float const*, int)",27,418.241,15.490407407407407,15.52,0.3287370283531157
+"batch_decode_kernels::value_up(float*, float const*, unsigned short const*, int, int, int, int, unsigned long)",27,330.082,12.225259259259259,12.16,0.2594441381711815
+"batch_decode_kernels::prefill_kv_norm_rope(unsigned short*, float const*, unsigned short const*, int, int, int, int, int, int, float const*, int, float)",27,272.0,10.074074074074074,10.08,0.21379174139323373
+"batch_decode_kernels::prefill_q_rope(float*, float const*, int, int, int, int, int, float const*, int)",27,209.761,7.7689259259259265,7.84,0.16487194656759596
+"batch_decode_kernels::embedding(float*, unsigned short const*, int const*, int*, int, int, int, int)",5,24.64,4.928,5.28,0.01936701657326941
+__amd_rocclr_fillBufferAligned,4,19.84,4.96,4.88,0.015594221136918225
+"batch_decode_kernels::gather_last_hidden(float*, float const*, int, int, int)",1,5.12,5.12,5.12,0.004024315132107929

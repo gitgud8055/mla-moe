@@ -72,11 +72,14 @@ struct GpuContext {
     float *logits = nullptr;
     bf16_t *kv_cache = nullptr;
     int *topk = nullptr, *next_token = nullptr, *generated = nullptr;
+    int *decode_positions = nullptr;
     float *topk_weights = nullptr;
     int kv_capacity = 0;
 
     /* Layer-major unabsorbed prefill workspace. */
     int *prompt_tokens = nullptr, *prefill_route_ids = nullptr;
+    int *prefill_row_batches = nullptr, *prefill_row_positions = nullptr;
+    int *prefill_offsets = nullptr;
     int *prefill_topk = nullptr;
     int *prefill_expert_counts = nullptr, *prefill_expert_buckets = nullptr;
     float *prefill_x = nullptr, *prefill_xn = nullptr;

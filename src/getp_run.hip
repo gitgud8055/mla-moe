@@ -19,6 +19,7 @@
 #include "kernels/getp_utils.h"
 #include "kernels/getp_state.h"
 
+using namespace std;
 namespace batch_decode_kernels {
     __global__ void embedding(float *, const bf16_t *, const int *, int *,
                               int, int, int, int);
@@ -28,33 +29,43 @@ namespace batch_decode_kernels {
                               int, const float *, int, int);
     __global__ void gate_up_swiglu(float *, const float *, const bf16_t *,
                                    const bf16_t *, int, int, int);
-    __global__ void kv_norm_rope(bf16_t *, const float *, const bf16_t *, int, int,
-                                 int, int, int, int, const float *, int, float);
-    __global__ void q_absorb_rope(float *, float *, const float *, const bf16_t *,
-                                  int, int, int, int, int, int, int,
-                                  const float *, int);
-    __global__ void attention_score(float *, const float *, const float *,
-                                    const bf16_t *, int, int, int, int, int, int,
-                                    int, float);
-    __global__ void latent_context(float *, const float *, const bf16_t *, int, int,
-                                   int, int, int, int);
-    template <int KV_TILE>
-    __global__ void flash_decode(float *, const float *, const float *,
-                                 const bf16_t *, int, int, int, int, int, int,
-                                 int, float);
-    __global__ void prefill_kv_norm_rope(
-        bf16_t *, const float *, const bf16_t *, int, int, int, int, int,
-        int, const float *, int, float);
-    __global__ void prefill_q_rope(
-        float *, const float *, int, int, int, int, int, const float *, int);
-    template <int KV_TILE>
-    __global__ void flash_prefill(
-        float *, const float *, const float *, const bf16_t *, int, int, int,
-        int, int, int, int, float);
-    __global__ void gather_last_hidden(
-        float *, const float *, int, int, int);
-    __global__ void value_up(float *, const float *, const bf16_t *, int, int, int,
-                             int, size_t);
+    namespace decode {
+        __global__ void kv_norm_rope(
+            bf16_t *, const float *, const bf16_t *, const int *, int, int,
+            int, int, int, const float *, int, float);
+        __global__ void q_absorb_rope(
+            float *, float *, const float *, const bf16_t *, const int *, int,
+            int, int, int, int, int, const float *, int);
+        __global__ void attention_score(
+            float *, const float *, const float *, const bf16_t *, const int *,
+            int, int, int, int, int, int, int, float);
+        __global__ void latent_context(
+            float *, const float *, const bf16_t *, const int *, int, int, int,
+            int, int, int);
+        template <int KV_TILE>
+        __global__ void flash_attention(
+            float *, const float *, const float *, const bf16_t *, const int *,
+            int, int, int, int, int, int, float);
+        __global__ void q_rope(
+            float *, const float *, const int *, int, int, int, int, int,
+            const float *, int);
+        __global__ void value_up(
+            float *, const float *, const bf16_t *, int, int, int, int, size_t);
+    }
+    namespace prefill {
+        __global__ void kv_norm_rope(
+            bf16_t *, const float *, const bf16_t *, const int *, const int *,
+            int, int, int, int, int, int, const float *, int, float);
+        __global__ void q_rope(
+            float *, const float *, const int *, int, int, int, int,
+            const float *, int);
+        template <int KV_TILE>
+        __global__ void flash_attention(
+            float *, const float *, const float *, const bf16_t *, const int *,
+            const int *, int, int, int, int, int, int, int, float);
+        __global__ void gather_last_hidden(
+            float *, const float *, const int *, int, int, int);
+    }
     __global__ void routed_shared_gate_up(float *, float *, const float *,
                                           const char *, const size_t *, const size_t *,
                                           const int *, const bf16_t *, const bf16_t *,
@@ -76,8 +87,6 @@ namespace batch_decode_kernels {
     template <int M_TILES>
     __global__ void mfma_gate_up_swiglu_rows(
         float *, const float *, const bf16_t *, const bf16_t *, int, int, int);
-    __global__ void q_rope(float *, const float *, int, int, int, int, int, int,
-                           const float *, int);
     __global__ void swiglu(float *, const float *, const float *, int);
     __global__ void align_routes(const int *, int, int, int, int *, int *, int *);
     template <int BLOCK_M, int M_TILES>
@@ -96,6 +105,8 @@ namespace {
 
 constexpr int kDefaultBatchSize = 512;
 constexpr int kMaxBatchSize = 512;
+constexpr int kMaxPrefillRows = 65520;
+constexpr int kDefaultPrefillBatchTokens = kMaxPrefillRows;
 constexpr size_t kDeviceAlignment = 256;
 constexpr int kDefaultMfmaThreshold = 4;
 constexpr int kDefaultFlashThreshold = 8;
@@ -112,7 +123,6 @@ constexpr int kFlashLargeBatchThreads = 256;
 constexpr int kFlashLargeBatchKvTile = 8;
 constexpr int kPrefillThreads = 256;
 constexpr int kPrefillKvTile = 8;
-constexpr int kMaxPrefillRows = 65520;
 constexpr size_t kVramReserve = (size_t)512 << 20;
 
 static int div_up(int value, int divisor) {
@@ -123,6 +133,8 @@ static int div_up(int value, int divisor) {
 
 static GpuContext g;
 static int g_max_batch = 1;
+static int g_prefill_token_budget = kDefaultPrefillBatchTokens;
+static int g_decode_token_budget = kDefaultBatchSize;
 static int g_mfma_threshold = kDefaultMfmaThreshold;
 static int g_flash_threshold = kDefaultFlashThreshold;
 static bool g_prefill_large_m = true;
@@ -141,19 +153,36 @@ static int configured_threshold(const char *name, int default_value) {
     return (int)value;
 }
 
-static int configured_batch_size() {
-    const char *text = std::getenv("GETP_BATCH_SIZE");
-    if (!text || !*text) return kDefaultBatchSize;
+static int configured_positive_int(const char *name, int default_value,
+                                   int maximum) {
+    const char *text = std::getenv(name);
+    if (!text || !*text) return default_value;
 
     char *end = nullptr;
     long value = std::strtol(text, &end, 10);
-    if (*end != '\0' || value < 1 || value > kMaxBatchSize) {
+    if (*end != '\0' || value < 1 || value > maximum) {
         std::fprintf(stderr,
-            "GETP_BATCH_SIZE must be an integer in [1,%d] (got '%s')\n",
-            kMaxBatchSize, text);
+            "%s must be an integer in [1,%d] (got '%s')\n",
+            name, maximum, text);
         std::exit(EXIT_FAILURE);
     }
     return (int)value;
+}
+
+static int configured_decode_token_budget() {
+    if (std::getenv("GETP_DECODE_BATCH_TOKENS"))
+        return configured_positive_int(
+            "GETP_DECODE_BATCH_TOKENS", kDefaultBatchSize, kMaxBatchSize);
+    /* Compatibility with the old knob: one decode step consumes exactly one
+     * token for every active sequence. */
+    return configured_positive_int(
+        "GETP_BATCH_SIZE", kDefaultBatchSize, kMaxBatchSize);
+}
+
+static int configured_prefill_token_budget() {
+    return configured_positive_int(
+        "GETP_PREFILL_BATCH_TOKENS", kDefaultPrefillBatchTokens,
+        kMaxPrefillRows);
 }
 
 static int configured_kv_capacity(const Config &c) {
@@ -366,6 +395,8 @@ static size_t prefill_workspace_bytes(const Config &c, size_t rows) {
     return rows * floats_per_row * sizeof(float)
         + rows * k * c.moe_inter_size * sizeof(bf16_t)
         + rows * sizeof(int)                 // flattened prompt tokens
+        + rows * 2 * sizeof(int)             // packed row batch + position
+        + ((size_t)g_max_batch + 1) * sizeof(int) // packed prompt offsets
         + rows * k * sizeof(int)             // top-k expert ids
         + max_padded * sizeof(int)            // aligned route ids
         + (max_padded + kGroupedRouteTile - 1) / kGroupedRouteTile
@@ -404,6 +435,9 @@ static void allocate_prefill_workspace(const Config &c, int target_rows) {
         + (size_t)c.n_routed_experts * (kGroupedRouteTile - 1);
 
     device_alloc(&g.prompt_tokens, rows);
+    device_alloc(&g.prefill_row_batches, rows);
+    device_alloc(&g.prefill_row_positions, rows);
+    device_alloc(&g.prefill_offsets, (size_t)g_max_batch + 1);
     device_alloc(&g.prefill_x, rows * c.hidden_size);
     device_alloc(&g.prefill_xn, rows * c.hidden_size);
     device_alloc(&g.prefill_q, rows * c.n_heads * qhd);
@@ -622,13 +656,17 @@ static void gpu_ffn_batch(const Config &c, const DeviceLayer &d, int l,
                  g.prefill_ffn);
 }
 
-/* Process a homogeneous prompt batch layer-major.  Rows are flattened as
- * [request, position], so every projection and MoE operation sees B*S rows,
- * while flash_prefill applies the causal boundary independently per request. */
-static void gpu_prefill_batch(const int *device_tokens, int seq, int batch)
+namespace prefill {
+
+/* Process packed prompts layer-major.  `rows` is the number of real input
+ * tokens, not batch*max_length; row metadata gives each token's sequence and
+ * position.  This keeps request order and avoids both padding and length
+ * sorting while all dense/MoE operations see one token batch. */
+static void run_chunk(const int *device_tokens, const int *row_batches,
+                      const int *row_positions, const int *offsets,
+                      int rows, int batch, int slot_base)
 {
     const Config &c = g.owner->config;
-    const int rows = batch * seq;
     const int H = c.hidden_size;
     const int NH = c.n_heads;
     const int QKN = c.qk_nope_head_dim;
@@ -639,12 +677,11 @@ static void gpu_prefill_batch(const int *device_tokens, int seq, int batch)
     const int KVD = KVL + QKR;
     const int VHD = c.v_head_dim;
     const size_t head_stride = (size_t)(QKN + VHD) * KVL;
-    if (batch < 1 || batch > g_max_batch || seq < 1 ||
-        seq > g.kv_capacity || rows > g.prefill_capacity) {
+    if (batch < 1 || slot_base < 0 || slot_base + batch > g_max_batch ||
+        rows < batch || rows > g.prefill_capacity) {
         std::fprintf(stderr,
-            "HIP batched prefill: batch=%d/%d seq=%d/%d rows=%d/%d\n",
-            batch, g_max_batch, seq, g.kv_capacity, rows,
-            g.prefill_capacity);
+            "HIP packed prefill: slots=%d+%d/%d tokens=%d/%d\n",
+            slot_base, batch, g_max_batch, rows, g.prefill_capacity);
         std::exit(EXIT_FAILURE);
     }
 
@@ -697,10 +734,11 @@ static void gpu_prefill_batch(const int *device_tokens, int seq, int batch)
 
         bf16_t *layer_cache = g.kv_cache
             + (size_t)l * g_max_batch * g.kv_capacity * KVD;
-        batch_decode_kernels::prefill_kv_norm_rope<<<
+        batch_decode_kernels::prefill::kv_norm_rope<<<
             rows, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
-                layer_cache, g.prefill_comp, d.kv_a_norm, rows, seq,
-                g.kv_capacity, KVL, KVD, QKR, g.rope_inv_freq,
+                layer_cache, g.prefill_comp, d.kv_a_norm, row_batches,
+                row_positions, slot_base, rows, g.kv_capacity, KVL, KVD,
+                QKR, g.rope_inv_freq,
                 c.rope_interleaved, c.mla_norm_eps);
         HIP_LAUNCH_CHECK();
 
@@ -712,24 +750,23 @@ static void gpu_prefill_batch(const int *device_tokens, int seq, int batch)
                 g.prefill_qabs, g.prefill_q, d.W_UK_T, rows, NH, KVL,
                 QKN, QHD, KVL, (size_t)KVL * QKN);
         HIP_LAUNCH_CHECK();
-        batch_decode_kernels::prefill_q_rope<<<
+        batch_decode_kernels::prefill::q_rope<<<
             div_up(rows * NH, kernel_tuning::ATTENTION_THREADS / HIP_WAVE),
             kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
-                g.prefill_qrope, g.prefill_q, rows, seq, NH, QHD, QKN,
+                g.prefill_qrope, g.prefill_q, row_positions, rows, NH, QHD, QKN,
                 g.rope_inv_freq, c.rope_interleaved);
         HIP_LAUNCH_CHECK();
         phase_end(qkv_ms);
 
         phase_begin();
         constexpr int head_tile = kPrefillThreads / HIP_WAVE;
-        dim3 flash_grid((unsigned)div_up(NH, head_tile), (unsigned)seq,
-                        (unsigned)batch);
-        batch_decode_kernels::flash_prefill<kPrefillKvTile><<<
+        dim3 flash_grid((unsigned)div_up(NH, head_tile), (unsigned)rows);
+        batch_decode_kernels::prefill::flash_attention<kPrefillKvTile><<<
             flash_grid, kPrefillThreads,
             (size_t)kPrefillKvTile * KVD * sizeof(bf16_t), g.stream>>>(
                 g.prefill_clat, g.prefill_qabs, g.prefill_qrope,
-                layer_cache, batch, seq, NH, g.kv_capacity, KVD, KVL,
-                QKR, c.softmax_scale);
+                layer_cache, row_batches, row_positions, slot_base, rows, NH,
+                g.kv_capacity, KVD, KVL, QKR, c.softmax_scale);
         HIP_LAUNCH_CHECK();
         phase_end(flash_ms);
 
@@ -760,34 +797,41 @@ static void gpu_prefill_batch(const int *device_tokens, int seq, int batch)
 
     dim3 gather_grid((unsigned)div_up(H, kernel_tuning::ELEMENTWISE_THREADS),
                      (unsigned)batch);
-    batch_decode_kernels::gather_last_hidden<<<
+    batch_decode_kernels::prefill::gather_last_hidden<<<
         gather_grid, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
-            g.x, g.prefill_x, batch, seq, H);
+            g.x, g.prefill_x, offsets, batch, slot_base, H);
     HIP_LAUNCH_CHECK();
-    launch_batch_rmsnorm(g.xn, g.x, g.final_norm, H, batch, c.rms_eps);
-    launch_batch_gemv(g.logits, g.xn, g.lm_head, c.vocab_size, H, batch);
+    launch_batch_rmsnorm(g.xn + (size_t)slot_base * H,
+                         g.x + (size_t)slot_base * H,
+                         g.final_norm, H, batch, c.rms_eps);
+    launch_batch_gemv(g.logits + (size_t)slot_base * c.vocab_size,
+                      g.xn + (size_t)slot_base * H, g.lm_head,
+                      c.vocab_size, H, batch);
     batch_decode_kernels::argmax<<<
         batch, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
-            g.logits, c.vocab_size, g.next_token, batch);
+            g.logits + (size_t)slot_base * c.vocab_size, c.vocab_size,
+            g.next_token + slot_base, batch);
     HIP_LAUNCH_CHECK();
     if (profile) {
         HIP_CHECK(hipEventDestroy(phase_start));
         HIP_CHECK(hipEventDestroy(phase_stop));
         std::fprintf(stderr,
-            "[getp prefill profile] prompt=%d batch=%d qkv=%.3f "
+            "[getp prefill profile] tokens=%d batch=%d qkv=%.3f "
             "flash=%.3f output=%.3f ffn=%.3f ms\n",
-            seq, batch, qkv_ms, flash_ms, output_ms, ffn_ms);
+            rows, batch, qkv_ms, flash_ms, output_ms, ffn_ms);
     }
 }
 
-/* Absorbed forward for a homogeneous microbatch.  All requests have the same
- * absolute position; inference() groups equal prompt lengths to maintain this
- * invariant.  KV is [layer, batch-slot, position, kv-dim], which is also the
- * contract a future batched prefill implementation can fill directly. */
-static void gpu_forward_absorbed_batch(const int *device_tokens,
-                                       int *generated, int generated_stride,
-                                       int output_index, int pos,
-                                       bool produce_token, int batch)
+} // namespace prefill
+
+namespace decode {
+
+/* One token per active sequence.  `positions[b]` is independent for every
+ * sequence, so prompts of different lengths remain in the same decode batch. */
+static void run_step(const int *device_tokens, int *generated,
+                     int generated_stride, int output_index,
+                     const int *positions, int max_kv_len,
+                     bool produce_token, int batch)
 {
     const Config &c = g.owner->config;
     const int H = c.hidden_size;
@@ -799,11 +843,11 @@ static void gpu_forward_absorbed_batch(const int *device_tokens,
     const int KVL = c.kv_lora_rank;
     const int KVD = KVL + QKR;
     const int VHD = c.v_head_dim;
-    const int kv_len = pos + 1;
     const size_t head_stride = (size_t)(QKN + VHD) * KVL;
-    if (batch < 1 || batch > g_max_batch || pos < 0 || pos >= g.kv_capacity) {
-        std::fprintf(stderr, "HIP batched decode: batch=%d/%d position=%d/%d\n",
-                     batch, g_max_batch, pos, g.kv_capacity);
+    if (batch < 1 || batch > g_max_batch || max_kv_len < 1 ||
+        max_kv_len > g.kv_capacity) {
+        std::fprintf(stderr, "HIP token decode: batch=%d/%d max_kv=%d/%d\n",
+                     batch, g_max_batch, max_kv_len, g.kv_capacity);
         std::exit(EXIT_FAILURE);
     }
     dim3 embed_grid((unsigned)div_up(H, kernel_tuning::ELEMENTWISE_THREADS),
@@ -831,10 +875,10 @@ static void gpu_forward_absorbed_batch(const int *device_tokens,
         }
         bf16_t *layer_cache = g.kv_cache +
             (size_t)l * g_max_batch * g.kv_capacity * KVD;
-        batch_decode_kernels::kv_norm_rope<<<batch,
+        batch_decode_kernels::decode::kv_norm_rope<<<batch,
             kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
-                layer_cache, g.comp, d.kv_a_norm, batch, g.kv_capacity,
-                pos, KVL, KVD, QKR, g.rope_inv_freq, c.rope_interleaved,
+                layer_cache, g.comp, d.kv_a_norm, positions, batch,
+                g.kv_capacity, KVL, KVD, QKR, g.rope_inv_freq, c.rope_interleaved,
                 c.mla_norm_eps);
         HIP_LAUNCH_CHECK();
 
@@ -848,18 +892,18 @@ static void gpu_forward_absorbed_batch(const int *device_tokens,
                     g.qabs, g.q, d.W_UK_T, batch, NH, KVL, QKN, QHD, KVL,
                     (size_t)KVL * QKN);
             HIP_LAUNCH_CHECK();
-            batch_decode_kernels::q_rope<<<
+            batch_decode_kernels::decode::q_rope<<<
                 div_up(batch * NH,
                        kernel_tuning::ATTENTION_THREADS / HIP_WAVE),
                 kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
-                    g.qrope, g.q, batch, NH, QHD, QKN, QKR, pos,
+                    g.qrope, g.q, positions, batch, NH, QHD, QKN, QKR,
                     g.rope_inv_freq, c.rope_interleaved);
         } else {
-            batch_decode_kernels::q_absorb_rope<<<
+            batch_decode_kernels::decode::q_absorb_rope<<<
                 batch_projection_grid(qabs_rows, batch),
                 kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
-                    g.qabs, g.qrope, g.q, d.W_UK_T, batch, NH, QHD, QKN, QKR,
-                    KVL, pos, g.rope_inv_freq, c.rope_interleaved);
+                    g.qabs, g.qrope, g.q, d.W_UK_T, positions, batch, NH,
+                    QHD, QKN, QKR, KVL, g.rope_inv_freq, c.rope_interleaved);
         }
         HIP_LAUNCH_CHECK();
         if (batch >= g_flash_threshold) {
@@ -868,51 +912,52 @@ static void gpu_forward_absorbed_batch(const int *device_tokens,
                     (unsigned)div_up(
                         NH, kFlashLargeBatchThreads / HIP_WAVE),
                     (unsigned)batch);
-                batch_decode_kernels::flash_decode<
+                batch_decode_kernels::decode::flash_attention<
                     kFlashLargeBatchKvTile><<<
                         flash_grid, kFlashLargeBatchThreads,
                         (size_t)kFlashLargeBatchKvTile * KVD * sizeof(bf16_t),
                         g.stream>>>(
-                            g.clat, g.qabs, g.qrope, layer_cache, batch, NH,
-                            kv_len, g.kv_capacity, KVD, KVL, QKR,
+                            g.clat, g.qabs, g.qrope, layer_cache, positions,
+                            batch, NH, g.kv_capacity, KVD, KVL, QKR,
                             c.softmax_scale);
             } else {
                 dim3 flash_grid(
                     (unsigned)div_up(
                         NH, kFlashSmallBatchThreads / HIP_WAVE),
                     (unsigned)batch);
-                batch_decode_kernels::flash_decode<
+                batch_decode_kernels::decode::flash_attention<
                     kFlashSmallBatchKvTile><<<
                         flash_grid, kFlashSmallBatchThreads,
                         (size_t)kFlashSmallBatchKvTile * KVD * sizeof(bf16_t),
                         g.stream>>>(
-                            g.clat, g.qabs, g.qrope, layer_cache, batch, NH,
-                            kv_len, g.kv_capacity, KVD, KVL, QKR,
+                            g.clat, g.qabs, g.qrope, layer_cache, positions,
+                            batch, NH, g.kv_capacity, KVD, KVL, QKR,
                             c.softmax_scale);
             }
             HIP_LAUNCH_CHECK();
         } else {
             constexpr int rows_per_block =
                 kernel_tuning::ATTENTION_THREADS / HIP_WAVE;
-            int score_rows = NH * kv_len;
+            int score_rows = NH * max_kv_len;
             dim3 score_grid((unsigned)div_up(score_rows, rows_per_block),
                             (unsigned)batch);
-            batch_decode_kernels::attention_score<<<score_grid,
+            batch_decode_kernels::decode::attention_score<<<score_grid,
                 kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
-                    g.scores, g.qabs, g.qrope, layer_cache, batch, NH, kv_len,
-                    g.kv_capacity, KVD, KVL, QKR, c.softmax_scale);
+                    g.scores, g.qabs, g.qrope, layer_cache, positions, batch,
+                    NH, max_kv_len, g.kv_capacity, KVD, KVL, QKR,
+                    c.softmax_scale);
             HIP_LAUNCH_CHECK();
             attention_kernels::softmax_rows_kernel<
                 kernel_tuning::ATTENTION_THREADS><<<
                     batch * NH, kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
-                        g.scores, batch * NH, kv_len, g.kv_capacity, 0);
+                        g.scores, batch * NH, max_kv_len, g.kv_capacity, 0);
             HIP_LAUNCH_CHECK();
             dim3 latent_grid((unsigned)div_up(qabs_rows, rows_per_block),
                              (unsigned)batch);
-            batch_decode_kernels::latent_context<<<latent_grid,
+            batch_decode_kernels::decode::latent_context<<<latent_grid,
                 kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
-                    g.clat, g.scores, layer_cache, batch, NH, kv_len,
-                    g.kv_capacity, KVD, KVL);
+                    g.clat, g.scores, layer_cache, positions, batch, NH,
+                    max_kv_len, g.kv_capacity, KVD, KVL);
             HIP_LAUNCH_CHECK();
         }
         int value_rows = NH * VHD;
@@ -925,7 +970,7 @@ static void gpu_forward_absorbed_batch(const int *device_tokens,
                     g.ctx, g.clat, d.W_UV, batch, NH, VHD, KVL, KVL, VHD,
                     head_stride);
         } else {
-            batch_decode_kernels::value_up<<<
+            batch_decode_kernels::decode::value_up<<<
                 batch_projection_grid(value_rows, batch),
                 kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
                     g.ctx, g.clat, d.W_UV, batch, NH, VHD, KVL, head_stride);
@@ -945,6 +990,8 @@ static void gpu_forward_absorbed_batch(const int *device_tokens,
     HIP_LAUNCH_CHECK();
 }
 
+} // namespace decode
+
 extern "C" void warm_up(Transformer *t) {
     if (g.owner) {
         std::fprintf(stderr, "warm_up: HIP context is already initialized\n");
@@ -961,7 +1008,9 @@ extern "C" void warm_up(Transformer *t) {
         std::exit(EXIT_FAILURE);
     }
     g.owner = t;
-    g_max_batch = configured_batch_size();
+    g_decode_token_budget = configured_decode_token_budget();
+    g_prefill_token_budget = configured_prefill_token_budget();
+    g_max_batch = g_decode_token_budget;
     g_mfma_threshold = configured_threshold(
         "GETP_MFMA_THRESHOLD", kDefaultMfmaThreshold);
     g_flash_threshold = configured_threshold(
@@ -1096,6 +1145,7 @@ extern "C" void warm_up(Transformer *t) {
             g_max_batch, memory_batch);
         g_max_batch = (int)memory_batch;
     }
+    g_decode_token_budget = g_max_batch;
 
     const size_t B = (size_t)g_max_batch;
     device_alloc(&g.x, B * c.hidden_size);
@@ -1116,11 +1166,17 @@ extern "C" void warm_up(Transformer *t) {
     device_alloc(&g.logits, B * c.vocab_size);
     device_alloc(&g.next_token, B);
     device_alloc(&g.generated, B * c.max_seq_len);
+    device_alloc(&g.decode_positions, B);
     g.kv_capacity = 0;
     allocate_sequence_buffers(c, warm_capacity);
+    /* Prefill workspace follows its token budget, independently of how many
+     * decode tokens are scheduled per step. */
     const int target_prefill_rows = std::min(
-        kMaxPrefillRows, g_max_batch * std::min(warm_capacity, 512));
+        kMaxPrefillRows,
+        std::max(g_prefill_token_budget, warm_capacity));
     allocate_prefill_workspace(c, target_prefill_rows);
+    g_prefill_token_budget = std::min(
+        g_prefill_token_budget, g.prefill_capacity);
     HIP_CHECK(hipStreamSynchronize(g.stream));
 
     /* Exercise every inference kernel family before the timed call.  Batch 1
@@ -1130,20 +1186,23 @@ extern "C" void warm_up(Transformer *t) {
     const int kernel_warm_batch = std::min(g_max_batch, 32);
     HIP_CHECK(hipMemsetAsync(g.next_token, 0,
                              (size_t)kernel_warm_batch * sizeof(int), g.stream));
-    gpu_forward_absorbed_batch(g.next_token, g.generated, c.max_seq_len,
-                               0, 0, true, 1);
+    HIP_CHECK(hipMemsetAsync(g.decode_positions, 0,
+                             (size_t)kernel_warm_batch * sizeof(int), g.stream));
+    decode::run_step(g.next_token, g.generated, c.max_seq_len,
+                     0, g.decode_positions, 1, true, 1);
     if (kernel_warm_batch > 1) {
         HIP_CHECK(hipMemsetAsync(g.next_token, 0,
                                  (size_t)kernel_warm_batch * sizeof(int), g.stream));
-        gpu_forward_absorbed_batch(g.next_token, g.generated, c.max_seq_len,
-                                   0, 0, true, kernel_warm_batch);
+        decode::run_step(g.next_token, g.generated, c.max_seq_len,
+                         0, g.decode_positions, 1, true, kernel_warm_batch);
     }
     HIP_CHECK(hipStreamSynchronize(g.stream));
 
-    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv=bf16 batch=%d warm_kv=%d prefill_rows=%d prefill_m=%d mfma_at=%d flash_at=%d\n",
+    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv=bf16 prefill_tokens=%d decode_tokens=%d warm_kv=%d prefill_rows=%d prefill_m=%d mfma_at=%d flash_at=%d\n",
                  prop.name, (double)total_bytes / (double)(1ULL << 30),
                  (double)(global_bytes + layer_total) / (double)(1ULL << 30),
-                 g_max_batch, g.kv_capacity, g.prefill_capacity,
+                 g_prefill_token_budget, g_decode_token_budget,
+                 g.kv_capacity, g.prefill_capacity,
                  g_prefill_large_m ? kPrefillMmaRows : kMmaBatchTile,
                  g_mfma_threshold,
                  g_flash_threshold);
@@ -1170,7 +1229,10 @@ extern "C" void finish(Transformer *t) {
     device_free(g.ctx); device_free(g.hb); device_free(g.router);
     device_free(g.topk); device_free(g.topk_weights); device_free(g.logits);
     device_free(g.kv_cache); device_free(g.next_token); device_free(g.generated);
+    device_free(g.decode_positions);
     device_free(g.prompt_tokens); device_free(g.prefill_route_ids);
+    device_free(g.prefill_row_batches); device_free(g.prefill_row_positions);
+    device_free(g.prefill_offsets);
     device_free(g.prefill_topk);
     device_free(g.prefill_expert_counts); device_free(g.prefill_expert_buckets);
     device_free(g.prefill_x); device_free(g.prefill_xn);
@@ -1185,6 +1247,8 @@ extern "C" void finish(Transformer *t) {
     HIP_CHECK(hipStreamDestroy(g.stream));
     g = GpuContext();
     g_max_batch = 1;
+    g_prefill_token_budget = kDefaultPrefillBatchTokens;
+    g_decode_token_budget = kDefaultBatchSize;
     g_mfma_threshold = kDefaultMfmaThreshold;
     g_flash_threshold = kDefaultFlashThreshold;
     g_prefill_large_m = true;
@@ -1231,18 +1295,14 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
     for (int r = 0; r < reqs->num_reqs; ++r) reqs->out_lens[r] = 0;
 
 
-    std::vector<int> order;
-    order.reserve((size_t)reqs->num_reqs);
+    /* Preserve request order.  Token budgets decide batch boundaries; prompt
+     * length is metadata, never a sorting/grouping key. */
+    std::vector<int> active_requests;
+    active_requests.reserve((size_t)reqs->num_reqs);
     for (int r = 0; r < reqs->num_reqs; ++r)
-        if (!prompts[r].empty()) order.push_back(r);
-    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-        return prompts[a].size() < prompts[b].size();
-    });
+        if (!prompts[r].empty()) active_requests.push_back(r);
 
     long long total = 0;
-    std::vector<int> host_tokens((size_t)g_max_batch);
-    const bool use_batched_prefill =
-        std::getenv("GETP_DISABLE_BATCHED_PREFILL") == nullptr;
     const bool report_prefill_timing =
         std::getenv("GETP_REPORT_PREFILL_TIMING") != nullptr;
     const bool report_decode_timing =
@@ -1258,116 +1318,155 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
         HIP_CHECK(hipEventCreate(&decode_stop));
     }
     size_t group_begin = 0;
-    while (group_begin < order.size()) {
-        const int n_prompt = (int)prompts[order[group_begin]].size();
-        size_t group_end = group_begin + 1;
-        while (group_end < order.size() &&
-               (int)prompts[order[group_end]].size() == n_prompt)
+    while (group_begin < active_requests.size()) {
+        const int first_request = active_requests[group_begin];
+        const int group_steps = std::max(
+            0, std::min(reqs->max_steps,
+                        max_seq - (int)prompts[first_request].size()));
+        size_t group_end = group_begin;
+        while (group_end < active_requests.size() &&
+               group_end - group_begin < (size_t)g_decode_token_budget) {
+            const int r = active_requests[group_end];
+            const int steps = std::max(
+                0, std::min(reqs->max_steps,
+                            max_seq - (int)prompts[r].size()));
+            if (steps != group_steps) break;
             ++group_end;
-
-        if (use_batched_prefill && n_prompt > g.prefill_capacity) {
-            std::fprintf(stderr,
-                "HIP batched prefill needs %d rows for one prompt, but only "
-                "%d fit in VRAM\n", n_prompt, g.prefill_capacity);
-            std::exit(EXIT_FAILURE);
         }
-        const int microbatch_limit = use_batched_prefill
-            ? std::max(1, std::min(g_max_batch,
-                                  g.prefill_capacity / n_prompt))
-            : g_max_batch;
-        for (size_t base = group_begin; base < group_end;
-             base += (size_t)microbatch_limit) {
-            const int batch = (int)std::min<size_t>(
-                (size_t)microbatch_limit, group_end - base);
-            const int steps = std::max(0, std::min(reqs->max_steps,
-                                                  max_seq - n_prompt));
-
-            if (use_batched_prefill) {
-                const int rows = batch * n_prompt;
-                std::vector<int> flat_tokens((size_t)rows);
-                for (int b = 0; b < batch; ++b)
-                    std::copy(prompts[order[base + (size_t)b]].begin(),
-                              prompts[order[base + (size_t)b]].end(),
-                              flat_tokens.begin() + (size_t)b * n_prompt);
-                HIP_CHECK(hipMemcpyAsync(
-                    g.prompt_tokens, flat_tokens.data(),
-                    (size_t)rows * sizeof(int), hipMemcpyHostToDevice,
-                    g.stream));
-                if (report_prefill_timing)
-                    HIP_CHECK(hipEventRecord(prefill_start, g.stream));
-                gpu_prefill_batch(g.prompt_tokens, n_prompt, batch);
-                if (report_prefill_timing) {
-                    HIP_CHECK(hipEventRecord(prefill_stop, g.stream));
-                    HIP_CHECK(hipEventSynchronize(prefill_stop));
-                    float prefill_ms = 0.0f;
-                    HIP_CHECK(hipEventElapsedTime(
-                        &prefill_ms, prefill_start, prefill_stop));
-                    std::fprintf(stderr,
-                        "[getp prefill] prompt=%d batch=%d rows=%d ms=%.3f "
-                        "input_tps=%.3f\n",
-                        n_prompt, batch, rows, prefill_ms,
-                        (double)rows * 1e3 / prefill_ms);
-                }
-            } else {
-                for (int p = 0; p < n_prompt; ++p) {
-                    for (int b = 0; b < batch; ++b)
-                        host_tokens[b] =
-                            prompts[order[base + (size_t)b]][p];
-                    HIP_CHECK(hipMemcpyAsync(
-                        g.next_token, host_tokens.data(),
-                        (size_t)batch * sizeof(int), hipMemcpyHostToDevice,
-                        g.stream));
-                    gpu_forward_absorbed_batch(
-                        g.next_token, nullptr, max_seq, 0, p,
-                        p == n_prompt - 1, batch);
-                }
-            }
-
-            if (report_decode_timing && steps > 0)
-                HIP_CHECK(hipEventRecord(decode_start, g.stream));
-            for (int step = 0; step < steps; ++step)
-                gpu_forward_absorbed_batch(g.next_token, g.generated, max_seq,
-                                           step, n_prompt + step, true, batch);
-            if (report_decode_timing && steps > 0) {
-                HIP_CHECK(hipEventRecord(decode_stop, g.stream));
-                HIP_CHECK(hipEventSynchronize(decode_stop));
-                float decode_ms = 0.0f;
-                HIP_CHECK(hipEventElapsedTime(
-                    &decode_ms, decode_start, decode_stop));
+        const int batch = (int)(group_end - group_begin);
+        std::vector<int> prompt_lengths((size_t)batch);
+        int group_tokens = 0;
+        for (int b = 0; b < batch; ++b) {
+            const int r = active_requests[group_begin + (size_t)b];
+            prompt_lengths[b] = (int)prompts[r].size();
+            group_tokens += prompt_lengths[b];
+            if (prompt_lengths[b] > g.prefill_capacity) {
                 std::fprintf(stderr,
-                    "[getp decode] prompt=%d batch=%d steps=%d ms=%.3f "
-                    "compute_tps=%.3f\n",
-                    n_prompt, batch, steps, decode_ms,
-                    (double)batch * steps * 1e3 / decode_ms);
+                    "HIP packed prefill needs %d tokens for request %d, but "
+                    "workspace holds %d\n", prompt_lengths[b], r,
+                    g.prefill_capacity);
+                std::exit(EXIT_FAILURE);
+            }
+        }
+
+        if (report_prefill_timing)
+            HIP_CHECK(hipEventRecord(prefill_start, g.stream));
+        int slot_base = 0;
+        int prefill_chunks = 0;
+        while (slot_base < batch) {
+            int chunk_batch = 0;
+            int rows = 0;
+            while (slot_base + chunk_batch < batch) {
+                const int n = prompt_lengths[slot_base + chunk_batch];
+                if (chunk_batch > 0 &&
+                    (rows + n > g_prefill_token_budget ||
+                     rows + n > g.prefill_capacity))
+                    break;
+                rows += n;
+                ++chunk_batch;
             }
 
-            std::vector<int> host_generated((size_t)batch * steps);
-            if (steps > 0) {
-                for (int b = 0; b < batch; ++b)
-                    HIP_CHECK(hipMemcpyAsync(
-                        host_generated.data() + (size_t)b * steps,
-                        g.generated + (size_t)b * max_seq,
-                        (size_t)steps * sizeof(int), hipMemcpyDeviceToHost,
-                        g.stream));
-                HIP_CHECK(hipStreamSynchronize(g.stream));
-            }
-            for (int b = 0; b < batch; ++b) {
-                int r = order[base + (size_t)b];
-                const int *generated = steps > 0
-                    ? host_generated.data() + (size_t)b * steps : nullptr;
-                int n_out = 0;
-                while (n_out < steps) {
-                    const int token = generated[n_out];
-                    reqs->out_tokens[r][n_out] = token;
-                    ++n_out;
-                    // Hugging Face generate() includes the EOS token in the
-                    // returned completion.  Keep it in the output as well,
-                    // then discard the speculative tokens generated after it.
-                    if (token == eos) break;
+            std::vector<int> flat_tokens;
+            std::vector<int> row_batches;
+            std::vector<int> row_positions;
+            std::vector<int> offsets((size_t)chunk_batch + 1, 0);
+            flat_tokens.reserve((size_t)rows);
+            row_batches.reserve((size_t)rows);
+            row_positions.reserve((size_t)rows);
+            for (int b = 0; b < chunk_batch; ++b) {
+                const int r = active_requests[
+                    group_begin + (size_t)slot_base + (size_t)b];
+                const int n = (int)prompts[r].size();
+                flat_tokens.insert(flat_tokens.end(), prompts[r].begin(),
+                                   prompts[r].end());
+                for (int p = 0; p < n; ++p) {
+                    row_batches.push_back(b);
+                    row_positions.push_back(p);
                 }
-                reqs->out_lens[r] = n_out;
-                total += n_out;
+                offsets[(size_t)b + 1] = offsets[(size_t)b] + n;
             }
+            HIP_CHECK(hipMemcpyAsync(
+                g.prompt_tokens, flat_tokens.data(),
+                (size_t)rows * sizeof(int), hipMemcpyHostToDevice, g.stream));
+            HIP_CHECK(hipMemcpyAsync(
+                g.prefill_row_batches, row_batches.data(),
+                (size_t)rows * sizeof(int), hipMemcpyHostToDevice, g.stream));
+            HIP_CHECK(hipMemcpyAsync(
+                g.prefill_row_positions, row_positions.data(),
+                (size_t)rows * sizeof(int), hipMemcpyHostToDevice, g.stream));
+            HIP_CHECK(hipMemcpyAsync(
+                g.prefill_offsets, offsets.data(),
+                ((size_t)chunk_batch + 1) * sizeof(int),
+                hipMemcpyHostToDevice, g.stream));
+            prefill::run_chunk(
+                g.prompt_tokens, g.prefill_row_batches,
+                g.prefill_row_positions, g.prefill_offsets,
+                rows, chunk_batch, slot_base);
+            slot_base += chunk_batch;
+            ++prefill_chunks;
+        }
+        if (report_prefill_timing) {
+            HIP_CHECK(hipEventRecord(prefill_stop, g.stream));
+            HIP_CHECK(hipEventSynchronize(prefill_stop));
+            float prefill_ms = 0.0f;
+            HIP_CHECK(hipEventElapsedTime(
+                &prefill_ms, prefill_start, prefill_stop));
+            std::fprintf(stderr,
+                "[getp prefill] tokens=%d batch=%d chunks=%d ms=%.3f "
+                "input_tps=%.3f\n", group_tokens, batch, prefill_chunks,
+                prefill_ms, (double)group_tokens * 1e3 / prefill_ms);
+        }
+
+        std::vector<int> host_positions((size_t)batch);
+        if (report_decode_timing && group_steps > 0)
+            HIP_CHECK(hipEventRecord(decode_start, g.stream));
+        for (int step = 0; step < group_steps; ++step) {
+            int max_kv_len = 1;
+            for (int b = 0; b < batch; ++b) {
+                host_positions[b] = prompt_lengths[b] + step;
+                max_kv_len = std::max(max_kv_len, host_positions[b] + 1);
+            }
+            HIP_CHECK(hipMemcpyAsync(
+                g.decode_positions, host_positions.data(),
+                (size_t)batch * sizeof(int), hipMemcpyHostToDevice, g.stream));
+            decode::run_step(g.next_token, g.generated, max_seq, step,
+                             g.decode_positions, max_kv_len, true, batch);
+        }
+        if (report_decode_timing && group_steps > 0) {
+            HIP_CHECK(hipEventRecord(decode_stop, g.stream));
+            HIP_CHECK(hipEventSynchronize(decode_stop));
+            float decode_ms = 0.0f;
+            HIP_CHECK(hipEventElapsedTime(
+                &decode_ms, decode_start, decode_stop));
+            std::fprintf(stderr,
+                "[getp decode] tokens_per_step=%d steps=%d ms=%.3f "
+                "compute_tps=%.3f\n", batch, group_steps, decode_ms,
+                (double)batch * group_steps * 1e3 / decode_ms);
+        }
+
+        std::vector<int> host_generated((size_t)batch * group_steps);
+        if (group_steps > 0) {
+            for (int b = 0; b < batch; ++b)
+                HIP_CHECK(hipMemcpyAsync(
+                    host_generated.data() + (size_t)b * group_steps,
+                    g.generated + (size_t)b * max_seq,
+                    (size_t)group_steps * sizeof(int), hipMemcpyDeviceToHost,
+                    g.stream));
+            HIP_CHECK(hipStreamSynchronize(g.stream));
+        }
+        for (int b = 0; b < batch; ++b) {
+            const int r = active_requests[group_begin + (size_t)b];
+            const int *generated = group_steps > 0
+                ? host_generated.data() + (size_t)b * group_steps : nullptr;
+            int n_out = 0;
+            while (n_out < group_steps) {
+                const int token = generated[n_out];
+                reqs->out_tokens[r][n_out] = token;
+                ++n_out;
+                if (token == eos) break;
+            }
+            reqs->out_lens[r] = n_out;
+            total += n_out;
         }
         group_begin = group_end;
     }

@@ -781,13 +781,16 @@ __global__ void gate_up_swiglu(float *y, const float *x, const bf16_t *gate,
     }
 }
 
+namespace decode {
+
 __global__ void kv_norm_rope(bf16_t *cache, const float *comp, const bf16_t *norm,
-                             int batch, int capacity, int pos, int kv_rank,
+                             const int *positions, int batch, int capacity, int kv_rank,
                              int kv_dim, int rope_dim, const float *inv_freq,
                              int interleaved, float eps) {
     __shared__ float scratch[THREADS];
     int b = (int)blockIdx.x;
     if (b >= batch) return;
+    const int pos = positions[b];
     const float *src = comp + (size_t)b * kv_dim;
     bf16_t *dst = cache + ((size_t)b * capacity + pos) * kv_dim;
     float ss = 0.0f;
@@ -820,9 +823,10 @@ __global__ void kv_norm_rope(bf16_t *cache, const float *comp, const bf16_t *nor
 }
 
 __global__ void q_absorb_rope(float *qabs, float *qrope, const float *q,
-                              const bf16_t *wuk_t, int batch, int heads,
+                              const bf16_t *wuk_t, const int *positions,
+                              int batch, int heads,
                               int q_head_dim, int qk_nope, int rope_dim,
-                              int kv_rank, int pos, const float *inv_freq,
+                              int kv_rank, const float *inv_freq,
                               int interleaved) {
     int wave=(int)threadIdx.x/HIP_WAVE, lane=(int)threadIdx.x&(HIP_WAVE-1);
     int row=(int)blockIdx.x*WAVES+wave, total=heads*kv_rank;
@@ -847,7 +851,7 @@ __global__ void q_absorb_rope(float *qabs, float *qrope, const float *q,
         for(int j=0;j<BATCH_TILE;++j) if(b0+j<batch) {
             const float *v=q+((size_t)(b0+j)*heads+h)*q_head_dim+qk_nope;
             float *o=qrope+((size_t)(b0+j)*heads+h)*rope_dim;
-            float angle=(float)pos*inv_freq[lane], co=cosf(angle), si=sinf(angle);
+            float angle=(float)positions[b0+j]*inv_freq[lane], co=cosf(angle), si=sinf(angle);
             float even=v[2*lane], odd=v[2*lane+1];
             if(!interleaved){o[2*lane]=even*co-odd*si;o[2*lane+1]=even*si+odd*co;}
             else{int half=rope_dim/2;o[lane]=even*co-odd*si;o[half+lane]=odd*co+even*si;}
@@ -855,16 +859,17 @@ __global__ void q_absorb_rope(float *qabs, float *qrope, const float *q,
     }
 }
 
-__global__ void q_rope(float *qrope, const float *q, int batch, int heads,
-                       int q_head_dim, int qk_nope, int rope_dim, int pos,
+__global__ void q_rope(float *qrope, const float *q, const int *positions,
+                       int batch, int heads, int q_head_dim, int qk_nope, int rope_dim,
                        const float *inv_freq, int interleaved) {
     const int wave = (int)threadIdx.x / HIP_WAVE;
     const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
     const int row = (int)blockIdx.x * WAVES + wave;
     if (row >= batch * heads || lane >= rope_dim / 2) return;
+    const int b = row / heads;
     const float *v = q + (size_t)row * q_head_dim + qk_nope;
     float *o = qrope + (size_t)row * rope_dim;
-    const float angle = (float)pos * inv_freq[lane];
+    const float angle = (float)positions[b] * inv_freq[lane];
     const float co = cosf(angle), si = sinf(angle);
     const float even = v[2 * lane], odd = v[2 * lane + 1];
     if (!interleaved) {
@@ -877,16 +882,23 @@ __global__ void q_rope(float *qrope, const float *q, int batch, int heads,
     }
 }
 
-/* Prefill rows are flattened in batch-major order: row = b * seq + pos. */
-__global__ void prefill_kv_norm_rope(
-    bf16_t *cache, const float *comp, const bf16_t *norm, int rows, int seq,
+} // namespace decode
+
+namespace prefill {
+
+/* Packed prefill rows contain only real tokens.  Metadata maps each row to its
+ * local sequence and absolute position, so heterogeneous prompts share one
+ * projection/MoE batch without padding or length sorting. */
+__global__ void kv_norm_rope(
+    bf16_t *cache, const float *comp, const bf16_t *norm,
+    const int *row_batches, const int *row_positions, int slot_base, int rows,
     int capacity, int kv_rank, int kv_dim, int rope_dim,
     const float *inv_freq, int interleaved, float eps) {
     __shared__ float scratch[THREADS];
     const int row = (int)blockIdx.x;
     if (row >= rows) return;
-    const int b = row / seq;
-    const int pos = row - b * seq;
+    const int b = slot_base + row_batches[row];
+    const int pos = row_positions[row];
     const float *src = comp + (size_t)row * kv_dim;
     bf16_t *dst = cache + ((size_t)b * capacity + pos) * kv_dim;
     float ss = 0.0f;
@@ -922,15 +934,15 @@ __global__ void prefill_kv_norm_rope(
     }
 }
 
-__global__ void prefill_q_rope(
-    float *qrope, const float *q, int rows, int seq, int heads,
+__global__ void q_rope(
+    float *qrope, const float *q, const int *row_positions, int rows, int heads,
     int q_head_dim, int qk_nope, const float *inv_freq, int interleaved) {
     const int wave = (int)threadIdx.x / HIP_WAVE;
     const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
     const int qh = (int)blockIdx.x * WAVES + wave;
     if (qh >= rows * heads) return;
     const int row = qh / heads;
-    const int pos = row % seq;
+    const int pos = row_positions[row];
     const int rope_dim = q_head_dim - qk_nope;
     if (lane >= rope_dim / 2) return;
     const float *v = q + (size_t)qh * q_head_dim + qk_nope;
@@ -952,20 +964,22 @@ __global__ void prefill_q_rope(
  * all waves share one (request, query), reusing each staged compressed-KV tile
  * across blockDim/64 heads without divergent causal boundaries. */
 template <int KV_TILE>
-__global__ void flash_prefill(
+__global__ void flash_attention(
     float *__restrict__ clat, const float *__restrict__ qabs,
     const float *__restrict__ qrope, const bf16_t *__restrict__ cache,
-    int batch, int seq, int heads, int capacity, int kv_dim, int kv_rank,
-    int rope_dim, float scale) {
+    const int *__restrict__ row_batches,
+    const int *__restrict__ row_positions, int slot_base, int rows, int heads,
+    int capacity, int kv_dim, int kv_rank, int rope_dim, float scale) {
     extern __shared__ bf16_t shared_cache[];
     const int wave = (int)threadIdx.x / HIP_WAVE;
     const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
     const int waves = (int)blockDim.x / HIP_WAVE;
-    const int qpos = (int)blockIdx.y;
+    const int row = (int)blockIdx.y;
     const int h = (int)blockIdx.x * waves + wave;
-    const int b = (int)blockIdx.z;
-    const bool active = b < batch && h < heads && qpos < seq;
-    const size_t qh = ((size_t)b * seq + qpos) * heads + h;
+    const bool active = row < rows && h < heads;
+    const int b = active ? slot_base + row_batches[row] : slot_base;
+    const int qpos = active ? row_positions[row] : 0;
+    const size_t qh = (size_t)row * heads + h;
     const float *qa = active ? qabs + qh * kv_rank : nullptr;
     const float *qp = active ? qrope + qh * rope_dim : nullptr;
     const bf16_t *cache_b = cache + (size_t)b * capacity * kv_dim;
@@ -1043,27 +1057,35 @@ __global__ void flash_prefill(
     }
 }
 
-template __global__ void flash_prefill<8>(
-    float *, const float *, const float *, const bf16_t *, int, int, int, int,
-    int, int, int, float);
+template __global__ void flash_attention<8>(
+    float *, const float *, const float *, const bf16_t *, const int *,
+    const int *, int, int, int, int, int, int, int, float);
 
-__global__ void gather_last_hidden(float *dst, const float *src, int batch,
-                                   int seq, int hidden) {
+__global__ void gather_last_hidden(float *dst, const float *src,
+                                   const int *offsets, int batch,
+                                   int slot_base, int hidden) {
     const int b = (int)blockIdx.y;
     const int d = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
     if (b < batch && d < hidden)
-        dst[(size_t)b * hidden + d] =
-            src[((size_t)b * seq + seq - 1) * hidden + d];
+        dst[(size_t)(slot_base + b) * hidden + d] =
+            src[(size_t)(offsets[b + 1] - 1) * hidden + d];
 }
+
+} // namespace prefill
+
+namespace decode {
 
 __global__ void attention_score(float *scores, const float *qabs,
                                 const float *qrope, const bf16_t *cache,
-                                int batch, int heads, int kv_len, int capacity,
+                                const int *positions, int batch, int heads,
+                                int max_kv_len, int capacity,
                                 int kv_dim, int kv_rank, int rope_dim, float scale) {
     int wave=(int)threadIdx.x/HIP_WAVE, lane=(int)threadIdx.x&(HIP_WAVE-1);
     int row=(int)blockIdx.x*WAVES+wave, b=(int)blockIdx.y;
-    if(row>=heads*kv_len || b>=batch)return;
-    int h=row/kv_len,k=row-h*kv_len;
+    if(row>=heads*max_kv_len || b>=batch)return;
+    int h=row/max_kv_len,k=row-h*max_kv_len;
+    const int kv_len=positions[b]+1;
+    if(k>=kv_len){if(lane==0)scores[((size_t)b*heads+h)*capacity+k]=-INFINITY;return;}
     const float *qa=qabs+((size_t)b*heads+h)*kv_rank;
     const float *qp=qrope+((size_t)b*heads+h)*rope_dim;
     const bf16_t *ckv=cache+((size_t)b*capacity+k)*kv_dim;
@@ -1079,11 +1101,12 @@ __global__ void attention_score(float *scores, const float *qabs,
  * max/denominator and the 512-wide latent context in registers, eliminating
  * the materialized score matrix and the separate softmax/context launches. */
 template <int KV_TILE>
-__global__ void flash_decode(float *__restrict__ clat,
+__global__ void flash_attention(float *__restrict__ clat,
                              const float *__restrict__ qabs,
                              const float *__restrict__ qrope,
                              const bf16_t *__restrict__ cache,
-                             int batch, int heads, int kv_len, int capacity,
+                             const int *__restrict__ positions,
+                             int batch, int heads, int capacity,
                              int kv_dim, int kv_rank, int rope_dim, float scale) {
     extern __shared__ bf16_t shared_cache[];
     const int wave = (int)threadIdx.x / HIP_WAVE;
@@ -1092,6 +1115,7 @@ __global__ void flash_decode(float *__restrict__ clat,
     const int b = (int)blockIdx.y;
     const int h = (int)blockIdx.x * waves + wave;
     const bool active = b < batch && h < heads;
+    const int kv_len = active ? positions[b] + 1 : 0;
     const float *qa = active
         ? qabs + ((size_t)b * heads + h) * kv_rank : nullptr;
     const float *qp = active
@@ -1164,20 +1188,23 @@ __global__ void flash_decode(float *__restrict__ clat,
     }
 }
 
-template __global__ void flash_decode<8>(
-    float *, const float *, const float *, const bf16_t *, int, int, int, int,
-    int, int, int, float);
-template __global__ void flash_decode<16>(
-    float *, const float *, const float *, const bf16_t *, int, int, int, int,
-    int, int, int, float);
+template __global__ void flash_attention<8>(
+    float *, const float *, const float *, const bf16_t *, const int *, int,
+    int, int, int, int, int, float);
+template __global__ void flash_attention<16>(
+    float *, const float *, const float *, const bf16_t *, const int *, int,
+    int, int, int, int, int, float);
 
 __global__ void latent_context(float *clat, const float *scores, const bf16_t *cache,
-                               int batch, int heads, int kv_len, int capacity,
+                               const int *positions, int batch, int heads,
+                               int max_kv_len, int capacity,
                                int kv_dim, int kv_rank) {
+    (void)max_kv_len;
     int wave=(int)threadIdx.x/HIP_WAVE,lane=(int)threadIdx.x&(HIP_WAVE-1);
     int row=(int)blockIdx.x*WAVES+wave,b=(int)blockIdx.y;
     if(row>=heads*kv_rank||b>=batch)return;
     int h=row/kv_rank,r=row-h*kv_rank;
+    const int kv_len=positions[b]+1;
     const float *a=scores+((size_t)b*heads+h)*capacity;
     const bf16_t *cb=cache+(size_t)b*capacity*kv_dim;
     float sum=0.0f;
@@ -1206,6 +1233,8 @@ __global__ void value_up(float *ctx, const float *clat, const bf16_t *wuv,
     for(int j=0;j<BATCH_TILE;++j){sums[j]=wave_sum(sums[j]);if(lane==0&&b0+j<batch)
         ctx[((size_t)(b0+j)*heads+h)*value_dim+d]=sums[j];}
 }
+
+} // namespace decode
 
 __global__ void routed_shared_gate_up(float *routed, float *shared, const float *x,
                                       const char *pool, const size_t *gate_offsets,
