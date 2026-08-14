@@ -33,4 +33,5 @@ mv-mi250-08/
 profile/
 
 /docs/decode-end-to-end.md
-rocprof_*
+rocprof*
+TOKEN*
