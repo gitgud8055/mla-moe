@@ -31,3 +31,7 @@ output.tile8.txt
 output.tile16.txt
 mv-mi250-08/
 profile/
+.env
+CLAUDE.md
+reports/
+.claude/

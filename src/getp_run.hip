@@ -54,6 +54,8 @@ namespace batch_decode_kernels {
     __global__ void argmax(const float *, int, int *, int);
     __global__ void mfma_gemm(float *, const float *, const bf16_t *,
                               int, int, int, int);
+    __global__ void mfma_gemm_heads(float *, const float *, const bf16_t *,
+                                    int, int, int, size_t);
     __global__ void mfma_head_gemm(float *, const float *, const bf16_t *,
                                    int, int, int, int, int, int, size_t);
     __global__ void mfma_gate_up_swiglu(float *, const float *, const bf16_t *,
@@ -72,6 +74,21 @@ namespace batch_decode_kernels {
         float *, int, int, int, int);
     __global__ void reduce_routes_add(float *, const float *, const float *,
                                       int, int, int);
+}
+
+namespace prefill_kernels {
+    __global__ void q_rope_rows(float *, int, int, int, int, int,
+                                const float *, int);
+    __global__ void kv_norm_rope_prefill(float *, float *, bf16_t *,
+                                         const float *, const bf16_t *, int, int,
+                                         int, int, int, int, const float *, int,
+                                         float);
+    __global__ void flash_prefill_causal(float *, const float *, const float *,
+                                         const float *, const float *, int, int,
+                                         int, int, int, int, float);
+    __global__ void flash_prefill_causal_tiled(
+        float *, const float *, const float *, const float *, const float *,
+        int, int, int, int, int, int, float);
 }
 
 namespace {
@@ -380,21 +397,26 @@ static void launch_batch_rmsnorm(float *y, const float *x, const bf16_t *w,
     HIP_LAUNCH_CHECK();
 }
 
-static void gpu_ffn_batch(const Config &c, const DeviceLayer &d, int l, int batch)
+/* FFN over `batch` rows. `x` is the residual stream (updated in place via the
+ * down projection's add), `xn` the post-norm input. Internal expert/router
+ * scratch stays in the g_max_batch-sized g.* buffers, so callers with more rows
+ * than g_max_batch (prefill) must invoke this in chunks of at most g_max_batch. */
+static void gpu_ffn_batch(const Config &c, const DeviceLayer &d, int l,
+                          float *x, float *xn, int batch)
 {
     const int H = c.hidden_size;
     if (l < c.first_k_dense) {
         int inter = c.dense_inter_size;
-        launch_batch_gate_up_swiglu(g.hb, g.xn, d.dense_gate, d.dense_up,
+        launch_batch_gate_up_swiglu(g.hb, xn, d.dense_gate, d.dense_up,
                                     inter, H, batch);
-        launch_batch_gemv(g.x, g.hb, d.dense_down, H, inter, batch, true);
+        launch_batch_gemv(x, g.hb, d.dense_down, H, inter, batch, true);
         return;
     }
 
     const int E = c.n_routed_experts;
     const int K = c.n_experts_per_tok;
     const int inter = c.moe_inter_size;
-    launch_batch_gemv(g.router, g.xn, d.moe_gate, E, H, batch);
+    launch_batch_gemv(g.router, xn, d.moe_gate, E, H, batch);
     launch_router_topk(g.router, d.moe_bias, g.topk, g.topk_weights,
                        batch, E, K, c.router_sigmoid, c.norm_topk,
                        c.routed_scaling);
@@ -418,7 +440,7 @@ static void gpu_ffn_batch(const Config &c, const DeviceLayer &d, int l, int batc
         const int up_tiles = div_up(inter, kMmaTileSize);
         batch_decode_kernels::grouped_expert_gate_up<16, 1><<<
             max_blocks * up_tiles, 256, 0, g.stream>>>(
-                g.xn, d.pool, d.expert_gate_offsets, d.expert_up_offsets,
+                xn, d.pool, d.expert_gate_offsets, d.expert_up_offsets,
                 g.prefill_topk, g.prefill_expert_counts, g.routed_hidden,
                 routes, H, inter, K, up_tiles);
         HIP_LAUNCH_CHECK();
@@ -427,12 +449,12 @@ static void gpu_ffn_batch(const Config &c, const DeviceLayer &d, int l, int batc
                        (unsigned)batch);
         batch_decode_kernels::routed_shared_gate_up<<<gate_grid,
             kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-                g.routed_hidden, g.hb, g.xn, d.pool,
+                g.routed_hidden, g.hb, xn, d.pool,
                 d.expert_gate_offsets, d.expert_up_offsets, g.topk,
                 d.shared_gate, d.shared_up, batch, K, inter, 0, H);
         HIP_LAUNCH_CHECK();
     }
-    launch_batch_gate_up_swiglu(g.hb, g.xn, d.shared_gate, d.shared_up,
+    launch_batch_gate_up_swiglu(g.hb, xn, d.shared_gate, d.shared_up,
                                 shared, H, batch);
     if (grouped_mfma) {
         const int routes = batch * K;
@@ -445,18 +467,18 @@ static void gpu_ffn_batch(const Config &c, const DeviceLayer &d, int l, int batc
         HIP_LAUNCH_CHECK();
         batch_decode_kernels::reduce_routes_add<<<
             batch, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
-                g.x, g.prefill_ffn, g.topk_weights, batch, H, K);
+                x, g.prefill_ffn, g.topk_weights, batch, H, K);
         HIP_LAUNCH_CHECK();
     } else {
         dim3 down_grid((unsigned)div_up(H, rows_per_block),
                        (unsigned)batch);
         batch_decode_kernels::routed_shared_down<<<down_grid,
             kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-                g.x, g.routed_hidden, g.hb, d.pool, d.expert_down_offsets,
+                x, g.routed_hidden, g.hb, d.pool, d.expert_down_offsets,
                 g.topk, g.topk_weights, d.shared_down, batch, K, H, inter, 0);
         HIP_LAUNCH_CHECK();
     }
-    launch_batch_gemv(g.x, g.hb, d.shared_down, H, shared, batch, true);
+    launch_batch_gemv(x, g.hb, d.shared_down, H, shared, batch, true);
 }
 
 /* Absorbed forward for a homogeneous microbatch.  All requests have the same
@@ -595,7 +617,7 @@ static void gpu_forward_absorbed_batch(const int *device_tokens,
         launch_batch_gemv(g.x, g.ctx, d.o_proj, H, NH * VHD, batch, true);
 
         launch_batch_rmsnorm(g.xn, g.x, d.post_norm, H, batch, c.rms_eps);
-        gpu_ffn_batch(c, d, l, batch);
+        gpu_ffn_batch(c, d, l, g.x, g.xn, batch);
     }
 
     if (!produce_token) return;
@@ -603,6 +625,120 @@ static void gpu_forward_absorbed_batch(const int *device_tokens,
     launch_batch_gemv(g.logits, g.xn, g.lm_head, c.vocab_size, H, batch);
     batch_decode_kernels::argmax<<<batch, kernel_tuning::ELEMENTWISE_THREADS,
         0, g.stream>>>(g.logits, c.vocab_size, g.next_token, batch);
+    HIP_LAUNCH_CHECK();
+}
+
+/* Unabsorbed batched prefill for a single prompt of `seq` tokens into KV slot
+ * `slot`.  All L positions are processed at once: projections/FFN run as MFMA
+ * GEMMs over L rows, and attention is one causal FlashAttention-v2 pass. Writes
+ * the bf16 KV cache (positions 0..seq-1) that the decode path continues from,
+ * and seeds g.next_token[slot] with the argmax of the final position's logits
+ * (the first generated token), matching the old per-position prefill contract.
+ * Mirrors forward_unabsorbed() in the frozen CPU reference. */
+static void gpu_forward_prefill(const int *device_tokens, int seq, int slot)
+{
+    const Config &c = g.owner->config;
+    const int H = c.hidden_size;
+    const int NH = c.n_heads;
+    const int QKN = c.qk_nope_head_dim;
+    const int QKR = c.qk_rope_head_dim;
+    const int QHD = QKN + QKR;
+    const int QD = NH * QHD;
+    const int KVL = c.kv_lora_rank;
+    const int KVD = KVL + QKR;
+    const int VHD = c.v_head_dim;
+    const size_t head_stride = (size_t)(QKN + VHD) * KVL;
+    constexpr int waves = kernel_tuning::ATTENTION_THREADS / HIP_WAVE;
+    if (seq < 1 || seq > g.kv_capacity || slot < 0 || slot >= g_max_batch) {
+        std::fprintf(stderr, "HIP prefill: seq=%d/%d slot=%d/%d\n",
+                     seq, g.kv_capacity, slot, g_max_batch);
+        std::exit(EXIT_FAILURE);
+    }
+
+    dim3 embed_grid((unsigned)div_up(H, kernel_tuning::ELEMENTWISE_THREADS),
+                    (unsigned)seq);
+    batch_decode_kernels::embedding<<<embed_grid,
+        kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+            g.prefill_x, g.embed, device_tokens, nullptr, 0, 0, H, seq);
+    HIP_LAUNCH_CHECK();
+
+    for (int l = 0; l < c.n_layers; ++l) {
+        const DeviceLayer &d = g.layers[l];
+        launch_batch_rmsnorm(g.prefill_xn, g.prefill_x, d.input_norm, H, seq,
+                             c.rms_eps);
+        if (c.q_lora_rank > 0) {
+            launch_batch_dual_gemv(
+                g.prefill_q_a, d.q_a_proj, c.q_lora_rank,
+                g.prefill_comp, d.kv_a_proj, KVD, g.prefill_xn, H, seq);
+            launch_batch_rmsnorm(g.prefill_q_a, g.prefill_q_a, d.q_a_norm,
+                                 c.q_lora_rank, seq, c.mla_norm_eps);
+            launch_batch_gemv(g.prefill_q, g.prefill_q_a, d.q_b_proj, QD,
+                              c.q_lora_rank, seq);
+        } else {
+            launch_batch_dual_gemv(
+                g.prefill_q, d.q_proj, QD, g.prefill_comp, d.kv_a_proj, KVD,
+                g.prefill_xn, H, seq);
+        }
+        prefill_kernels::q_rope_rows<<<
+            (unsigned)div_up(seq * NH, waves),
+            kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
+                g.prefill_q, seq, NH, QHD, QKN, QKR, g.rope_inv_freq,
+                c.rope_interleaved);
+        HIP_LAUNCH_CHECK();
+
+        bf16_t *layer_cache = g.kv_cache +
+            (size_t)l * g_max_batch * g.kv_capacity * KVD;
+        prefill_kernels::kv_norm_rope_prefill<<<
+            (unsigned)seq, kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
+                g.prefill_ckv, g.prefill_kpe, layer_cache, g.prefill_comp,
+                d.kv_a_norm, seq, g.kv_capacity, slot, KVL, KVD, QKR,
+                g.rope_inv_freq, c.rope_interleaved, c.mla_norm_eps);
+        HIP_LAUNCH_CHECK();
+
+        /* Decompress per-head K_nope and V from the (float) latent c_kv. The
+         * input c_kv is shared across heads, so this is one batched GEMM over
+         * heads (blockIdx.z), not 2*NH separate launches -- the per-head loop
+         * ran at ~4% occupancy (launch-bound). Same MFMA tile as mfma_gemm. */
+        dim3 kn_grid((unsigned)div_up(QKN, kMmaTileSize),
+                     (unsigned)div_up(seq, kBatchGemmThreshold), (unsigned)NH);
+        dim3 v_grid((unsigned)div_up(VHD, kMmaTileSize),
+                    (unsigned)div_up(seq, kBatchGemmThreshold), (unsigned)NH);
+        batch_decode_kernels::mfma_gemm_heads<<<kn_grid, 256, 0, g.stream>>>(
+            g.prefill_knope, g.prefill_ckv, d.W_UK, seq, QKN, KVL, head_stride);
+        batch_decode_kernels::mfma_gemm_heads<<<v_grid, 256, 0, g.stream>>>(
+            g.prefill_value, g.prefill_ckv, d.W_UV, seq, VHD, KVL, head_stride);
+        HIP_LAUNCH_CHECK();
+
+        // NOTE: an LDS-tiled fp32 variant (flash_prefill_causal_tiled) was
+        // measured 22% slower here (233 ms vs 191 ms) -- cutting the redundant
+        // K/V HBM reads collapsed occupancy to 1 block/CU (~33 KB LDS) and the
+        // naive kernel was already hiding those reads via high occupancy. Kept
+        // the naive kernel; see optimization_report.md 2026-08-14.
+        prefill_kernels::flash_prefill_causal<<<
+            (unsigned)div_up(seq * NH, waves),
+            kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
+                g.prefill_ctx, g.prefill_q, g.prefill_knope, g.prefill_kpe,
+                g.prefill_value, seq, NH, QKN, QKR, VHD, QHD, c.softmax_scale);
+        HIP_LAUNCH_CHECK();
+
+        launch_batch_gemv(g.prefill_x, g.prefill_ctx, d.o_proj, H, NH * VHD,
+                          seq, true);
+        launch_batch_rmsnorm(g.prefill_xn, g.prefill_x, d.post_norm, H, seq,
+                             c.rms_eps);
+        for (int r0 = 0; r0 < seq; r0 += g_max_batch) {
+            const int chunk = std::min(g_max_batch, seq - r0);
+            gpu_ffn_batch(c, d, l, g.prefill_x + (size_t)r0 * H,
+                          g.prefill_xn + (size_t)r0 * H, chunk);
+        }
+    }
+
+    /* Only the final position's logits are needed (its argmax is the first
+     * generated token, seeding decode). Compute one row into g.next_token[slot]. */
+    launch_batch_rmsnorm(g.xn, g.prefill_x + (size_t)(seq - 1) * H,
+                         g.final_norm, H, 1, c.rms_eps);
+    launch_batch_gemv(g.logits, g.xn, g.lm_head, c.vocab_size, H, 1);
+    batch_decode_kernels::argmax<<<1, kernel_tuning::ELEMENTWISE_THREADS,
+        0, g.stream>>>(g.logits, c.vocab_size, g.next_token + slot, 1);
     HIP_LAUNCH_CHECK();
 }
 
@@ -735,9 +871,26 @@ extern "C" void warm_up(Transformer *t) {
         + (size_t)c.n_layers * warm_capacity * KVD * sizeof(bf16_t)
         + ((size_t)std::max(1, c.n_experts_per_tok) + 1 + c.max_seq_len)
             * sizeof(int);
+    /* Unabsorbed prefill workspace is sized to the prompt capacity P (rows = L),
+     * independent of the decode batch. Reserve it before sizing the decode batch
+     * so the batch buffers cannot starve it. */
+    const size_t P = (size_t)warm_capacity;
+    const size_t prefill_floats =
+        (size_t)2 * P * c.hidden_size                       /* prefill_x, prefill_xn */
+        + P * (size_t)c.n_heads * QHD                       /* prefill_q */
+        + P * (size_t)std::max(1, c.q_lora_rank)            /* prefill_q_a */
+        + P * KVD                                           /* prefill_comp */
+        + P * c.kv_lora_rank                                /* prefill_ckv */
+        + P * c.qk_rope_head_dim                            /* prefill_kpe */
+        + (size_t)c.n_heads * P * c.qk_nope_head_dim        /* prefill_knope */
+        + (size_t)c.n_heads * P * c.v_head_dim              /* prefill_value */
+        + P * (size_t)c.n_heads * c.v_head_dim;             /* prefill_ctx */
+    const size_t prefill_bytes =
+        prefill_floats * sizeof(float) + P * sizeof(int);   /* + prompt_tokens */
     constexpr size_t vram_reserve = kVramReserve;
-    size_t memory_batch = free_after_weights > vram_reserve
-        ? (free_after_weights - vram_reserve) / per_batch_bytes : 0;
+    const size_t reserve_total = vram_reserve + prefill_bytes;
+    size_t memory_batch = free_after_weights > reserve_total
+        ? (free_after_weights - reserve_total) / per_batch_bytes : 0;
     if (memory_batch < 1) {
         std::fprintf(stderr, "HIP inference: insufficient VRAM for batch buffers\n");
         std::exit(EXIT_FAILURE);
@@ -777,6 +930,21 @@ extern "C" void warm_up(Transformer *t) {
     device_alloc(&g.logits, B * c.vocab_size);
     device_alloc(&g.next_token, B);
     device_alloc(&g.generated, B * c.max_seq_len);
+
+    /* Unabsorbed prefill workspace (rows = prompt length, up to P). */
+    device_alloc(&g.prompt_tokens, P);
+    device_alloc(&g.prefill_x, P * c.hidden_size);
+    device_alloc(&g.prefill_xn, P * c.hidden_size);
+    device_alloc(&g.prefill_q, P * (size_t)c.n_heads * QHD);
+    device_alloc(&g.prefill_q_a, P * std::max(1, c.q_lora_rank));
+    device_alloc(&g.prefill_comp, P * KVD);
+    device_alloc(&g.prefill_ckv, P * c.kv_lora_rank);
+    device_alloc(&g.prefill_kpe, P * c.qk_rope_head_dim);
+    device_alloc(&g.prefill_knope, (size_t)c.n_heads * P * c.qk_nope_head_dim);
+    device_alloc(&g.prefill_value, (size_t)c.n_heads * P * c.v_head_dim);
+    device_alloc(&g.prefill_ctx, P * (size_t)c.n_heads * c.v_head_dim);
+    g.prefill_capacity = (int)P;
+
     g.kv_capacity = 0;
     allocate_sequence_buffers(c, warm_capacity);
     HIP_CHECK(hipStreamSynchronize(g.stream));
@@ -795,6 +963,13 @@ extern "C" void warm_up(Transformer *t) {
                                  (size_t)kernel_warm_batch * sizeof(int), g.stream));
         gpu_forward_absorbed_batch(g.next_token, g.generated, c.max_seq_len,
                                    0, 0, true, kernel_warm_batch);
+    }
+    /* Exercise the prefill kernels (embed/rope-rows/kv-norm/decompress/flash). */
+    {
+        const int warm_seq = std::min(g.kv_capacity, 8);
+        HIP_CHECK(hipMemsetAsync(g.prompt_tokens, 0,
+                                 (size_t)warm_seq * sizeof(int), g.stream));
+        gpu_forward_prefill(g.prompt_tokens, warm_seq, 0);
     }
     HIP_CHECK(hipStreamSynchronize(g.stream));
 
@@ -831,6 +1006,7 @@ extern "C" void finish(Transformer *t) {
     device_free(g.prefill_q); device_free(g.prefill_q_a); device_free(g.prefill_comp);
     device_free(g.prefill_qrope); device_free(g.prefill_knope); device_free(g.prefill_value);
     device_free(g.prefill_scores); device_free(g.prefill_ctx);
+    device_free(g.prefill_ckv); device_free(g.prefill_kpe);
     device_free(g.prefill_ffn);
     device_free(g.prefill_router); device_free(g.prefill_topk_weights);
     device_free(g.prefill_hb); device_free(g.routed_hidden);
@@ -889,7 +1065,6 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
     });
 
     long long total = 0;
-    std::vector<int> host_tokens((size_t)g_max_batch);
     size_t group_begin = 0;
     while (group_begin < order.size()) {
         const int n_prompt = (int)prompts[order[group_begin]].size();
@@ -906,14 +1081,17 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
                                                   max_seq - n_prompt));
 
 
-            for (int p = 0; p < n_prompt; ++p) {
-                for (int b = 0; b < batch; ++b)
-                    host_tokens[b] = prompts[order[base + (size_t)b]][p];
-                HIP_CHECK(hipMemcpyAsync(g.next_token, host_tokens.data(),
-                                         (size_t)batch * sizeof(int),
+            /* Unabsorbed FlashAttention-v2 prefill: each request in the group is
+             * prefilled whole into its own KV slot (all L tokens at once), which
+             * seeds g.next_token[b] with its first generated token. This replaces
+             * the old per-position absorbed loop that re-read every weight once
+             * per prompt token. */
+            for (int b = 0; b < batch; ++b) {
+                const std::vector<int> &pr = prompts[order[base + (size_t)b]];
+                HIP_CHECK(hipMemcpyAsync(g.prompt_tokens, pr.data(),
+                                         (size_t)n_prompt * sizeof(int),
                                          hipMemcpyHostToDevice, g.stream));
-                gpu_forward_absorbed_batch(g.next_token, nullptr, max_seq, 0,
-                                           p, p == n_prompt - 1, batch);
+                gpu_forward_prefill(g.prompt_tokens, n_prompt, b);
             }
 
             for (int step = 0; step < steps; ++step)

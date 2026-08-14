@@ -82,6 +82,7 @@ struct GpuContext {
     float *prefill_q = nullptr, *prefill_q_a = nullptr, *prefill_comp = nullptr;
     float *prefill_qrope = nullptr, *prefill_knope = nullptr, *prefill_value = nullptr;
     float *prefill_scores = nullptr, *prefill_ctx = nullptr;
+    float *prefill_ckv = nullptr, *prefill_kpe = nullptr;
     float *prefill_ffn = nullptr;
     float *prefill_router = nullptr, *prefill_topk_weights = nullptr;
     float *prefill_hb = nullptr, *routed_hidden = nullptr;

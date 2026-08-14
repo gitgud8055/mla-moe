@@ -90,6 +90,84 @@ __global__ void mfma_gemm(float *__restrict__ y,
     }
 }
 
+/* Batched decompression: y[h][row][:] = x[row][:] @ W[h], with x SHARED across
+ * heads (only the weight and output offsets change per head).  Collapses the
+ * per-head mfma_gemm decompression loop (2*NH launches/layer, occupancy-starved
+ * at ~4%) into one dispatch via blockIdx.z = head.  Identical MFMA math and tile
+ * shape to mfma_gemm, so output is bit-identical to the per-head launches.
+ *   x : [rows, n_in]           (shared: c_kv latent, same for every head)
+ *   w : per-head [d_out, n_in], stride = weight_head_stride
+ *   y : [heads, rows, d_out]   (head-major) */
+__global__ void mfma_gemm_heads(float *__restrict__ y,
+                                const float *__restrict__ x,
+                                const bf16_t *__restrict__ w,
+                                int rows, int d_out, int n_in,
+                                size_t weight_head_stride) {
+    __shared__ bf16_t sx[MFMA_M][MFMA_LDS_K];
+    __shared__ bf16_t sw[MFMA_N][MFMA_LDS_K];
+
+    const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    const int wave = (int)threadIdx.x / HIP_WAVE;
+    const int head = (int)blockIdx.z;
+    const int row0 = (int)blockIdx.y * MFMA_M;
+    const int col0 = (int)blockIdx.x * MFMA_N;
+    const int col = col0 + wave * 16 + (lane & 15);
+    const int k4 = 4 * (lane >> 4);
+    const bf16_t *wh = w + (size_t)head * weight_head_stride;
+    float4v acc = {};
+
+    for (int bk = 0; bk < n_in; bk += MFMA_K) {
+        for (int i = (int)threadIdx.x; i < MFMA_M * MFMA_K;
+             i += (int)blockDim.x) {
+            const int r = i / MFMA_K;
+            const int k = i - r * MFMA_K;
+            const int gr = row0 + r;
+            sx[r][k] = gr < rows && bk + k < n_in
+                ? gpu_f32_to_bf16(x[(size_t)gr * n_in + bk + k])
+                : (bf16_t)0;
+        }
+        for (int i = (int)threadIdx.x; i < MFMA_N * (MFMA_K / 8);
+             i += (int)blockDim.x) {
+            const int c = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            bf16x8 value = {};
+            const int gc = col0 + c;
+            if (gc < d_out && bk + k + 8 <= n_in)
+                value = *reinterpret_cast<const bf16x8 *>(
+                    wh + (size_t)gc * n_in + bk + k);
+            else if (gc < d_out) {
+#pragma unroll
+                for (int q = 0; q < 8; ++q)
+                    if (bk + k + q < n_in)
+                        value[q] = reinterpret_cast<const short *>(wh)[
+                            (size_t)gc * n_in + bk + k + q];
+            }
+            *reinterpret_cast<bf16x8 *>(&sw[c][k]) = value;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < MFMA_K; k += 16) {
+            const bf16x4 av = *reinterpret_cast<const bf16x4 *>(
+                &sx[lane & 15][k + k4]);
+            const bf16x4 bv = *reinterpret_cast<const bf16x4 *>(
+                &sw[wave * 16 + (lane & 15)][k + k4]);
+            acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+                av, bv, acc, 0, 0, 0);
+        }
+        __syncthreads();
+    }
+
+    if (col < d_out) {
+        const int r0 = row0 + 4 * (lane >> 4);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const int r = r0 + q;
+            if (r < rows)
+                y[((size_t)head * rows + r) * d_out + col] = acc[q];
+        }
+    }
+}
+
 /* Batched per-head projection.  The activation and result are both
  * [batch, head, dim], while weights are independently row-major per head. */
 __global__ void mfma_head_gemm(float *__restrict__ y,
