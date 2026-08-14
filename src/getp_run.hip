@@ -184,7 +184,9 @@ static QuantGroups g_quant;
 static QuantGroups configured_quant_groups() {
     QuantGroups q;
     const char *text = std::getenv("GETP_QUANT");
-    if (!text || !*text) return q;
+    if (!text || !*text) {
+        text = "all,w8a8";
+    }
     std::string s(text);
     size_t begin = 0;
     while (begin <= s.size()) {
