@@ -32,5 +32,5 @@ output.tile16.txt
 mv-mi250-08/
 profile/
 
-# Local implementation notes
 /docs/decode-end-to-end.md
+rocprof_*
