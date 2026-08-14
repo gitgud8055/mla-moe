@@ -1547,20 +1547,21 @@ __global__ void flash_attention(
         for (int t = 0; t < KV_TILE; ++t) {
             const int key = k0 + t;
             const bool valid = active && t < tile && key <= qpos;
-            float score_nope = 0.0f;
+            float partial = 0.0f;
             const bf16_t *ckv = shared_cache + t * kv_dim;
 #pragma unroll
             for (int q = 0; q < VALUES_PER_LANE; ++q) {
                 const int r = lane + q * HIP_WAVE;
                 if (valid && r < kv_rank)
-                    score_nope += qa[r] * gpu_bf16_to_f32(ckv[r]);
+                    partial += qa[r] * gpu_bf16_to_f32(ckv[r]);
             }
-            float score_rope = valid && lane < rope_dim
-                ? qp[lane] * gpu_bf16_to_f32(ckv[kv_rank + lane]) : 0.0f;
-            score_nope = wave_sum(score_nope);
-            score_rope = wave_sum(score_rope);
+            /* fold the rope partial into the same lane accumulator so the
+             * (nope + rope) dot needs one wave reduction instead of two. */
+            if (valid && lane < rope_dim)
+                partial += qp[lane] * gpu_bf16_to_f32(ckv[kv_rank + lane]);
+            partial = wave_sum(partial);
             scores[t] = valid
-                ? __shfl((score_nope + score_rope) * scale, 0, HIP_WAVE)
+                ? __shfl(partial * scale, 0, HIP_WAVE)
                 : -INFINITY;
         }
 
@@ -1681,20 +1682,21 @@ __global__ void flash_attention(float *__restrict__ clat,
 
         float scores[KV_TILE];
         for (int t = 0; t < KV_TILE; ++t) {
-            float score_nope = 0.0f;
+            float partial = 0.0f;
             const bf16_t *ckv = shared_cache + t * kv_dim;
 #pragma unroll
             for (int q = 0; q < VALUES_PER_LANE; ++q) {
                 const int r = lane + q * HIP_WAVE;
                 if (active && t < tile && r < kv_rank)
-                    score_nope += qa[r] * gpu_bf16_to_f32(ckv[r]);
+                    partial += qa[r] * gpu_bf16_to_f32(ckv[r]);
             }
-            float score_rope = active && t < tile && lane < rope_dim
-                ? qp[lane] * gpu_bf16_to_f32(ckv[kv_rank + lane]) : 0.0f;
-            score_nope = wave_sum(score_nope);
-            score_rope = wave_sum(score_rope);
+            /* fold the rope partial into the same lane accumulator so the
+             * (nope + rope) dot needs one wave reduction instead of two. */
+            if (active && t < tile && lane < rope_dim)
+                partial += qp[lane] * gpu_bf16_to_f32(ckv[kv_rank + lane]);
+            partial = wave_sum(partial);
             scores[t] = t < tile
-                ? __shfl((score_nope + score_rope) * scale, 0, HIP_WAVE)
+                ? __shfl(partial * scale, 0, HIP_WAVE)
                 : -INFINITY;
         }
 

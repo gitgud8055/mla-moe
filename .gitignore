@@ -38,3 +38,6 @@ TOKEN*
 CLAUDE.md
 trace_out/
 reports/
+workloads/
+.rocprofv3/
+.claude/
