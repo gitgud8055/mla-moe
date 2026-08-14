@@ -25,7 +25,7 @@ def main():
     if not os.path.exists(args.output_txt):
         sys.exit(f"Output file not found: {args.output_txt}")
         
-    data = args.dir or os.path.join(_HERE, args.model)
+    data = os.path.join(args.dir or _HERE, args.model)
     comps_path = os.path.join(data, "completions.i32.txt")
     
     if not os.path.exists(comps_path):
