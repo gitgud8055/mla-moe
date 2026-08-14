@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "getp.h"
@@ -24,11 +25,15 @@ namespace batch_decode_kernels {
     __global__ void embedding(float *, const bf16_t *, const int *, int *,
                               int, int, int, int);
     __global__ void rmsnorm(float *, const float *, const bf16_t *, int, int, float);
-    __global__ void gemv(float *, const float *, const bf16_t *, int, int, int, int);
-    __global__ void dual_gemv(float *, const bf16_t *, int, float *, const bf16_t *,
-                              int, const float *, int, int);
+    __global__ void gemv(float *, const float *, const bf16_t *, const float *,
+                         int, int, int, int);
+    __global__ void dual_gemv(float *, const bf16_t *, const float *, int,
+                              float *, const bf16_t *, const float *, int,
+                              const float *, int, int);
     __global__ void gate_up_swiglu(float *, const float *, const bf16_t *,
-                                   const bf16_t *, int, int, int);
+                                   const float *, const bf16_t *, const float *,
+                                   int, int, int);
+    __global__ void quantize_rows(const bf16_t *, char *, float *, int, int);
     namespace decode {
         __global__ void kv_norm_rope(
             bf16_t *, const float *, const bf16_t *, const int *, int, int,
@@ -68,35 +73,65 @@ namespace batch_decode_kernels {
     }
     __global__ void routed_shared_gate_up(float *, float *, const float *,
                                           const char *, const size_t *, const size_t *,
-                                          const int *, const bf16_t *, const bf16_t *,
+                                          const size_t *, const size_t *,
+                                          const int *, const bf16_t *, const float *,
+                                          const bf16_t *, const float *,
                                           int, int, int, int, int);
     __global__ void routed_shared_down(float *, const float *, const float *,
-                                       const char *, const size_t *, const int *,
-                                       const float *, const bf16_t *, int, int, int,
+                                       const char *, const size_t *, const size_t *,
+                                       const int *,
+                                       const float *, const bf16_t *, const float *,
+                                       int, int, int,
                                        int, int);
     __global__ void argmax(const float *, int, int *, int);
     __global__ void mfma_gemm(float *, const float *, const bf16_t *,
-                              int, int, int, int);
+                              const float *, int, int, int, int);
     template <int M_TILES>
     __global__ void mfma_gemm_rows(float *, const float *, const bf16_t *,
-                                   int, int, int, int);
+                                   const float *, int, int, int, int);
     __global__ void mfma_head_gemm(float *, const float *, const bf16_t *,
                                    int, int, int, int, int, int, size_t);
     __global__ void mfma_gate_up_swiglu(float *, const float *, const bf16_t *,
-                                        const bf16_t *, int, int, int);
+                                        const float *, const bf16_t *,
+                                        const float *, int, int, int);
     template <int M_TILES>
     __global__ void mfma_gate_up_swiglu_rows(
-        float *, const float *, const bf16_t *, const bf16_t *, int, int, int);
+        float *, const float *, const bf16_t *, const float *, const bf16_t *,
+        const float *, int, int, int);
     __global__ void swiglu(float *, const float *, const float *, int);
     __global__ void align_routes(const int *, int, int, int, int *, int *, int *);
     template <int BLOCK_M, int M_TILES>
     __global__ void grouped_expert_gate_up(
         const float *, const char *, const size_t *, const size_t *,
+        const size_t *, const size_t *,
         const int *, const int *, float *, bf16_t *, int, int, int, int, int);
     template <int BLOCK_M, int M_TILES>
     __global__ void grouped_expert_down(
         const float *, const bf16_t *, const char *, const size_t *,
+        const size_t *,
         const int *, const int *, float *, int, int, int, int);
+    __global__ void quantize_act_rows_f32(const float *, char *, float *,
+                                          int, int);
+    __global__ void quantize_act_rows_bf16(const bf16_t *, char *, float *,
+                                           int, int);
+    template <int BLOCK_M, int M_TILES>
+    __global__ void grouped_expert_gate_up_i8(
+        const char *, const float *, const char *, const size_t *,
+        const size_t *, const size_t *, const size_t *, const int *,
+        const int *, float *, bf16_t *, int, int, int, int, int);
+    template <int BLOCK_M, int M_TILES>
+    __global__ void grouped_expert_down_i8(
+        const char *, const float *, const char *, const size_t *,
+        const size_t *, const int *, const int *, float *, int, int, int,
+        int);
+    template <int M_TILES>
+    __global__ void mfma_gemm_i8(float *, const char *, const float *,
+                                 const char *, const float *, int, int, int,
+                                 int);
+    template <int M_TILES>
+    __global__ void mfma_gate_up_swiglu_i8(
+        float *, const char *, const float *, const char *, const float *,
+        const char *, const float *, int, int, int);
     __global__ void reduce_routes_add(float *, const float *, const float *,
                                       int, int, int);
 }
@@ -132,6 +167,48 @@ static int div_up(int value, int divisor) {
 }  // namespace
 
 static GpuContext g;
+
+/* Weight-only int8 (per-output-row scales), selected per tensor group via
+ * GETP_QUANT (comma list of: experts, shared, proj, lmhead; or "all"). */
+struct QuantGroups {
+    bool experts = false;
+    bool shared_experts = false;
+    bool proj = false;
+    bool lmhead = false;
+    /* int8 MFMA compute for the grouped expert path (implies experts). */
+    bool w8a8 = false;
+    bool any() const { return experts || shared_experts || proj || lmhead; }
+};
+static QuantGroups g_quant;
+
+static QuantGroups configured_quant_groups() {
+    QuantGroups q;
+    const char *text = std::getenv("GETP_QUANT");
+    if (!text || !*text) return q;
+    std::string s(text);
+    size_t begin = 0;
+    while (begin <= s.size()) {
+        size_t end = s.find(',', begin);
+        if (end == std::string::npos) end = s.size();
+        std::string token = s.substr(begin, end - begin);
+        if (token == "experts") q.experts = true;
+        else if (token == "shared") q.shared_experts = true;
+        else if (token == "proj") q.proj = true;
+        else if (token == "lmhead") q.lmhead = true;
+        else if (token == "w8a8") q.w8a8 = q.experts = true;
+        else if (token == "all") q.experts = q.shared_experts = q.proj = q.lmhead = true;
+        else if (token == "none" || token.empty()) { /* no-op */ }
+        else {
+            std::fprintf(stderr,
+                "GETP_QUANT: unknown group '%s' (use experts,shared,proj,lmhead,all)\n",
+                token.c_str());
+            std::exit(EXIT_FAILURE);
+        }
+        begin = end + 1;
+    }
+    return q;
+}
+
 static int g_max_batch = 1;
 static int g_prefill_token_budget = kDefaultPrefillBatchTokens;
 static int g_decode_token_budget = kDefaultBatchSize;
@@ -213,6 +290,24 @@ static size_t add_chunk(LayerLayout &layout, const void *host, size_t bytes) {
     return offset;
 }
 
+/* Row-major [rows x cols] weight: plain bf16 copy, or (when `quant`) an int8
+ * data block plus per-row fp32 scales written by quantize_rows at load time. */
+static size_t add_weight(LayerLayout &layout, const void *host, size_t rows,
+                         size_t cols, bool quant, size_t *scale_offset) {
+    if (!quant)
+        return add_chunk(layout, host, rows * cols * sizeof(bf16_t));
+    layout.bytes = align_up(layout.bytes, kDeviceAlignment);
+    const size_t data_offset = layout.bytes;
+    layout.bytes += rows * cols;
+    layout.bytes = align_up(layout.bytes, kDeviceAlignment);
+    const size_t s_offset = layout.bytes;
+    layout.bytes += rows * sizeof(float);
+    layout.qchunks.push_back({host, data_offset, s_offset,
+                              (int)rows, (int)cols});
+    if (scale_offset) *scale_offset = s_offset;
+    return data_offset;
+}
+
 static LayerLayout make_layer_layout(const Transformer *t, int l,
                                      const bf16_t *wuk_t) {
     const Config &c = t->config;
@@ -226,44 +321,59 @@ static LayerLayout make_layer_layout(const Transformer *t, int l,
     auto bfbytes = [](size_t n) { return n * sizeof(bf16_t); };
 
     if (c.q_lora_rank > 0) {
-        a.q_a_proj = add_chunk(a, w.q_a_proj[l], bfbytes((size_t)c.q_lora_rank * H));
-        a.q_b_proj = add_chunk(a, w.q_b_proj[l], bfbytes((size_t)QD * c.q_lora_rank));
+        a.q_a_proj = add_weight(a, w.q_a_proj[l], c.q_lora_rank, H,
+                                g_quant.proj, &a.q_a_proj_s);
+        a.q_b_proj = add_weight(a, w.q_b_proj[l], QD, c.q_lora_rank,
+                                g_quant.proj, &a.q_b_proj_s);
         a.q_a_norm = add_chunk(a, w.q_a_layernorm[l], bfbytes(c.q_lora_rank));
     } else {
-        a.q_proj = add_chunk(a, w.q_proj[l], bfbytes((size_t)QD * H));
+        a.q_proj = add_weight(a, w.q_proj[l], QD, H, g_quant.proj, &a.q_proj_s);
     }
-    a.kv_a_proj = add_chunk(a, w.kv_a_proj[l], bfbytes((size_t)KVD * H));
+    a.kv_a_proj = add_weight(a, w.kv_a_proj[l], KVD, H, g_quant.proj,
+                             &a.kv_a_proj_s);
     size_t kv_b_elems = (size_t)c.n_heads * (c.qk_nope_head_dim + c.v_head_dim) * c.kv_lora_rank;
     a.kv_b_proj = add_chunk(a, w.W_UK[l], bfbytes(kv_b_elems));
     size_t wuk_elems = (size_t)c.n_heads * c.kv_lora_rank * c.qk_nope_head_dim;
     a.wuk_t = add_chunk(a, wuk_t, bfbytes(wuk_elems));
-    a.o_proj = add_chunk(a, w.o_proj[l], bfbytes((size_t)H * AOUT));
+    a.o_proj = add_weight(a, w.o_proj[l], H, AOUT, g_quant.proj, &a.o_proj_s);
     a.input_norm = add_chunk(a, w.input_layernorm[l], bfbytes(H));
     a.post_norm = add_chunk(a, w.post_attn_norm[l], bfbytes(H));
     a.kv_a_norm = add_chunk(a, w.kv_a_layernorm[l], bfbytes(c.kv_lora_rank));
 
     if (l < c.first_k_dense) {
-        size_t ih = (size_t)c.dense_inter_size * H;
-        a.dense_gate = add_chunk(a, w.dense_gate[l], bfbytes(ih));
-        a.dense_up = add_chunk(a, w.dense_up[l], bfbytes(ih));
-        a.dense_down = add_chunk(a, w.dense_down[l], bfbytes(ih));
+        a.dense_gate = add_weight(a, w.dense_gate[l], c.dense_inter_size, H,
+                                  g_quant.proj, &a.dense_gate_s);
+        a.dense_up = add_weight(a, w.dense_up[l], c.dense_inter_size, H,
+                                g_quant.proj, &a.dense_up_s);
+        a.dense_down = add_weight(a, w.dense_down[l], H, c.dense_inter_size,
+                                  g_quant.proj, &a.dense_down_s);
     } else {
         a.moe_gate = add_chunk(a, w.moe_gate[l], bfbytes((size_t)c.n_routed_experts * H));
         if (w.moe_gate_bias[l])
             a.moe_bias = add_chunk(a, w.moe_gate_bias[l], (size_t)c.n_routed_experts * sizeof(float));
         int shared = c.n_shared_experts * c.moe_inter_size;
-        size_t sh = (size_t)shared * H;
-        a.shared_gate = add_chunk(a, w.shared_gate[l], bfbytes(sh));
-        a.shared_up = add_chunk(a, w.shared_up[l], bfbytes(sh));
-        a.shared_down = add_chunk(a, w.shared_down[l], bfbytes(sh));
+        a.shared_gate = add_weight(a, w.shared_gate[l], shared, H,
+                                   g_quant.shared_experts, &a.shared_gate_s);
+        a.shared_up = add_weight(a, w.shared_up[l], shared, H,
+                                 g_quant.shared_experts, &a.shared_up_s);
+        a.shared_down = add_weight(a, w.shared_down[l], H, shared,
+                                   g_quant.shared_experts, &a.shared_down_s);
         a.expert_gate.resize(c.n_routed_experts);
         a.expert_up.resize(c.n_routed_experts);
         a.expert_down.resize(c.n_routed_experts);
-        size_t eh = (size_t)c.moe_inter_size * H;
+        a.expert_gate_s.resize(c.n_routed_experts, NO_OFFSET);
+        a.expert_up_s.resize(c.n_routed_experts, NO_OFFSET);
+        a.expert_down_s.resize(c.n_routed_experts, NO_OFFSET);
         for (int e = 0; e < c.n_routed_experts; ++e) {
-            a.expert_gate[e] = add_chunk(a, w.expert_gate[l][e], bfbytes(eh));
-            a.expert_up[e] = add_chunk(a, w.expert_up[l][e], bfbytes(eh));
-            a.expert_down[e] = add_chunk(a, w.expert_down[l][e], bfbytes(eh));
+            a.expert_gate[e] = add_weight(a, w.expert_gate[l][e],
+                                          c.moe_inter_size, H,
+                                          g_quant.experts, &a.expert_gate_s[e]);
+            a.expert_up[e] = add_weight(a, w.expert_up[l][e],
+                                        c.moe_inter_size, H,
+                                        g_quant.experts, &a.expert_up_s[e]);
+            a.expert_down[e] = add_weight(a, w.expert_down[l][e],
+                                          H, c.moe_inter_size,
+                                          g_quant.experts, &a.expert_down_s[e]);
         }
     }
     a.bytes = align_up(a.bytes, kDeviceAlignment);
@@ -318,15 +428,51 @@ static DeviceLayer materialize_layer(const LayerLayout &a, void *pool, int l) {
         d.expert_gate_offsets = g.expert_offsets + layer_base;
         d.expert_up_offsets = g.expert_offsets + layer_base + c.n_routed_experts;
         d.expert_down_offsets = g.expert_offsets + layer_base + 2 * c.n_routed_experts;
+        if (g_quant.experts && g.expert_scale_offsets) {
+            d.expert_gate_scale_offsets = g.expert_scale_offsets + layer_base;
+            d.expert_up_scale_offsets =
+                g.expert_scale_offsets + layer_base + c.n_routed_experts;
+            d.expert_down_scale_offsets =
+                g.expert_scale_offsets + layer_base + 2 * c.n_routed_experts;
+        }
     }
+    auto scale_ptr = [&](size_t offset) {
+        return reinterpret_cast<const float *>(offset_ptr(base, offset));
+    };
+    d.q_proj_s = scale_ptr(a.q_proj_s);
+    d.q_a_proj_s = scale_ptr(a.q_a_proj_s);
+    d.q_b_proj_s = scale_ptr(a.q_b_proj_s);
+    d.kv_a_proj_s = scale_ptr(a.kv_a_proj_s);
+    d.o_proj_s = scale_ptr(a.o_proj_s);
+    d.dense_gate_s = scale_ptr(a.dense_gate_s);
+    d.dense_up_s = scale_ptr(a.dense_up_s);
+    d.dense_down_s = scale_ptr(a.dense_down_s);
+    d.shared_gate_s = scale_ptr(a.shared_gate_s);
+    d.shared_up_s = scale_ptr(a.shared_up_s);
+    d.shared_down_s = scale_ptr(a.shared_down_s);
     return d;
 }
 
-static void enqueue_layer_copy(const LayerLayout &a, void *pool) {
+static void enqueue_layer_copy(const LayerLayout &a, void *pool,
+                               bf16_t *quant_stage) {
     char *base = reinterpret_cast<char *>(pool);
     for (const CopyChunk &chunk : a.chunks) {
         HIP_CHECK(hipMemcpyAsync(base + chunk.offset, chunk.host, chunk.bytes,
                                  hipMemcpyHostToDevice, g.stream));
+    }
+    /* Stream order serializes the staging copy against the previous chunk's
+     * quantize_rows launch, so one staging buffer is enough. */
+    for (const QuantChunk &chunk : a.qchunks) {
+        HIP_CHECK(hipMemcpyAsync(
+            quant_stage, chunk.host,
+            (size_t)chunk.rows * chunk.cols * sizeof(bf16_t),
+            hipMemcpyHostToDevice, g.stream));
+        batch_decode_kernels::quantize_rows<<<
+            chunk.rows, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                quant_stage, base + chunk.data_offset,
+                reinterpret_cast<float *>(base + chunk.scale_offset),
+                chunk.rows, chunk.cols);
+        HIP_LAUNCH_CHECK();
     }
 }
 
@@ -392,8 +538,16 @@ static size_t prefill_workspace_bytes(const Config &c, size_t rows) {
     const size_t routes = rows * k;
     const size_t max_padded = routes
         + (size_t)c.n_routed_experts * (kGroupedRouteTile - 1);
+    const size_t w8a8_act_cols = std::max(
+        inter, std::max((size_t)c.hidden_size,
+                        (size_t)c.n_heads * c.v_head_dim));
+    const size_t w8a8_bytes = g_quant.w8a8
+        ? rows * w8a8_act_cols + routes * (size_t)c.moe_inter_size
+          + (rows + routes) * sizeof(float)
+        : 0;
     return rows * floats_per_row * sizeof(float)
         + rows * k * c.moe_inter_size * sizeof(bf16_t)
+        + w8a8_bytes
         + rows * sizeof(int)                 // flattened prompt tokens
         + rows * 2 * sizeof(int)             // packed row batch + position
         + ((size_t)g_max_batch + 1) * sizeof(int) // packed prompt offsets
@@ -459,6 +613,16 @@ static void allocate_prefill_workspace(const Config &c, int target_rows) {
     device_alloc(&g.prefill_expert_buckets, 1);
     device_alloc(&g.prefill_routed_hidden, routes * c.moe_inter_size);
     device_alloc(&g.prefill_ffn, routes * c.hidden_size);
+    if (g_quant.w8a8) {
+        const size_t act_cols = std::max(
+            inter,
+            std::max((size_t)c.hidden_size,
+                     (size_t)c.n_heads * c.v_head_dim));
+        device_alloc(&g.prefill_act_i8, rows * act_cols);
+        device_alloc(&g.prefill_act_s, rows);
+        device_alloc(&g.prefill_routed_i8, routes * c.moe_inter_size);
+        device_alloc(&g.prefill_routed_s, routes);
+    }
     g.prefill_capacity = lo;
 }
 
@@ -473,68 +637,114 @@ static dim3 batch_projection_grid(int rows, int batch)
 }
 
 static void launch_batch_gemv(float *y, const float *x, const bf16_t *w,
-                              int out, int in, int batch, bool add = false)
+                              const float *ws, int out, int in, int batch,
+                              bool add = false)
 {
     if (batch >= g_mfma_threshold) {
+        const bool large_m =
+            g_prefill_large_m && batch >= kPrefillMmaThreshold;
         dim3 grid((unsigned)div_up(out, kMmaTileSize),
                   (unsigned)div_up(
-                      batch, g_prefill_large_m && batch >= kPrefillMmaThreshold
-                          ? kPrefillMmaRows : kMmaBatchTile));
-        if (g_prefill_large_m && batch >= kPrefillMmaThreshold)
+                      batch, large_m ? kPrefillMmaRows : kMmaBatchTile));
+        char *xq = batch <= g_max_batch ? g.act_i8 : g.prefill_act_i8;
+        float *xqs = batch <= g_max_batch ? g.act_s : g.prefill_act_s;
+        if (g_quant.w8a8 && ws && xq) {
+            batch_decode_kernels::quantize_act_rows_f32<<<
+                batch, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                    x, xq, xqs, batch, in);
+            HIP_LAUNCH_CHECK();
+            if (large_m)
+                batch_decode_kernels::mfma_gemm_i8<kPrefillMmaRowTiles><<<
+                    grid, 256, 0, g.stream>>>(
+                        y, xq, xqs, reinterpret_cast<const char *>(w), ws,
+                        batch, out, in, add ? 1 : 0);
+            else
+                batch_decode_kernels::mfma_gemm_i8<1><<<
+                    grid, 256, 0, g.stream>>>(
+                        y, xq, xqs, reinterpret_cast<const char *>(w), ws,
+                        batch, out, in, add ? 1 : 0);
+            HIP_LAUNCH_CHECK();
+            return;
+        }
+        if (large_m)
             batch_decode_kernels::mfma_gemm_rows<kPrefillMmaRowTiles><<<
                 grid, 256, 0, g.stream>>>(
-                    y, x, w, batch, out, in, add ? 1 : 0);
+                    y, x, w, ws, batch, out, in, add ? 1 : 0);
         else
             batch_decode_kernels::mfma_gemm<<<grid, 256, 0, g.stream>>>(
-                y, x, w, batch, out, in, add ? 1 : 0);
+                y, x, w, ws, batch, out, in, add ? 1 : 0);
         HIP_LAUNCH_CHECK();
         return;
     }
     batch_decode_kernels::gemv<<<batch_projection_grid(out, batch),
         kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-            y, x, w, out, in, batch, add ? 1 : 0);
+            y, x, w, ws, out, in, batch, add ? 1 : 0);
     HIP_LAUNCH_CHECK();
 }
 
 static void launch_batch_dual_gemv(
-    float *y0, const bf16_t *w0, int out0,
-    float *y1, const bf16_t *w1, int out1,
+    float *y0, const bf16_t *w0, const float *ws0, int out0,
+    float *y1, const bf16_t *w1, const float *ws1, int out1,
     const float *x, int in, int batch)
 {
     if (batch >= g_mfma_threshold) {
-        launch_batch_gemv(y0, x, w0, out0, in, batch);
-        launch_batch_gemv(y1, x, w1, out1, in, batch);
+        launch_batch_gemv(y0, x, w0, ws0, out0, in, batch);
+        launch_batch_gemv(y1, x, w1, ws1, out1, in, batch);
         return;
     }
     batch_decode_kernels::dual_gemv<<<batch_projection_grid(out0 + out1, batch),
         kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-            y0, w0, out0, y1, w1, out1, x, in, batch);
+            y0, w0, ws0, out0, y1, w1, ws1, out1, x, in, batch);
     HIP_LAUNCH_CHECK();
 }
 
 static void launch_batch_gate_up_swiglu(float *y, const float *x,
-                                        const bf16_t *gate, const bf16_t *up,
+                                        const bf16_t *gate, const float *gws,
+                                        const bf16_t *up, const float *uws,
                                         int out, int in, int batch)
 {
     if (batch >= g_mfma_threshold) {
+        const bool large_m =
+            g_prefill_large_m && batch >= kPrefillMmaThreshold;
         dim3 grid((unsigned)div_up(out, kMmaTileSize),
                   (unsigned)div_up(
-                      batch, g_prefill_large_m && batch >= kPrefillMmaThreshold
-                          ? kPrefillMmaRows : kMmaBatchTile));
-        if (g_prefill_large_m && batch >= kPrefillMmaThreshold)
+                      batch, large_m ? kPrefillMmaRows : kMmaBatchTile));
+        char *xq = batch <= g_max_batch ? g.act_i8 : g.prefill_act_i8;
+        float *xqs = batch <= g_max_batch ? g.act_s : g.prefill_act_s;
+        if (g_quant.w8a8 && gws && uws && xq) {
+            batch_decode_kernels::quantize_act_rows_f32<<<
+                batch, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                    x, xq, xqs, batch, in);
+            HIP_LAUNCH_CHECK();
+            if (large_m)
+                batch_decode_kernels::mfma_gate_up_swiglu_i8<
+                    kPrefillMmaRowTiles><<<grid, 256, 0, g.stream>>>(
+                        y, xq, xqs, reinterpret_cast<const char *>(gate), gws,
+                        reinterpret_cast<const char *>(up), uws,
+                        batch, out, in);
+            else
+                batch_decode_kernels::mfma_gate_up_swiglu_i8<1><<<
+                    grid, 256, 0, g.stream>>>(
+                        y, xq, xqs, reinterpret_cast<const char *>(gate), gws,
+                        reinterpret_cast<const char *>(up), uws,
+                        batch, out, in);
+            HIP_LAUNCH_CHECK();
+            return;
+        }
+        if (large_m)
             batch_decode_kernels::mfma_gate_up_swiglu_rows<
                 kPrefillMmaRowTiles><<<grid, 256, 0, g.stream>>>(
-                    y, x, gate, up, batch, out, in);
+                    y, x, gate, gws, up, uws, batch, out, in);
         else
             batch_decode_kernels::mfma_gate_up_swiglu<<<
                 grid, 256, 0, g.stream>>>(
-                    y, x, gate, up, batch, out, in);
+                    y, x, gate, gws, up, uws, batch, out, in);
         HIP_LAUNCH_CHECK();
         return;
     }
     batch_decode_kernels::gate_up_swiglu<<<batch_projection_grid(out, batch),
         kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-            y, x, gate, up, out, in, batch);
+            y, x, gate, gws, up, uws, out, in, batch);
     HIP_LAUNCH_CHECK();
 }
 
@@ -569,21 +779,24 @@ static void gpu_ffn_rows(
     float *x, float *xn, float *hb, float *router, int *topk,
     float *topk_weights, int *sorted_ids, int *expert_ids,
     int *num_post_pad, float *routed_hidden,
-    bf16_t *routed_hidden_bf16, float *route_out)
+    bf16_t *routed_hidden_bf16, float *route_out,
+    char *act_i8, float *act_s, char *routed_i8, float *routed_s)
 {
     const int H = c.hidden_size;
     if (l < c.first_k_dense) {
         int inter = c.dense_inter_size;
-        launch_batch_gate_up_swiglu(hb, xn, d.dense_gate, d.dense_up,
+        launch_batch_gate_up_swiglu(hb, xn, d.dense_gate, d.dense_gate_s,
+                                    d.dense_up, d.dense_up_s,
                                     inter, H, rows);
-        launch_batch_gemv(x, hb, d.dense_down, H, inter, rows, true);
+        launch_batch_gemv(x, hb, d.dense_down, d.dense_down_s, H, inter,
+                          rows, true);
         return;
     }
 
     const int E = c.n_routed_experts;
     const int K = c.n_experts_per_tok;
     const int inter = c.moe_inter_size;
-    launch_batch_gemv(router, xn, d.moe_gate, E, H, rows);
+    launch_batch_gemv(router, xn, d.moe_gate, nullptr, E, H, rows);
     launch_router_topk(router, d.moe_bias, topk, topk_weights,
                        rows, E, K, c.router_sigmoid, c.norm_topk,
                        c.routed_scaling);
@@ -603,11 +816,27 @@ static void gpu_ffn_rows(
             num_post_pad);
         HIP_LAUNCH_CHECK();
         const int up_tiles = div_up(inter, kMmaTileSize);
-        batch_decode_kernels::grouped_expert_gate_up<16, 1><<<
-            max_blocks * up_tiles, 256, 0, g.stream>>>(
-                xn, d.pool, d.expert_gate_offsets, d.expert_up_offsets,
-                sorted_ids, expert_ids, routed_hidden, routed_hidden_bf16,
-                routes, H, inter, K, up_tiles);
+        const bool w8a8 = g_quant.w8a8 && act_i8 != nullptr;
+        if (w8a8) {
+            batch_decode_kernels::quantize_act_rows_f32<<<
+                rows, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                    xn, act_i8, act_s, rows, H);
+            HIP_LAUNCH_CHECK();
+            batch_decode_kernels::grouped_expert_gate_up_i8<16, 1><<<
+                max_blocks * up_tiles, 256, 0, g.stream>>>(
+                    act_i8, act_s, d.pool,
+                    d.expert_gate_offsets, d.expert_up_offsets,
+                    d.expert_gate_scale_offsets, d.expert_up_scale_offsets,
+                    sorted_ids, expert_ids, routed_hidden, routed_hidden_bf16,
+                    routes, H, inter, K, up_tiles);
+        } else {
+            batch_decode_kernels::grouped_expert_gate_up<16, 1><<<
+                max_blocks * up_tiles, 256, 0, g.stream>>>(
+                    xn, d.pool, d.expert_gate_offsets, d.expert_up_offsets,
+                    d.expert_gate_scale_offsets, d.expert_up_scale_offsets,
+                    sorted_ids, expert_ids, routed_hidden, routed_hidden_bf16,
+                    routes, H, inter, K, up_tiles);
+        }
         HIP_LAUNCH_CHECK();
     } else {
         dim3 gate_grid((unsigned)div_up(output_rows, rows_per_block),
@@ -615,21 +844,43 @@ static void gpu_ffn_rows(
         batch_decode_kernels::routed_shared_gate_up<<<gate_grid,
             kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 routed_hidden, hb, xn, d.pool,
-                d.expert_gate_offsets, d.expert_up_offsets, topk,
-                d.shared_gate, d.shared_up, rows, K, inter, 0, H);
+                d.expert_gate_offsets, d.expert_up_offsets,
+                d.expert_gate_scale_offsets, d.expert_up_scale_offsets, topk,
+                d.shared_gate, d.shared_gate_s, d.shared_up, d.shared_up_s,
+                rows, K, inter, 0, H);
         HIP_LAUNCH_CHECK();
     }
-    launch_batch_gate_up_swiglu(hb, xn, d.shared_gate, d.shared_up,
+    launch_batch_gate_up_swiglu(hb, xn, d.shared_gate, d.shared_gate_s,
+                                d.shared_up, d.shared_up_s,
                                 shared, H, rows);
     if (grouped_mfma) {
         const int routes = rows * K;
         const int down_tiles = div_up(H, kMmaTileSize);
-        batch_decode_kernels::grouped_expert_down<16, 1><<<
-            max_blocks * down_tiles, 256, 0, g.stream>>>(
-                routed_hidden, routed_hidden_bf16, d.pool,
-                d.expert_down_offsets,
-                sorted_ids, expert_ids, route_out,
-                routes, H, inter, down_tiles);
+        const bool w8a8 = g_quant.w8a8 && routed_i8 != nullptr;
+        if (w8a8) {
+            if (routed_hidden_bf16)
+                batch_decode_kernels::quantize_act_rows_bf16<<<
+                    routes, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                        routed_hidden_bf16, routed_i8, routed_s, routes, inter);
+            else
+                batch_decode_kernels::quantize_act_rows_f32<<<
+                    routes, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                        routed_hidden, routed_i8, routed_s, routes, inter);
+            HIP_LAUNCH_CHECK();
+            batch_decode_kernels::grouped_expert_down_i8<16, 1><<<
+                max_blocks * down_tiles, 256, 0, g.stream>>>(
+                    routed_i8, routed_s, d.pool,
+                    d.expert_down_offsets, d.expert_down_scale_offsets,
+                    sorted_ids, expert_ids, route_out,
+                    routes, H, inter, down_tiles);
+        } else {
+            batch_decode_kernels::grouped_expert_down<16, 1><<<
+                max_blocks * down_tiles, 256, 0, g.stream>>>(
+                    routed_hidden, routed_hidden_bf16, d.pool,
+                    d.expert_down_offsets, d.expert_down_scale_offsets,
+                    sorted_ids, expert_ids, route_out,
+                    routes, H, inter, down_tiles);
+        }
         HIP_LAUNCH_CHECK();
         batch_decode_kernels::reduce_routes_add<<<
             rows, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
@@ -641,10 +892,13 @@ static void gpu_ffn_rows(
         batch_decode_kernels::routed_shared_down<<<down_grid,
             kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 x, routed_hidden, hb, d.pool, d.expert_down_offsets,
-                topk, topk_weights, d.shared_down, rows, K, H, inter, 0);
+                d.expert_down_scale_offsets,
+                topk, topk_weights, d.shared_down, d.shared_down_s,
+                rows, K, H, inter, 0);
         HIP_LAUNCH_CHECK();
     }
-    launch_batch_gemv(x, hb, d.shared_down, H, shared, rows, true);
+    launch_batch_gemv(x, hb, d.shared_down, d.shared_down_s, H, shared,
+                      rows, true);
 }
 
 static void gpu_ffn_batch(const Config &c, const DeviceLayer &d, int l,
@@ -653,7 +907,8 @@ static void gpu_ffn_batch(const Config &c, const DeviceLayer &d, int l,
     gpu_ffn_rows(c, d, l, batch, g.x, g.xn, g.hb, g.router, g.topk,
                  g.topk_weights, g.prefill_topk, g.prefill_expert_counts,
                  g.prefill_expert_buckets, g.routed_hidden, nullptr,
-                 g.prefill_ffn);
+                 g.prefill_ffn,
+                 g.act_i8, g.act_s, g.routed_i8, g.routed_s);
 }
 
 namespace prefill {
@@ -718,17 +973,17 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
                              H, rows, c.rms_eps);
         if (c.q_lora_rank > 0) {
             launch_batch_dual_gemv(
-                g.prefill_q_a, d.q_a_proj, c.q_lora_rank,
-                g.prefill_comp, d.kv_a_proj, KVD,
+                g.prefill_q_a, d.q_a_proj, d.q_a_proj_s, c.q_lora_rank,
+                g.prefill_comp, d.kv_a_proj, d.kv_a_proj_s, KVD,
                 g.prefill_xn, H, rows);
             launch_batch_rmsnorm(g.prefill_q_a, g.prefill_q_a, d.q_a_norm,
                                  c.q_lora_rank, rows, c.mla_norm_eps);
             launch_batch_gemv(g.prefill_q, g.prefill_q_a, d.q_b_proj,
-                              QD, c.q_lora_rank, rows);
+                              d.q_b_proj_s, QD, c.q_lora_rank, rows);
         } else {
             launch_batch_dual_gemv(
-                g.prefill_q, d.q_proj, QD,
-                g.prefill_comp, d.kv_a_proj, KVD,
+                g.prefill_q, d.q_proj, d.q_proj_s, QD,
+                g.prefill_comp, d.kv_a_proj, d.kv_a_proj_s, KVD,
                 g.prefill_xn, H, rows);
         }
 
@@ -779,7 +1034,7 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
                 g.prefill_ctx, g.prefill_clat, d.W_UV, rows, NH, VHD,
                 KVL, KVL, VHD, head_stride);
         HIP_LAUNCH_CHECK();
-        launch_batch_gemv(g.prefill_x, g.prefill_ctx, d.o_proj,
+        launch_batch_gemv(g.prefill_x, g.prefill_ctx, d.o_proj, d.o_proj_s,
                           H, NH * VHD, rows, true);
         phase_end(output_ms);
 
@@ -791,7 +1046,9 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
             g.prefill_router, g.prefill_route_ids, g.prefill_topk_weights,
             g.prefill_topk, g.prefill_expert_counts,
             g.prefill_expert_buckets, nullptr, g.prefill_routed_hidden,
-            g.prefill_ffn);
+            g.prefill_ffn,
+            g.prefill_act_i8, g.prefill_act_s,
+            g.prefill_routed_i8, g.prefill_routed_s);
         phase_end(ffn_ms);
     }
 
@@ -805,7 +1062,7 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
                          g.x + (size_t)slot_base * H,
                          g.final_norm, H, batch, c.rms_eps);
     launch_batch_gemv(g.logits + (size_t)slot_base * c.vocab_size,
-                      g.xn + (size_t)slot_base * H, g.lm_head,
+                      g.xn + (size_t)slot_base * H, g.lm_head, g.lm_head_s,
                       c.vocab_size, H, batch);
     batch_decode_kernels::argmax<<<
         batch, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
@@ -863,15 +1120,16 @@ static void run_step(const int *device_tokens, int *generated,
         launch_batch_rmsnorm(g.xn, g.x, d.input_norm, H, batch, c.rms_eps);
         if (c.q_lora_rank > 0) {
             launch_batch_dual_gemv(
-                g.q_a, d.q_a_proj, c.q_lora_rank,
-                g.comp, d.kv_a_proj, KVD, g.xn, H, batch);
+                g.q_a, d.q_a_proj, d.q_a_proj_s, c.q_lora_rank,
+                g.comp, d.kv_a_proj, d.kv_a_proj_s, KVD, g.xn, H, batch);
             launch_batch_rmsnorm(g.q_a, g.q_a, d.q_a_norm,
                                  c.q_lora_rank, batch, c.mla_norm_eps);
-            launch_batch_gemv(g.q, g.q_a, d.q_b_proj, QD,
+            launch_batch_gemv(g.q, g.q_a, d.q_b_proj, d.q_b_proj_s, QD,
                               c.q_lora_rank, batch);
         } else {
             launch_batch_dual_gemv(
-                g.q, d.q_proj, QD, g.comp, d.kv_a_proj, KVD, g.xn, H, batch);
+                g.q, d.q_proj, d.q_proj_s, QD,
+                g.comp, d.kv_a_proj, d.kv_a_proj_s, KVD, g.xn, H, batch);
         }
         bf16_t *layer_cache = g.kv_cache +
             (size_t)l * g_max_batch * g.kv_capacity * KVD;
@@ -976,7 +1234,8 @@ static void run_step(const int *device_tokens, int *generated,
                     g.ctx, g.clat, d.W_UV, batch, NH, VHD, KVL, head_stride);
         }
         HIP_LAUNCH_CHECK();
-        launch_batch_gemv(g.x, g.ctx, d.o_proj, H, NH * VHD, batch, true);
+        launch_batch_gemv(g.x, g.ctx, d.o_proj, d.o_proj_s, H, NH * VHD,
+                          batch, true);
 
         launch_batch_rmsnorm(g.xn, g.x, d.post_norm, H, batch, c.rms_eps);
         gpu_ffn_batch(c, d, l, batch);
@@ -984,7 +1243,8 @@ static void run_step(const int *device_tokens, int *generated,
 
     if (!produce_token) return;
     launch_batch_rmsnorm(g.xn, g.x, g.final_norm, H, batch, c.rms_eps);
-    launch_batch_gemv(g.logits, g.xn, g.lm_head, c.vocab_size, H, batch);
+    launch_batch_gemv(g.logits, g.xn, g.lm_head, g.lm_head_s,
+                      c.vocab_size, H, batch);
     batch_decode_kernels::argmax<<<batch, kernel_tuning::ELEMENTWISE_THREADS,
         0, g.stream>>>(g.logits, c.vocab_size, g.next_token, batch);
     HIP_LAUNCH_CHECK();
@@ -1015,6 +1275,7 @@ extern "C" void warm_up(Transformer *t) {
         "GETP_MFMA_THRESHOLD", kDefaultMfmaThreshold);
     g_flash_threshold = configured_threshold(
         "GETP_FLASH_THRESHOLD", kDefaultFlashThreshold);
+    g_quant = configured_quant_groups();
     g_prefill_large_m =
         std::getenv("GETP_DISABLE_PREFILL_LARGE_M") == nullptr;
     int device = 0;
@@ -1069,9 +1330,21 @@ extern "C" void warm_up(Transformer *t) {
     size_t free_bytes = 0, total_bytes = 0;
     HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
 
+    /* One staging buffer covers every tensor quantized at load time. */
+    size_t quant_stage_elems = 0;
+    for (const LayerLayout &a : g.layouts)
+        for (const QuantChunk &chunk : a.qchunks)
+            quant_stage_elems = std::max(
+                quant_stage_elems, (size_t)chunk.rows * chunk.cols);
+    if (g_quant.lmhead)
+        quant_stage_elems = std::max(
+            quant_stage_elems, (size_t)c.vocab_size * c.hidden_size);
+    bf16_t *quant_stage = nullptr;
+    if (quant_stage_elems > 0)
+        device_alloc(&quant_stage, quant_stage_elems);
+
     device_alloc(&g.embed, (size_t)c.vocab_size * c.hidden_size);
     device_alloc(&g.final_norm, c.hidden_size);
-    device_alloc(&g.lm_head, (size_t)c.vocab_size * c.hidden_size);
     device_alloc(&g.rope_inv_freq, c.qk_rope_head_dim / 2);
     HIP_CHECK(hipMemcpyAsync(g.embed, t->weights.embed_tokens,
                              (size_t)c.vocab_size * c.hidden_size * sizeof(bf16_t),
@@ -1079,9 +1352,25 @@ extern "C" void warm_up(Transformer *t) {
     HIP_CHECK(hipMemcpyAsync(g.final_norm, t->weights.norm,
                              (size_t)c.hidden_size * sizeof(bf16_t),
                              hipMemcpyHostToDevice, g.stream));
-    HIP_CHECK(hipMemcpyAsync(g.lm_head, t->weights.lm_head,
-                             (size_t)c.vocab_size * c.hidden_size * sizeof(bf16_t),
-                             hipMemcpyHostToDevice, g.stream));
+    if (g_quant.lmhead) {
+        HIP_CHECK(hipMalloc(reinterpret_cast<void **>(&g.lm_head),
+                            (size_t)c.vocab_size * c.hidden_size));
+        device_alloc(&g.lm_head_s, (size_t)c.vocab_size);
+        HIP_CHECK(hipMemcpyAsync(
+            quant_stage, t->weights.lm_head,
+            (size_t)c.vocab_size * c.hidden_size * sizeof(bf16_t),
+            hipMemcpyHostToDevice, g.stream));
+        batch_decode_kernels::quantize_rows<<<
+            c.vocab_size, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                quant_stage, reinterpret_cast<char *>(g.lm_head), g.lm_head_s,
+                c.vocab_size, c.hidden_size);
+        HIP_LAUNCH_CHECK();
+    } else {
+        device_alloc(&g.lm_head, (size_t)c.vocab_size * c.hidden_size);
+        HIP_CHECK(hipMemcpyAsync(g.lm_head, t->weights.lm_head,
+                                 (size_t)c.vocab_size * c.hidden_size * sizeof(bf16_t),
+                                 hipMemcpyHostToDevice, g.stream));
+    }
     HIP_CHECK(hipMemcpyAsync(g.rope_inv_freq, t->rope_inv_freq,
                              (size_t)(c.qk_rope_head_dim / 2) * sizeof(float),
                              hipMemcpyHostToDevice, g.stream));
@@ -1101,6 +1390,23 @@ extern "C" void warm_up(Transformer *t) {
     device_alloc(&g.expert_offsets, offset_count);
     HIP_CHECK(hipMemcpy(g.expert_offsets, host_offsets.data(), offset_count * sizeof(size_t),
                         hipMemcpyHostToDevice));
+    if (g_quant.experts && c.n_routed_experts > 0) {
+        std::vector<size_t> host_scale_offsets(offset_count, 0);
+        for (int l = c.first_k_dense; l < c.n_layers; ++l) {
+            size_t base = (size_t)l * 3 * c.n_routed_experts;
+            for (int e = 0; e < c.n_routed_experts; ++e) {
+                host_scale_offsets[base + e] = g.layouts[l].expert_gate_s[e];
+                host_scale_offsets[base + c.n_routed_experts + e] =
+                    g.layouts[l].expert_up_s[e];
+                host_scale_offsets[base + 2 * c.n_routed_experts + e] =
+                    g.layouts[l].expert_down_s[e];
+            }
+        }
+        device_alloc(&g.expert_scale_offsets, offset_count);
+        HIP_CHECK(hipMemcpy(g.expert_scale_offsets, host_scale_offsets.data(),
+                            offset_count * sizeof(size_t),
+                            hipMemcpyHostToDevice));
+    }
 
     g.layers.resize(c.n_layers);
     g.layer_pools.resize(c.n_layers, nullptr);
@@ -1108,8 +1414,12 @@ extern "C" void warm_up(Transformer *t) {
         void *pool = nullptr;
         HIP_CHECK(hipMalloc(&pool, g.layouts[l].bytes));
         g.layer_pools[l] = pool;
-        enqueue_layer_copy(g.layouts[l], pool);
+        enqueue_layer_copy(g.layouts[l], pool, quant_stage);
         g.layers[l] = materialize_layer(g.layouts[l], pool, l);
+    }
+    if (quant_stage) {
+        HIP_CHECK(hipStreamSynchronize(g.stream));
+        device_free(quant_stage);
     }
     int QHD = c.qk_nope_head_dim + c.qk_rope_head_dim;
     int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
@@ -1160,6 +1470,16 @@ extern "C" void warm_up(Transformer *t) {
     device_alloc(&g.hb, B * inter);
     device_alloc(&g.routed_hidden,
                  B * c.n_experts_per_tok * c.moe_inter_size);
+    if (g_quant.w8a8) {
+        const size_t act_cols = std::max(
+            (size_t)inter,
+            std::max((size_t)c.hidden_size,
+                     (size_t)c.n_heads * c.v_head_dim));
+        device_alloc(&g.act_i8, B * act_cols);
+        device_alloc(&g.act_s, B);
+        device_alloc(&g.routed_i8, B * c.n_experts_per_tok * c.moe_inter_size);
+        device_alloc(&g.routed_s, B * c.n_experts_per_tok);
+    }
     device_alloc(&g.router, B * std::max(1, c.n_routed_experts));
     device_alloc(&g.topk, B * std::max(1, c.n_experts_per_tok));
     device_alloc(&g.topk_weights, B * std::max(1, c.n_experts_per_tok));
@@ -1198,9 +1518,15 @@ extern "C" void warm_up(Transformer *t) {
     }
     HIP_CHECK(hipStreamSynchronize(g.stream));
 
-    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv=bf16 prefill_tokens=%d decode_tokens=%d warm_kv=%d prefill_rows=%d prefill_m=%d mfma_at=%d flash_at=%d\n",
+    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv=bf16 quant=%s%s%s%s%s%s prefill_tokens=%d decode_tokens=%d warm_kv=%d prefill_rows=%d prefill_m=%d mfma_at=%d flash_at=%d\n",
                  prop.name, (double)total_bytes / (double)(1ULL << 30),
                  (double)(global_bytes + layer_total) / (double)(1ULL << 30),
+                 g_quant.any() ? "" : "none",
+                 g_quant.w8a8 ? "w8a8," : "",
+                 g_quant.experts ? "experts," : "",
+                 g_quant.shared_experts ? "shared," : "",
+                 g_quant.proj ? "proj," : "",
+                 g_quant.lmhead ? "lmhead," : "",
                  g_prefill_token_budget, g_decode_token_budget,
                  g.kv_capacity, g.prefill_capacity,
                  g_prefill_large_m ? kPrefillMmaRows : kMmaBatchTile,
@@ -1223,6 +1549,8 @@ extern "C" void finish(Transformer *t) {
     for (void *pool : g.layer_pools) if (pool) HIP_CHECK(hipFree(pool));
     g.layer_pools.clear();
     device_free(g.expert_offsets);
+    device_free(g.expert_scale_offsets);
+    device_free(g.lm_head_s);
     device_free(g.x); device_free(g.xn);
     device_free(g.q); device_free(g.q_a); device_free(g.comp);
     device_free(g.qrope); device_free(g.qabs); device_free(g.scores); device_free(g.clat);
@@ -1244,8 +1572,13 @@ extern "C" void finish(Transformer *t) {
     device_free(g.prefill_router); device_free(g.prefill_topk_weights);
     device_free(g.prefill_hb); device_free(g.routed_hidden);
     device_free(g.prefill_routed_hidden);
+    device_free(g.act_i8); device_free(g.act_s);
+    device_free(g.routed_i8); device_free(g.routed_s);
+    device_free(g.prefill_act_i8); device_free(g.prefill_act_s);
+    device_free(g.prefill_routed_i8); device_free(g.prefill_routed_s);
     HIP_CHECK(hipStreamDestroy(g.stream));
     g = GpuContext();
+    g_quant = QuantGroups();
     g_max_batch = 1;
     g_prefill_token_budget = kDefaultPrefillBatchTokens;
     g_decode_token_budget = kDefaultBatchSize;
