@@ -76,18 +76,20 @@ struct GpuContext {
     int kv_capacity = 0;
 
     /* Layer-major unabsorbed prefill workspace. */
-    int *prompt_tokens = nullptr, *prefill_topk = nullptr;
+    int *prompt_tokens = nullptr, *prefill_route_ids = nullptr;
+    int *prefill_topk = nullptr;
     int *prefill_expert_counts = nullptr, *prefill_expert_buckets = nullptr;
     float *prefill_x = nullptr, *prefill_xn = nullptr;
     float *prefill_q = nullptr, *prefill_q_a = nullptr, *prefill_comp = nullptr;
-    float *prefill_qrope = nullptr, *prefill_knope = nullptr, *prefill_value = nullptr;
+    float *prefill_qrope = nullptr, *prefill_qabs = nullptr, *prefill_clat = nullptr;
     float *prefill_scores = nullptr, *prefill_ctx = nullptr;
     float *prefill_ffn = nullptr;
     float *prefill_router = nullptr, *prefill_topk_weights = nullptr;
     float *prefill_hb = nullptr, *routed_hidden = nullptr;
+    bf16_t *prefill_routed_hidden = nullptr;
     int prefill_capacity = 0;
 
-    float *xs = nullptr; // [VOC, H]
+    float *xs = nullptr; // legacy single-prompt prefill scratch
 };
 
 #endif /* MLA_GETP_STATE_H */

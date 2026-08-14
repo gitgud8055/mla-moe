@@ -38,9 +38,21 @@ namespace batch_decode_kernels {
                                     int, float);
     __global__ void latent_context(float *, const float *, const bf16_t *, int, int,
                                    int, int, int, int);
+    template <int KV_TILE>
     __global__ void flash_decode(float *, const float *, const float *,
                                  const bf16_t *, int, int, int, int, int, int,
                                  int, float);
+    __global__ void prefill_kv_norm_rope(
+        bf16_t *, const float *, const bf16_t *, int, int, int, int, int,
+        int, const float *, int, float);
+    __global__ void prefill_q_rope(
+        float *, const float *, int, int, int, int, int, const float *, int);
+    template <int KV_TILE>
+    __global__ void flash_prefill(
+        float *, const float *, const float *, const bf16_t *, int, int, int,
+        int, int, int, int, float);
+    __global__ void gather_last_hidden(
+        float *, const float *, int, int, int);
     __global__ void value_up(float *, const float *, const bf16_t *, int, int, int,
                              int, size_t);
     __global__ void routed_shared_gate_up(float *, float *, const float *,
@@ -54,10 +66,16 @@ namespace batch_decode_kernels {
     __global__ void argmax(const float *, int, int *, int);
     __global__ void mfma_gemm(float *, const float *, const bf16_t *,
                               int, int, int, int);
+    template <int M_TILES>
+    __global__ void mfma_gemm_rows(float *, const float *, const bf16_t *,
+                                   int, int, int, int);
     __global__ void mfma_head_gemm(float *, const float *, const bf16_t *,
                                    int, int, int, int, int, int, size_t);
     __global__ void mfma_gate_up_swiglu(float *, const float *, const bf16_t *,
                                         const bf16_t *, int, int, int);
+    template <int M_TILES>
+    __global__ void mfma_gate_up_swiglu_rows(
+        float *, const float *, const bf16_t *, const bf16_t *, int, int, int);
     __global__ void q_rope(float *, const float *, int, int, int, int, int, int,
                            const float *, int);
     __global__ void swiglu(float *, const float *, const float *, int);
@@ -65,11 +83,11 @@ namespace batch_decode_kernels {
     template <int BLOCK_M, int M_TILES>
     __global__ void grouped_expert_gate_up(
         const float *, const char *, const size_t *, const size_t *,
-        const int *, const int *, float *, int, int, int, int, int);
+        const int *, const int *, float *, bf16_t *, int, int, int, int, int);
     template <int BLOCK_M, int M_TILES>
     __global__ void grouped_expert_down(
-        const float *, const char *, const size_t *, const int *, const int *,
-        float *, int, int, int, int);
+        const float *, const bf16_t *, const char *, const size_t *,
+        const int *, const int *, float *, int, int, int, int);
     __global__ void reduce_routes_add(float *, const float *, const float *,
                                       int, int, int);
 }
@@ -79,9 +97,22 @@ namespace {
 constexpr int kDefaultBatchSize = 512;
 constexpr int kMaxBatchSize = 512;
 constexpr size_t kDeviceAlignment = 256;
-constexpr int kBatchGemmThreshold = 16;
+constexpr int kDefaultMfmaThreshold = 4;
+constexpr int kDefaultFlashThreshold = 8;
+constexpr int kMmaBatchTile = 16;
 constexpr int kMmaTileSize = 64;
+constexpr int kPrefillMmaRowTiles = 2;
+constexpr int kPrefillMmaRows = kMmaBatchTile * kPrefillMmaRowTiles;
+constexpr int kPrefillMmaThreshold = 1024;
 constexpr int kGroupedRouteTile = 16;
+constexpr int kFlashLargeBatchThreshold = 128;
+constexpr int kFlashSmallBatchThreads = 512;
+constexpr int kFlashSmallBatchKvTile = 16;
+constexpr int kFlashLargeBatchThreads = 256;
+constexpr int kFlashLargeBatchKvTile = 8;
+constexpr int kPrefillThreads = 256;
+constexpr int kPrefillKvTile = 8;
+constexpr int kMaxPrefillRows = 65520;
 constexpr size_t kVramReserve = (size_t)512 << 20;
 
 static int div_up(int value, int divisor) {
@@ -92,6 +123,23 @@ static int div_up(int value, int divisor) {
 
 static GpuContext g;
 static int g_max_batch = 1;
+static int g_mfma_threshold = kDefaultMfmaThreshold;
+static int g_flash_threshold = kDefaultFlashThreshold;
+static bool g_prefill_large_m = true;
+
+static int configured_threshold(const char *name, int default_value) {
+    const char *text = std::getenv(name);
+    if (!text || !*text) return default_value;
+    char *end = nullptr;
+    long value = std::strtol(text, &end, 10);
+    if (*end != '\0' || value < 1 || value > kMaxBatchSize + 1) {
+        std::fprintf(stderr,
+            "%s must be an integer in [1,%d] (got '%s')\n",
+            name, kMaxBatchSize + 1, text);
+        std::exit(EXIT_FAILURE);
+    }
+    return (int)value;
+}
 
 static int configured_batch_size() {
     const char *text = std::getenv("GETP_BATCH_SIZE");
@@ -293,6 +341,93 @@ static void require_sequence_capacity(int required) {
     std::exit(EXIT_FAILURE);
 }
 
+static size_t prefill_workspace_bytes(const Config &c, size_t rows) {
+    const size_t qhd = (size_t)c.qk_nope_head_dim + c.qk_rope_head_dim;
+    const size_t kvd = (size_t)c.kv_lora_rank + c.qk_rope_head_dim;
+    const size_t shared = (size_t)c.n_shared_experts * c.moe_inter_size;
+    const size_t inter = std::max<size_t>(
+        c.dense_inter_size, std::max<size_t>(shared, c.moe_inter_size));
+    const size_t k = std::max(1, c.n_experts_per_tok);
+    size_t floats_per_row =
+        (size_t)2 * c.hidden_size
+        + (size_t)c.n_heads * qhd
+        + (size_t)std::max(1, c.q_lora_rank)
+        + kvd
+        + (size_t)c.n_heads * c.qk_rope_head_dim
+        + (size_t)2 * c.n_heads * c.kv_lora_rank
+        + (size_t)c.n_heads * c.v_head_dim
+        + inter
+        + (size_t)std::max(1, c.n_routed_experts)
+        + k
+        + k * c.hidden_size;
+    const size_t routes = rows * k;
+    const size_t max_padded = routes
+        + (size_t)c.n_routed_experts * (kGroupedRouteTile - 1);
+    return rows * floats_per_row * sizeof(float)
+        + rows * k * c.moe_inter_size * sizeof(bf16_t)
+        + rows * sizeof(int)                 // flattened prompt tokens
+        + rows * k * sizeof(int)             // top-k expert ids
+        + max_padded * sizeof(int)            // aligned route ids
+        + (max_padded + kGroupedRouteTile - 1) / kGroupedRouteTile
+            * sizeof(int)
+        + sizeof(int);
+}
+
+static void allocate_prefill_workspace(const Config &c, int target_rows) {
+    size_t free_bytes = 0, total_bytes = 0;
+    HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
+    (void)total_bytes;
+    const size_t usable = free_bytes > kVramReserve
+        ? free_bytes - kVramReserve : 0;
+    int lo = 0, hi = std::max(1, target_rows);
+    while (lo < hi) {
+        const int mid = lo + (hi - lo + 1) / 2;
+        if (prefill_workspace_bytes(c, (size_t)mid) <= usable)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    if (lo < 1) {
+        std::fprintf(stderr,
+            "HIP inference: insufficient VRAM for batched prefill workspace\n");
+        std::exit(EXIT_FAILURE);
+    }
+    const size_t rows = (size_t)lo;
+    const size_t qhd = (size_t)c.qk_nope_head_dim + c.qk_rope_head_dim;
+    const size_t kvd = (size_t)c.kv_lora_rank + c.qk_rope_head_dim;
+    const size_t shared = (size_t)c.n_shared_experts * c.moe_inter_size;
+    const size_t inter = std::max<size_t>(
+        c.dense_inter_size, std::max<size_t>(shared, c.moe_inter_size));
+    const size_t k = std::max(1, c.n_experts_per_tok);
+    const size_t routes = rows * k;
+    const size_t max_padded = routes
+        + (size_t)c.n_routed_experts * (kGroupedRouteTile - 1);
+
+    device_alloc(&g.prompt_tokens, rows);
+    device_alloc(&g.prefill_x, rows * c.hidden_size);
+    device_alloc(&g.prefill_xn, rows * c.hidden_size);
+    device_alloc(&g.prefill_q, rows * c.n_heads * qhd);
+    device_alloc(&g.prefill_q_a, rows * std::max(1, c.q_lora_rank));
+    device_alloc(&g.prefill_comp, rows * kvd);
+    device_alloc(&g.prefill_qrope,
+                 rows * c.n_heads * c.qk_rope_head_dim);
+    device_alloc(&g.prefill_qabs, rows * c.n_heads * c.kv_lora_rank);
+    device_alloc(&g.prefill_clat, rows * c.n_heads * c.kv_lora_rank);
+    device_alloc(&g.prefill_ctx, rows * c.n_heads * c.v_head_dim);
+    device_alloc(&g.prefill_hb, rows * inter);
+    device_alloc(&g.prefill_router,
+                 rows * std::max(1, c.n_routed_experts));
+    device_alloc(&g.prefill_route_ids, rows * k);
+    device_alloc(&g.prefill_topk_weights, rows * k);
+    device_alloc(&g.prefill_topk, max_padded);
+    device_alloc(&g.prefill_expert_counts,
+                 div_up((int)max_padded, kGroupedRouteTile));
+    device_alloc(&g.prefill_expert_buckets, 1);
+    device_alloc(&g.prefill_routed_hidden, routes * c.moe_inter_size);
+    device_alloc(&g.prefill_ffn, routes * c.hidden_size);
+    g.prefill_capacity = lo;
+}
+
 
 
 static dim3 batch_projection_grid(int rows, int batch)
@@ -306,11 +441,18 @@ static dim3 batch_projection_grid(int rows, int batch)
 static void launch_batch_gemv(float *y, const float *x, const bf16_t *w,
                               int out, int in, int batch, bool add = false)
 {
-    if (batch >= kBatchGemmThreshold) {
+    if (batch >= g_mfma_threshold) {
         dim3 grid((unsigned)div_up(out, kMmaTileSize),
-                  (unsigned)div_up(batch, kBatchGemmThreshold));
-        batch_decode_kernels::mfma_gemm<<<grid, 256, 0, g.stream>>>(
-            y, x, w, batch, out, in, add ? 1 : 0);
+                  (unsigned)div_up(
+                      batch, g_prefill_large_m && batch >= kPrefillMmaThreshold
+                          ? kPrefillMmaRows : kMmaBatchTile));
+        if (g_prefill_large_m && batch >= kPrefillMmaThreshold)
+            batch_decode_kernels::mfma_gemm_rows<kPrefillMmaRowTiles><<<
+                grid, 256, 0, g.stream>>>(
+                    y, x, w, batch, out, in, add ? 1 : 0);
+        else
+            batch_decode_kernels::mfma_gemm<<<grid, 256, 0, g.stream>>>(
+                y, x, w, batch, out, in, add ? 1 : 0);
         HIP_LAUNCH_CHECK();
         return;
     }
@@ -325,7 +467,7 @@ static void launch_batch_dual_gemv(
     float *y1, const bf16_t *w1, int out1,
     const float *x, int in, int batch)
 {
-    if (batch >= kBatchGemmThreshold) {
+    if (batch >= g_mfma_threshold) {
         launch_batch_gemv(y0, x, w0, out0, in, batch);
         launch_batch_gemv(y1, x, w1, out1, in, batch);
         return;
@@ -340,11 +482,19 @@ static void launch_batch_gate_up_swiglu(float *y, const float *x,
                                         const bf16_t *gate, const bf16_t *up,
                                         int out, int in, int batch)
 {
-    if (batch >= kBatchGemmThreshold) {
+    if (batch >= g_mfma_threshold) {
         dim3 grid((unsigned)div_up(out, kMmaTileSize),
-                  (unsigned)div_up(batch, kBatchGemmThreshold));
-        batch_decode_kernels::mfma_gate_up_swiglu<<<grid, 256, 0, g.stream>>>(
-            y, x, gate, up, batch, out, in);
+                  (unsigned)div_up(
+                      batch, g_prefill_large_m && batch >= kPrefillMmaThreshold
+                          ? kPrefillMmaRows : kMmaBatchTile));
+        if (g_prefill_large_m && batch >= kPrefillMmaThreshold)
+            batch_decode_kernels::mfma_gate_up_swiglu_rows<
+                kPrefillMmaRowTiles><<<grid, 256, 0, g.stream>>>(
+                    y, x, gate, up, batch, out, in);
+        else
+            batch_decode_kernels::mfma_gate_up_swiglu<<<
+                grid, 256, 0, g.stream>>>(
+                    y, x, gate, up, batch, out, in);
         HIP_LAUNCH_CHECK();
         return;
     }
@@ -380,83 +530,254 @@ static void launch_batch_rmsnorm(float *y, const float *x, const bf16_t *w,
     HIP_LAUNCH_CHECK();
 }
 
-static void gpu_ffn_batch(const Config &c, const DeviceLayer &d, int l, int batch)
+static void gpu_ffn_rows(
+    const Config &c, const DeviceLayer &d, int l, int rows,
+    float *x, float *xn, float *hb, float *router, int *topk,
+    float *topk_weights, int *sorted_ids, int *expert_ids,
+    int *num_post_pad, float *routed_hidden,
+    bf16_t *routed_hidden_bf16, float *route_out)
 {
     const int H = c.hidden_size;
     if (l < c.first_k_dense) {
         int inter = c.dense_inter_size;
-        launch_batch_gate_up_swiglu(g.hb, g.xn, d.dense_gate, d.dense_up,
-                                    inter, H, batch);
-        launch_batch_gemv(g.x, g.hb, d.dense_down, H, inter, batch, true);
+        launch_batch_gate_up_swiglu(hb, xn, d.dense_gate, d.dense_up,
+                                    inter, H, rows);
+        launch_batch_gemv(x, hb, d.dense_down, H, inter, rows, true);
         return;
     }
 
     const int E = c.n_routed_experts;
     const int K = c.n_experts_per_tok;
     const int inter = c.moe_inter_size;
-    launch_batch_gemv(g.router, g.xn, d.moe_gate, E, H, batch);
-    launch_router_topk(g.router, d.moe_bias, g.topk, g.topk_weights,
-                       batch, E, K, c.router_sigmoid, c.norm_topk,
+    launch_batch_gemv(router, xn, d.moe_gate, E, H, rows);
+    launch_router_topk(router, d.moe_bias, topk, topk_weights,
+                       rows, E, K, c.router_sigmoid, c.norm_topk,
                        c.routed_scaling);
     const int shared = c.n_shared_experts * inter;
-    const bool grouped_mfma = batch >= kBatchGemmThreshold;
-    const int rows = K * inter;
+    const bool grouped_mfma = rows >= g_mfma_threshold;
+    const int output_rows = K * inter;
     constexpr int rows_per_block = kernel_tuning::GEMV_THREADS / HIP_WAVE;
     int max_blocks = 0;
     if (grouped_mfma) {
-        /* With at most 64 requests, each of 64 experts normally receives far
-         * fewer than 16 routes.  A 16-row tile retains weight reuse while
-         * avoiding the 4x padded MFMA work of moe.c's generic 64-row choice. */
         constexpr int block_m = kGroupedRouteTile;
-        const int routes = batch * K;
+        const int routes = rows * K;
         const int max_padded = routes + E * (block_m - 1);
         max_blocks = div_up(max_padded, block_m);
-        batch_decode_kernels::align_routes<<<1, 64, 0, g.stream>>>(
-            g.topk, routes, E, block_m, g.prefill_topk,
-            g.prefill_expert_counts, g.prefill_expert_buckets);
+        batch_decode_kernels::align_routes<<<
+            1, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+            topk, routes, E, block_m, sorted_ids, expert_ids,
+            num_post_pad);
         HIP_LAUNCH_CHECK();
         const int up_tiles = div_up(inter, kMmaTileSize);
         batch_decode_kernels::grouped_expert_gate_up<16, 1><<<
             max_blocks * up_tiles, 256, 0, g.stream>>>(
-                g.xn, d.pool, d.expert_gate_offsets, d.expert_up_offsets,
-                g.prefill_topk, g.prefill_expert_counts, g.routed_hidden,
+                xn, d.pool, d.expert_gate_offsets, d.expert_up_offsets,
+                sorted_ids, expert_ids, routed_hidden, routed_hidden_bf16,
                 routes, H, inter, K, up_tiles);
         HIP_LAUNCH_CHECK();
     } else {
-        dim3 gate_grid((unsigned)div_up(rows, rows_per_block),
-                       (unsigned)batch);
+        dim3 gate_grid((unsigned)div_up(output_rows, rows_per_block),
+                       (unsigned)rows);
         batch_decode_kernels::routed_shared_gate_up<<<gate_grid,
             kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-                g.routed_hidden, g.hb, g.xn, d.pool,
-                d.expert_gate_offsets, d.expert_up_offsets, g.topk,
-                d.shared_gate, d.shared_up, batch, K, inter, 0, H);
+                routed_hidden, hb, xn, d.pool,
+                d.expert_gate_offsets, d.expert_up_offsets, topk,
+                d.shared_gate, d.shared_up, rows, K, inter, 0, H);
         HIP_LAUNCH_CHECK();
     }
-    launch_batch_gate_up_swiglu(g.hb, g.xn, d.shared_gate, d.shared_up,
-                                shared, H, batch);
+    launch_batch_gate_up_swiglu(hb, xn, d.shared_gate, d.shared_up,
+                                shared, H, rows);
     if (grouped_mfma) {
-        const int routes = batch * K;
+        const int routes = rows * K;
         const int down_tiles = div_up(H, kMmaTileSize);
         batch_decode_kernels::grouped_expert_down<16, 1><<<
             max_blocks * down_tiles, 256, 0, g.stream>>>(
-                g.routed_hidden, d.pool, d.expert_down_offsets,
-                g.prefill_topk, g.prefill_expert_counts, g.prefill_ffn,
+                routed_hidden, routed_hidden_bf16, d.pool,
+                d.expert_down_offsets,
+                sorted_ids, expert_ids, route_out,
                 routes, H, inter, down_tiles);
         HIP_LAUNCH_CHECK();
         batch_decode_kernels::reduce_routes_add<<<
-            batch, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
-                g.x, g.prefill_ffn, g.topk_weights, batch, H, K);
+            rows, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                x, route_out, topk_weights, rows, H, K);
         HIP_LAUNCH_CHECK();
     } else {
         dim3 down_grid((unsigned)div_up(H, rows_per_block),
-                       (unsigned)batch);
+                       (unsigned)rows);
         batch_decode_kernels::routed_shared_down<<<down_grid,
             kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-                g.x, g.routed_hidden, g.hb, d.pool, d.expert_down_offsets,
-                g.topk, g.topk_weights, d.shared_down, batch, K, H, inter, 0);
+                x, routed_hidden, hb, d.pool, d.expert_down_offsets,
+                topk, topk_weights, d.shared_down, rows, K, H, inter, 0);
         HIP_LAUNCH_CHECK();
     }
-    launch_batch_gemv(g.x, g.hb, d.shared_down, H, shared, batch, true);
+    launch_batch_gemv(x, hb, d.shared_down, H, shared, rows, true);
+}
+
+static void gpu_ffn_batch(const Config &c, const DeviceLayer &d, int l,
+                          int batch)
+{
+    gpu_ffn_rows(c, d, l, batch, g.x, g.xn, g.hb, g.router, g.topk,
+                 g.topk_weights, g.prefill_topk, g.prefill_expert_counts,
+                 g.prefill_expert_buckets, g.routed_hidden, nullptr,
+                 g.prefill_ffn);
+}
+
+/* Process a homogeneous prompt batch layer-major.  Rows are flattened as
+ * [request, position], so every projection and MoE operation sees B*S rows,
+ * while flash_prefill applies the causal boundary independently per request. */
+static void gpu_prefill_batch(const int *device_tokens, int seq, int batch)
+{
+    const Config &c = g.owner->config;
+    const int rows = batch * seq;
+    const int H = c.hidden_size;
+    const int NH = c.n_heads;
+    const int QKN = c.qk_nope_head_dim;
+    const int QKR = c.qk_rope_head_dim;
+    const int QHD = QKN + QKR;
+    const int QD = NH * QHD;
+    const int KVL = c.kv_lora_rank;
+    const int KVD = KVL + QKR;
+    const int VHD = c.v_head_dim;
+    const size_t head_stride = (size_t)(QKN + VHD) * KVL;
+    if (batch < 1 || batch > g_max_batch || seq < 1 ||
+        seq > g.kv_capacity || rows > g.prefill_capacity) {
+        std::fprintf(stderr,
+            "HIP batched prefill: batch=%d/%d seq=%d/%d rows=%d/%d\n",
+            batch, g_max_batch, seq, g.kv_capacity, rows,
+            g.prefill_capacity);
+        std::exit(EXIT_FAILURE);
+    }
+
+    dim3 embed_grid((unsigned)div_up(H, kernel_tuning::ELEMENTWISE_THREADS),
+                    (unsigned)rows);
+    batch_decode_kernels::embedding<<<embed_grid,
+        kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+            g.prefill_x, g.embed, device_tokens, nullptr, 0, 0, H, rows);
+    HIP_LAUNCH_CHECK();
+
+    const bool profile = std::getenv("GETP_PROFILE_PREFILL") != nullptr;
+    hipEvent_t phase_start = nullptr, phase_stop = nullptr;
+    float qkv_ms = 0.0f, flash_ms = 0.0f, output_ms = 0.0f, ffn_ms = 0.0f;
+    if (profile) {
+        HIP_CHECK(hipEventCreate(&phase_start));
+        HIP_CHECK(hipEventCreate(&phase_stop));
+    }
+    auto phase_begin = [&]() {
+        if (profile) HIP_CHECK(hipEventRecord(phase_start, g.stream));
+    };
+    auto phase_end = [&](float &total_ms) {
+        if (!profile) return;
+        HIP_CHECK(hipEventRecord(phase_stop, g.stream));
+        HIP_CHECK(hipEventSynchronize(phase_stop));
+        float elapsed_ms = 0.0f;
+        HIP_CHECK(hipEventElapsedTime(&elapsed_ms, phase_start, phase_stop));
+        total_ms += elapsed_ms;
+    };
+
+    for (int l = 0; l < c.n_layers; ++l) {
+        const DeviceLayer &d = g.layers[l];
+        phase_begin();
+        launch_batch_rmsnorm(g.prefill_xn, g.prefill_x, d.input_norm,
+                             H, rows, c.rms_eps);
+        if (c.q_lora_rank > 0) {
+            launch_batch_dual_gemv(
+                g.prefill_q_a, d.q_a_proj, c.q_lora_rank,
+                g.prefill_comp, d.kv_a_proj, KVD,
+                g.prefill_xn, H, rows);
+            launch_batch_rmsnorm(g.prefill_q_a, g.prefill_q_a, d.q_a_norm,
+                                 c.q_lora_rank, rows, c.mla_norm_eps);
+            launch_batch_gemv(g.prefill_q, g.prefill_q_a, d.q_b_proj,
+                              QD, c.q_lora_rank, rows);
+        } else {
+            launch_batch_dual_gemv(
+                g.prefill_q, d.q_proj, QD,
+                g.prefill_comp, d.kv_a_proj, KVD,
+                g.prefill_xn, H, rows);
+        }
+
+        bf16_t *layer_cache = g.kv_cache
+            + (size_t)l * g_max_batch * g.kv_capacity * KVD;
+        batch_decode_kernels::prefill_kv_norm_rope<<<
+            rows, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                layer_cache, g.prefill_comp, d.kv_a_norm, rows, seq,
+                g.kv_capacity, KVL, KVD, QKR, g.rope_inv_freq,
+                c.rope_interleaved, c.mla_norm_eps);
+        HIP_LAUNCH_CHECK();
+
+        dim3 qabs_grid((unsigned)div_up(KVL, kMmaTileSize),
+                       (unsigned)div_up(rows, kMmaBatchTile),
+                       (unsigned)NH);
+        batch_decode_kernels::mfma_head_gemm<<<
+            qabs_grid, 256, 0, g.stream>>>(
+                g.prefill_qabs, g.prefill_q, d.W_UK_T, rows, NH, KVL,
+                QKN, QHD, KVL, (size_t)KVL * QKN);
+        HIP_LAUNCH_CHECK();
+        batch_decode_kernels::prefill_q_rope<<<
+            div_up(rows * NH, kernel_tuning::ATTENTION_THREADS / HIP_WAVE),
+            kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
+                g.prefill_qrope, g.prefill_q, rows, seq, NH, QHD, QKN,
+                g.rope_inv_freq, c.rope_interleaved);
+        HIP_LAUNCH_CHECK();
+        phase_end(qkv_ms);
+
+        phase_begin();
+        constexpr int head_tile = kPrefillThreads / HIP_WAVE;
+        dim3 flash_grid((unsigned)div_up(NH, head_tile), (unsigned)seq,
+                        (unsigned)batch);
+        batch_decode_kernels::flash_prefill<kPrefillKvTile><<<
+            flash_grid, kPrefillThreads,
+            (size_t)kPrefillKvTile * KVD * sizeof(bf16_t), g.stream>>>(
+                g.prefill_clat, g.prefill_qabs, g.prefill_qrope,
+                layer_cache, batch, seq, NH, g.kv_capacity, KVD, KVL,
+                QKR, c.softmax_scale);
+        HIP_LAUNCH_CHECK();
+        phase_end(flash_ms);
+
+        phase_begin();
+        dim3 value_grid((unsigned)div_up(VHD, kMmaTileSize),
+                        (unsigned)div_up(rows, kMmaBatchTile),
+                        (unsigned)NH);
+        batch_decode_kernels::mfma_head_gemm<<<
+            value_grid, 256, 0, g.stream>>>(
+                g.prefill_ctx, g.prefill_clat, d.W_UV, rows, NH, VHD,
+                KVL, KVL, VHD, head_stride);
+        HIP_LAUNCH_CHECK();
+        launch_batch_gemv(g.prefill_x, g.prefill_ctx, d.o_proj,
+                          H, NH * VHD, rows, true);
+        phase_end(output_ms);
+
+        phase_begin();
+        launch_batch_rmsnorm(g.prefill_xn, g.prefill_x, d.post_norm,
+                             H, rows, c.rms_eps);
+        gpu_ffn_rows(
+            c, d, l, rows, g.prefill_x, g.prefill_xn, g.prefill_hb,
+            g.prefill_router, g.prefill_route_ids, g.prefill_topk_weights,
+            g.prefill_topk, g.prefill_expert_counts,
+            g.prefill_expert_buckets, nullptr, g.prefill_routed_hidden,
+            g.prefill_ffn);
+        phase_end(ffn_ms);
+    }
+
+    dim3 gather_grid((unsigned)div_up(H, kernel_tuning::ELEMENTWISE_THREADS),
+                     (unsigned)batch);
+    batch_decode_kernels::gather_last_hidden<<<
+        gather_grid, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+            g.x, g.prefill_x, batch, seq, H);
+    HIP_LAUNCH_CHECK();
+    launch_batch_rmsnorm(g.xn, g.x, g.final_norm, H, batch, c.rms_eps);
+    launch_batch_gemv(g.logits, g.xn, g.lm_head, c.vocab_size, H, batch);
+    batch_decode_kernels::argmax<<<
+        batch, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+            g.logits, c.vocab_size, g.next_token, batch);
+    HIP_LAUNCH_CHECK();
+    if (profile) {
+        HIP_CHECK(hipEventDestroy(phase_start));
+        HIP_CHECK(hipEventDestroy(phase_stop));
+        std::fprintf(stderr,
+            "[getp prefill profile] prompt=%d batch=%d qkv=%.3f "
+            "flash=%.3f output=%.3f ffn=%.3f ms\n",
+            seq, batch, qkv_ms, flash_ms, output_ms, ffn_ms);
+    }
 }
 
 /* Absorbed forward for a homogeneous microbatch.  All requests have the same
@@ -518,9 +839,9 @@ static void gpu_forward_absorbed_batch(const int *device_tokens,
         HIP_LAUNCH_CHECK();
 
         int qabs_rows = NH * KVL;
-        if (batch >= kBatchGemmThreshold) {
+        if (batch >= g_mfma_threshold) {
             dim3 qabs_grid((unsigned)div_up(KVL, kMmaTileSize),
-                           (unsigned)div_up(batch, kBatchGemmThreshold),
+                           (unsigned)div_up(batch, kMmaBatchTile),
                            (unsigned)NH);
             batch_decode_kernels::mfma_head_gemm<<<
                 qabs_grid, 256, 0, g.stream>>>(
@@ -541,16 +862,34 @@ static void gpu_forward_absorbed_batch(const int *device_tokens,
                     KVL, pos, g.rope_inv_freq, c.rope_interleaved);
         }
         HIP_LAUNCH_CHECK();
-        if (batch >= 32) {
-            dim3 flash_grid(
-                (unsigned)div_up(NH,
-                    kernel_tuning::ATTENTION_THREADS / HIP_WAVE),
-                (unsigned)batch);
-            batch_decode_kernels::flash_decode<<<
-                flash_grid, kernel_tuning::ATTENTION_THREADS,
-                (size_t)8 * KVD * sizeof(bf16_t), g.stream>>>(
-                    g.clat, g.qabs, g.qrope, layer_cache, batch, NH, kv_len,
-                    g.kv_capacity, KVD, KVL, QKR, c.softmax_scale);
+        if (batch >= g_flash_threshold) {
+            if (batch >= kFlashLargeBatchThreshold) {
+                dim3 flash_grid(
+                    (unsigned)div_up(
+                        NH, kFlashLargeBatchThreads / HIP_WAVE),
+                    (unsigned)batch);
+                batch_decode_kernels::flash_decode<
+                    kFlashLargeBatchKvTile><<<
+                        flash_grid, kFlashLargeBatchThreads,
+                        (size_t)kFlashLargeBatchKvTile * KVD * sizeof(bf16_t),
+                        g.stream>>>(
+                            g.clat, g.qabs, g.qrope, layer_cache, batch, NH,
+                            kv_len, g.kv_capacity, KVD, KVL, QKR,
+                            c.softmax_scale);
+            } else {
+                dim3 flash_grid(
+                    (unsigned)div_up(
+                        NH, kFlashSmallBatchThreads / HIP_WAVE),
+                    (unsigned)batch);
+                batch_decode_kernels::flash_decode<
+                    kFlashSmallBatchKvTile><<<
+                        flash_grid, kFlashSmallBatchThreads,
+                        (size_t)kFlashSmallBatchKvTile * KVD * sizeof(bf16_t),
+                        g.stream>>>(
+                            g.clat, g.qabs, g.qrope, layer_cache, batch, NH,
+                            kv_len, g.kv_capacity, KVD, KVL, QKR,
+                            c.softmax_scale);
+            }
             HIP_LAUNCH_CHECK();
         } else {
             constexpr int rows_per_block =
@@ -577,9 +916,9 @@ static void gpu_forward_absorbed_batch(const int *device_tokens,
             HIP_LAUNCH_CHECK();
         }
         int value_rows = NH * VHD;
-        if (batch >= kBatchGemmThreshold) {
+        if (batch >= g_mfma_threshold) {
             dim3 value_grid((unsigned)div_up(VHD, kMmaTileSize),
-                            (unsigned)div_up(batch, kBatchGemmThreshold),
+                            (unsigned)div_up(batch, kMmaBatchTile),
                             (unsigned)NH);
             batch_decode_kernels::mfma_head_gemm<<<
                 value_grid, 256, 0, g.stream>>>(
@@ -623,6 +962,12 @@ extern "C" void warm_up(Transformer *t) {
     }
     g.owner = t;
     g_max_batch = configured_batch_size();
+    g_mfma_threshold = configured_threshold(
+        "GETP_MFMA_THRESHOLD", kDefaultMfmaThreshold);
+    g_flash_threshold = configured_threshold(
+        "GETP_FLASH_THRESHOLD", kDefaultFlashThreshold);
+    g_prefill_large_m =
+        std::getenv("GETP_DISABLE_PREFILL_LARGE_M") == nullptr;
     int device = 0;
     HIP_CHECK(hipGetDevice(&device));
     hipDeviceProp_t prop;
@@ -634,6 +979,9 @@ extern "C" void warm_up(Transformer *t) {
     if (kernel_tuning::GEMV_THREADS > prop.maxThreadsPerBlock ||
         kernel_tuning::ELEMENTWISE_THREADS > prop.maxThreadsPerBlock ||
         kernel_tuning::ATTENTION_THREADS > prop.maxThreadsPerBlock ||
+        kFlashSmallBatchThreads > prop.maxThreadsPerBlock ||
+        kFlashLargeBatchThreads > prop.maxThreadsPerBlock ||
+        kPrefillThreads > prop.maxThreadsPerBlock ||
         kernel_tuning::ROUTER_THREADS > prop.maxThreadsPerBlock ||
         c.v_head_dim <= 0 ||
         c.v_head_dim > prop.maxThreadsPerBlock ||
@@ -760,17 +1108,8 @@ extern "C" void warm_up(Transformer *t) {
     device_alloc(&g.clat, B * c.n_heads * c.kv_lora_rank);
     device_alloc(&g.ctx, B * c.n_heads * c.v_head_dim);
     device_alloc(&g.hb, B * inter);
-    device_alloc(&g.prefill_hb, B * inter);
     device_alloc(&g.routed_hidden,
                  B * c.n_experts_per_tok * c.moe_inter_size);
-    const size_t max_padded_routes =
-        B * c.n_experts_per_tok + (size_t)c.n_routed_experts * 63;
-    device_alloc(&g.prefill_topk, max_padded_routes);
-    device_alloc(&g.prefill_expert_counts,
-                 (max_padded_routes + 63) / 64);
-    device_alloc(&g.prefill_expert_buckets, 1);
-    device_alloc(&g.prefill_ffn,
-                 B * c.n_experts_per_tok * c.hidden_size);
     device_alloc(&g.router, B * std::max(1, c.n_routed_experts));
     device_alloc(&g.topk, B * std::max(1, c.n_experts_per_tok));
     device_alloc(&g.topk_weights, B * std::max(1, c.n_experts_per_tok));
@@ -779,6 +1118,9 @@ extern "C" void warm_up(Transformer *t) {
     device_alloc(&g.generated, B * c.max_seq_len);
     g.kv_capacity = 0;
     allocate_sequence_buffers(c, warm_capacity);
+    const int target_prefill_rows = std::min(
+        kMaxPrefillRows, g_max_batch * std::min(warm_capacity, 512));
+    allocate_prefill_workspace(c, target_prefill_rows);
     HIP_CHECK(hipStreamSynchronize(g.stream));
 
     /* Exercise every inference kernel family before the timed call.  Batch 1
@@ -798,10 +1140,13 @@ extern "C" void warm_up(Transformer *t) {
     }
     HIP_CHECK(hipStreamSynchronize(g.stream));
 
-    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv=bf16 batch=%d warm_kv=%d\n",
+    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv=bf16 batch=%d warm_kv=%d prefill_rows=%d prefill_m=%d mfma_at=%d flash_at=%d\n",
                  prop.name, (double)total_bytes / (double)(1ULL << 30),
                  (double)(global_bytes + layer_total) / (double)(1ULL << 30),
-                 g_max_batch, g.kv_capacity);
+                 g_max_batch, g.kv_capacity, g.prefill_capacity,
+                 g_prefill_large_m ? kPrefillMmaRows : kMmaBatchTile,
+                 g_mfma_threshold,
+                 g_flash_threshold);
 }
 
 extern "C" void finish(Transformer *t) {
@@ -825,18 +1170,24 @@ extern "C" void finish(Transformer *t) {
     device_free(g.ctx); device_free(g.hb); device_free(g.router);
     device_free(g.topk); device_free(g.topk_weights); device_free(g.logits);
     device_free(g.kv_cache); device_free(g.next_token); device_free(g.generated);
-    device_free(g.prompt_tokens); device_free(g.prefill_topk);
+    device_free(g.prompt_tokens); device_free(g.prefill_route_ids);
+    device_free(g.prefill_topk);
     device_free(g.prefill_expert_counts); device_free(g.prefill_expert_buckets);
     device_free(g.prefill_x); device_free(g.prefill_xn);
     device_free(g.prefill_q); device_free(g.prefill_q_a); device_free(g.prefill_comp);
-    device_free(g.prefill_qrope); device_free(g.prefill_knope); device_free(g.prefill_value);
+    device_free(g.prefill_qrope); device_free(g.prefill_qabs);
+    device_free(g.prefill_clat);
     device_free(g.prefill_scores); device_free(g.prefill_ctx);
     device_free(g.prefill_ffn);
     device_free(g.prefill_router); device_free(g.prefill_topk_weights);
     device_free(g.prefill_hb); device_free(g.routed_hidden);
+    device_free(g.prefill_routed_hidden);
     HIP_CHECK(hipStreamDestroy(g.stream));
     g = GpuContext();
     g_max_batch = 1;
+    g_mfma_threshold = kDefaultMfmaThreshold;
+    g_flash_threshold = kDefaultFlashThreshold;
+    g_prefill_large_m = true;
 }
 
 extern "C" long long inference(Transformer *t, Requests *reqs)
@@ -890,6 +1241,22 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
 
     long long total = 0;
     std::vector<int> host_tokens((size_t)g_max_batch);
+    const bool use_batched_prefill =
+        std::getenv("GETP_DISABLE_BATCHED_PREFILL") == nullptr;
+    const bool report_prefill_timing =
+        std::getenv("GETP_REPORT_PREFILL_TIMING") != nullptr;
+    const bool report_decode_timing =
+        std::getenv("GETP_REPORT_DECODE_TIMING") != nullptr;
+    hipEvent_t prefill_start = nullptr, prefill_stop = nullptr;
+    if (report_prefill_timing) {
+        HIP_CHECK(hipEventCreate(&prefill_start));
+        HIP_CHECK(hipEventCreate(&prefill_stop));
+    }
+    hipEvent_t decode_start = nullptr, decode_stop = nullptr;
+    if (report_decode_timing) {
+        HIP_CHECK(hipEventCreate(&decode_start));
+        HIP_CHECK(hipEventCreate(&decode_stop));
+    }
     size_t group_begin = 0;
     while (group_begin < order.size()) {
         const int n_prompt = (int)prompts[order[group_begin]].size();
@@ -898,27 +1265,81 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
                (int)prompts[order[group_end]].size() == n_prompt)
             ++group_end;
 
+        if (use_batched_prefill && n_prompt > g.prefill_capacity) {
+            std::fprintf(stderr,
+                "HIP batched prefill needs %d rows for one prompt, but only "
+                "%d fit in VRAM\n", n_prompt, g.prefill_capacity);
+            std::exit(EXIT_FAILURE);
+        }
+        const int microbatch_limit = use_batched_prefill
+            ? std::max(1, std::min(g_max_batch,
+                                  g.prefill_capacity / n_prompt))
+            : g_max_batch;
         for (size_t base = group_begin; base < group_end;
-             base += (size_t)g_max_batch) {
+             base += (size_t)microbatch_limit) {
             const int batch = (int)std::min<size_t>(
-                (size_t)g_max_batch, group_end - base);
+                (size_t)microbatch_limit, group_end - base);
             const int steps = std::max(0, std::min(reqs->max_steps,
                                                   max_seq - n_prompt));
 
-
-            for (int p = 0; p < n_prompt; ++p) {
+            if (use_batched_prefill) {
+                const int rows = batch * n_prompt;
+                std::vector<int> flat_tokens((size_t)rows);
                 for (int b = 0; b < batch; ++b)
-                    host_tokens[b] = prompts[order[base + (size_t)b]][p];
-                HIP_CHECK(hipMemcpyAsync(g.next_token, host_tokens.data(),
-                                         (size_t)batch * sizeof(int),
-                                         hipMemcpyHostToDevice, g.stream));
-                gpu_forward_absorbed_batch(g.next_token, nullptr, max_seq, 0,
-                                           p, p == n_prompt - 1, batch);
+                    std::copy(prompts[order[base + (size_t)b]].begin(),
+                              prompts[order[base + (size_t)b]].end(),
+                              flat_tokens.begin() + (size_t)b * n_prompt);
+                HIP_CHECK(hipMemcpyAsync(
+                    g.prompt_tokens, flat_tokens.data(),
+                    (size_t)rows * sizeof(int), hipMemcpyHostToDevice,
+                    g.stream));
+                if (report_prefill_timing)
+                    HIP_CHECK(hipEventRecord(prefill_start, g.stream));
+                gpu_prefill_batch(g.prompt_tokens, n_prompt, batch);
+                if (report_prefill_timing) {
+                    HIP_CHECK(hipEventRecord(prefill_stop, g.stream));
+                    HIP_CHECK(hipEventSynchronize(prefill_stop));
+                    float prefill_ms = 0.0f;
+                    HIP_CHECK(hipEventElapsedTime(
+                        &prefill_ms, prefill_start, prefill_stop));
+                    std::fprintf(stderr,
+                        "[getp prefill] prompt=%d batch=%d rows=%d ms=%.3f "
+                        "input_tps=%.3f\n",
+                        n_prompt, batch, rows, prefill_ms,
+                        (double)rows * 1e3 / prefill_ms);
+                }
+            } else {
+                for (int p = 0; p < n_prompt; ++p) {
+                    for (int b = 0; b < batch; ++b)
+                        host_tokens[b] =
+                            prompts[order[base + (size_t)b]][p];
+                    HIP_CHECK(hipMemcpyAsync(
+                        g.next_token, host_tokens.data(),
+                        (size_t)batch * sizeof(int), hipMemcpyHostToDevice,
+                        g.stream));
+                    gpu_forward_absorbed_batch(
+                        g.next_token, nullptr, max_seq, 0, p,
+                        p == n_prompt - 1, batch);
+                }
             }
 
+            if (report_decode_timing && steps > 0)
+                HIP_CHECK(hipEventRecord(decode_start, g.stream));
             for (int step = 0; step < steps; ++step)
                 gpu_forward_absorbed_batch(g.next_token, g.generated, max_seq,
                                            step, n_prompt + step, true, batch);
+            if (report_decode_timing && steps > 0) {
+                HIP_CHECK(hipEventRecord(decode_stop, g.stream));
+                HIP_CHECK(hipEventSynchronize(decode_stop));
+                float decode_ms = 0.0f;
+                HIP_CHECK(hipEventElapsedTime(
+                    &decode_ms, decode_start, decode_stop));
+                std::fprintf(stderr,
+                    "[getp decode] prompt=%d batch=%d steps=%d ms=%.3f "
+                    "compute_tps=%.3f\n",
+                    n_prompt, batch, steps, decode_ms,
+                    (double)batch * steps * 1e3 / decode_ms);
+            }
 
             std::vector<int> host_generated((size_t)batch * steps);
             if (steps > 0) {
@@ -951,5 +1372,13 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
         group_begin = group_end;
     }
     HIP_CHECK(hipStreamSynchronize(g.stream));
+    if (report_prefill_timing) {
+        HIP_CHECK(hipEventDestroy(prefill_start));
+        HIP_CHECK(hipEventDestroy(prefill_stop));
+    }
+    if (report_decode_timing) {
+        HIP_CHECK(hipEventDestroy(decode_start));
+        HIP_CHECK(hipEventDestroy(decode_stop));
+    }
     return total;
 }
