@@ -1860,7 +1860,7 @@ __global__ void routed_shared_down(float *out, const float *routed, const float 
 __global__ void argmax(const float *logits, int n, int *result, int batch) {
     __shared__ float bv[THREADS];__shared__ int bi[THREADS];int b=(int)blockIdx.x;
     if(b>=batch)return;const float *row=logits+(size_t)b*n;float vbest=-INFINITY;int ibest=0x7fffffff;
-    for(int i=(int)threadIdx.x;i<n;i+=THREADS){float v=row[i];if(v>vbest||(v==vbest&&i<ibest)){vbest=v;ibest=i;}}
+    for(int i=(int)threadIdx.x;i<n;i+=THREADS){float v=row[i];if(v!=v)v=-INFINITY;/*NaN-safe: keep ibest a valid token, never leave the 0x7fffffff sentinel for embedding to read out of bounds*/if(v>vbest||(v==vbest&&i<ibest)){vbest=v;ibest=i;}}
     bv[threadIdx.x]=vbest;bi[threadIdx.x]=ibest;__syncthreads();
     for(int s=THREADS/2;s;s>>=1){if((int)threadIdx.x<s){float ov=bv[threadIdx.x+s];int oi=bi[threadIdx.x+s];
         if(ov>bv[threadIdx.x]||(ov==bv[threadIdx.x]&&oi<bi[threadIdx.x])){bv[threadIdx.x]=ov;bi[threadIdx.x]=oi;}}__syncthreads();}

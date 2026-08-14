@@ -103,11 +103,13 @@ __global__ void router_topk_kernel(float *scores, const float *bias,
                 if (chosen[prev] == e) used = true;
             if (used) continue;
             float selected = scores[e] + (bias ? bias[e] : 0.0f);
+            if (selected != selected) selected = -INFINITY;  /* NaN-safe */
             if (selected > best_value) {
                 best_value = selected;
                 best = e;
             }
         }
+        if (best < 0) best = 0;  /* degenerate (all-NaN) row: never index scores[-1] */
         chosen[slot] = best;
         indices[slot] = best;
         weights[slot] = scores[best];
@@ -153,6 +155,15 @@ __global__ void router_topk_wave64_kernel(
         if (lane < experts) scores[lane] = score;
     }
     __syncthreads();
+
+    /* NaN-safe argmax: a NaN score makes every `>`/`==` comparison below
+     * false, so the "used" sentinel (best_index == 0x7fffffff) survives the
+     * reduction and `weights[slot] = scores[best]` reads wildly out of bounds.
+     * This happens during warm-up, whose decode step runs over an
+     * uninitialized KV cache and can produce NaN router logits.  Flushing NaN
+     * to -INFINITY keeps the sentinel ordering intact so `best` stays a valid
+     * expert index; real inference scores are finite, so this is a no-op there. */
+    if (score != score) score = -INFINITY;
 
     bool used = lane >= experts;
     for (int slot = 0; slot < k; ++slot) {
