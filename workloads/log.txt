@@ -1,0 +1,22 @@
+Rocprofiler-Compute version: 3.4.0
+Profiler choice: rocprofiler-sdk
+Path: /remote/vast0/thangdo/mla-moe/workloads
+Target: MI210
+Command: ./run /remote/vast0/share-mv/deepseek-ai/DeepSeek-V2-Lite getp tests/eval/dsv2lite/requests.txt /tmp/getp_profile.txt 64
+Kernel Selection: None
+Dispatch Selection: None
+Filtered sections: ['7.1.0', '7.1.1', '7.1.2', '7.1.5', '7.1.6', '7.1.7', '7.1.8', '7.1.9']
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Collecting Performance Counters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+[Run 1/1][Approximate profiling time left: pending first measurement...]
+[profiling] Current input file: /home/thangdo/mla-moe/workloads/perfmon/pmc_perf_0.txt
+   |-> [rocprofiler-sdk] W20260814 14:36:14.787843 128297390097984 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.171430 sec
+   |-> [rocprofiler-sdk] W20260814 14:36:14.788233 128297390097984 simple_timer.cpp:55] [rocprofv3] './run /remote/vast0/share-mv/deepseek-ai/DeepSeek-V2-Lite getp tests/eval/dsv2lite/requests.txt /tmp/getp_profile.txt 64' ::     0.000000 sec
+   |-> [rocprofiler-sdk] Loaded 5291 tensors
+   |-> [rocprofiler-sdk] Config: n_layers=27 hidden=2048 vocab=102400
+   |-> [rocprofiler-sdk] Num requests: 5 (max_steps=64)
+   |-> [rocprofiler-sdk] W20260814 14:36:15.068634 128297390097984 tool.cpp:2422] HSA version 8.20.2 initialized (instance=0)
+   |-> [rocprofiler-sdk] [getp HIP] device=AMD Instinct MI250X / MI250 vram=63.98 GiB weights=29.31 GiB mode=resident kv=bf16 prefill_tokens=65520 decode_tokens=512 warm_kv=1024 prefill_rows=65520 prefill_m=32 mfma_at=4 flash_at=8

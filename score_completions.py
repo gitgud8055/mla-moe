@@ -1,12 +1,12 @@
 """Score an output token-ID file against data/<model>/completions.i32.txt.
 
 Run one command per model:
-    uv run python score_completions.py output2.txt dsv2lite
+    uv run python score_completions.py output.txt dsv2lite
     uv run python score_completions.py output_glm47.txt glm47 --model-dir "$GLM"
 
 METEOR and BERTScore operate on text. This script therefore decodes both files
 with the selected target model's tokenizer; token IDs from the two models are
-not interchangeable. Pass/fail uses only METEOR > 0.3 and BERTScore-F1 > 0.8
+not interchangeable. Pass/fail uses only METEOR > 0.3 and BERTScore-F1 > 0.9
 by default; exact-sequence and token accuracy are diagnostic only.
 """
 
@@ -23,7 +23,7 @@ from typing import Sequence
 REPO = Path(__file__).resolve().parent
 MODEL_ENV = {"dsv2lite": "DSV", "glm47": "GLM"}
 DEFAULT_METEOR_THRESHOLD = 0.3
-DEFAULT_BERTSCORE_F1_THRESHOLD = 0.8
+DEFAULT_BERTSCORE_F1_THRESHOLD = 0.9
 
 
 def parse_args() -> argparse.Namespace:

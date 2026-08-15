@@ -1,0 +1,5 @@
+pmc: SQ_WAVES SPI_CSN_WAVE GRBM_GUI_ACTIVE
+
+gpu:
+range:
+kernel:

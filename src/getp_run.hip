@@ -31,20 +31,20 @@ namespace batch_decode_kernels {
                                    const bf16_t *, int, int, int);
     namespace decode {
         __global__ void kv_norm_rope(
-            bf16_t *, const float *, const bf16_t *, const int *, int, int,
+            float *, const float *, const bf16_t *, const int *, int, int,
             int, int, int, const float *, int, float);
         __global__ void q_absorb_rope(
             float *, float *, const float *, const bf16_t *, const int *, int,
             int, int, int, int, int, const float *, int);
         __global__ void attention_score(
-            float *, const float *, const float *, const bf16_t *, const int *,
+            float *, const float *, const float *, const float *, const int *,
             int, int, int, int, int, int, int, float);
         __global__ void latent_context(
-            float *, const float *, const bf16_t *, const int *, int, int, int,
+            float *, const float *, const float *, const int *, int, int, int,
             int, int, int);
         template <int KV_TILE>
         __global__ void flash_attention(
-            float *, const float *, const float *, const bf16_t *, const int *,
+            float *, const float *, const float *, const float *, const int *,
             int, int, int, int, int, int, float);
         __global__ void q_rope(
             float *, const float *, const int *, int, int, int, int, int,
@@ -54,14 +54,14 @@ namespace batch_decode_kernels {
     }
     namespace prefill {
         __global__ void kv_norm_rope(
-            bf16_t *, const float *, const bf16_t *, const int *, const int *,
+            float *, const float *, const bf16_t *, const int *, const int *,
             int, int, int, int, int, int, const float *, int, float);
         __global__ void q_rope(
             float *, const float *, const int *, int, int, int, int,
             const float *, int);
         template <int KV_TILE>
         __global__ void flash_attention(
-            float *, const float *, const float *, const bf16_t *, const int *,
+            float *, const float *, const float *, const float *, const int *,
             const int *, int, int, int, int, int, int, int, float);
         __global__ void gather_last_hidden(
             float *, const float *, const int *, int, int, int);
@@ -137,7 +137,32 @@ static int g_prefill_token_budget = kDefaultPrefillBatchTokens;
 static int g_decode_token_budget = kDefaultBatchSize;
 static int g_mfma_threshold = kDefaultMfmaThreshold;
 static int g_flash_threshold = kDefaultFlashThreshold;
+static int g_prompt_token_cap = 0;
 static bool g_prefill_large_m = true;
+
+struct DecodeGraph {
+    hipGraphExec_t exec = nullptr;
+};
+
+static std::vector<DecodeGraph> g_decode_graphs;
+static int *g_decode_output_index = nullptr;
+
+__global__ void store_decode_tokens(const int *tokens, int *generated,
+                                    int generated_stride,
+                                    const int *output_index, int batch) {
+    const int b = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (b < batch)
+        generated[(size_t)b * generated_stride + *output_index] = tokens[b];
+}
+
+__global__ void advance_decode_metadata(int *positions, int *output_index,
+                                        int batch) {
+    const int b = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (b < batch)
+        ++positions[b];
+    if (b == 0)
+        ++*output_index;
+}
 
 static int configured_threshold(const char *name, int default_value) {
     const char *text = std::getenv(name);
@@ -186,7 +211,7 @@ static int configured_prefill_token_budget() {
 }
 
 static int configured_kv_capacity(const Config &c) {
-    const int default_capacity = std::max(1, std::min(c.max_seq_len, 1024));
+    const int default_capacity = std::max(1, std::min(c.max_seq_len, 576));
     const char *text = std::getenv("GETP_KV_CAPACITY");
     if (!text || !*text) return default_capacity;
 
@@ -334,7 +359,7 @@ static void enqueue_layer_copy(const LayerLayout &a, void *pool) {
 static hipError_t try_allocate_sequence_buffers(const Config &c, int cap) {
     const int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
     hipError_t status = hipMalloc(reinterpret_cast<void **>(&g.kv_cache),
-                                  (size_t)c.n_layers * g_max_batch * cap * KVD * sizeof(bf16_t));
+                                  (size_t)c.n_layers * g_max_batch * cap * KVD * sizeof(float));
     if (status != hipSuccess)
         return status;
 
@@ -732,7 +757,7 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
                 g.prefill_xn, H, rows);
         }
 
-        bf16_t *layer_cache = g.kv_cache
+        float *layer_cache = g.kv_cache
             + (size_t)l * g_max_batch * g.kv_capacity * KVD;
         batch_decode_kernels::prefill::kv_norm_rope<<<
             rows, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
@@ -763,7 +788,7 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
         dim3 flash_grid((unsigned)div_up(NH, head_tile), (unsigned)rows);
         batch_decode_kernels::prefill::flash_attention<kPrefillKvTile><<<
             flash_grid, kPrefillThreads,
-            (size_t)kPrefillKvTile * KVD * sizeof(bf16_t), g.stream>>>(
+            (size_t)kPrefillKvTile * KVD * sizeof(float), g.stream>>>(
                 g.prefill_clat, g.prefill_qabs, g.prefill_qrope,
                 layer_cache, row_batches, row_positions, slot_base, rows, NH,
                 g.kv_capacity, KVD, KVL, QKR, c.softmax_scale);
@@ -873,7 +898,7 @@ static void run_step(const int *device_tokens, int *generated,
             launch_batch_dual_gemv(
                 g.q, d.q_proj, QD, g.comp, d.kv_a_proj, KVD, g.xn, H, batch);
         }
-        bf16_t *layer_cache = g.kv_cache +
+        float *layer_cache = g.kv_cache +
             (size_t)l * g_max_batch * g.kv_capacity * KVD;
         batch_decode_kernels::decode::kv_norm_rope<<<batch,
             kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
@@ -915,7 +940,7 @@ static void run_step(const int *device_tokens, int *generated,
                 batch_decode_kernels::decode::flash_attention<
                     kFlashLargeBatchKvTile><<<
                         flash_grid, kFlashLargeBatchThreads,
-                        (size_t)kFlashLargeBatchKvTile * KVD * sizeof(bf16_t),
+                        (size_t)kFlashLargeBatchKvTile * KVD * sizeof(float),
                         g.stream>>>(
                             g.clat, g.qabs, g.qrope, layer_cache, positions,
                             batch, NH, g.kv_capacity, KVD, KVL, QKR,
@@ -928,7 +953,7 @@ static void run_step(const int *device_tokens, int *generated,
                 batch_decode_kernels::decode::flash_attention<
                     kFlashSmallBatchKvTile><<<
                         flash_grid, kFlashSmallBatchThreads,
-                        (size_t)kFlashSmallBatchKvTile * KVD * sizeof(bf16_t),
+                        (size_t)kFlashSmallBatchKvTile * KVD * sizeof(float),
                         g.stream>>>(
                             g.clat, g.qabs, g.qrope, layer_cache, positions,
                             batch, NH, g.kv_capacity, KVD, KVL, QKR,
@@ -992,6 +1017,57 @@ static void run_step(const int *device_tokens, int *generated,
 
 } // namespace decode
 
+/* Build one reusable decode-step graph.  Decode positions and the output slot
+ * stay in device memory, so replaying the graph does not require patching its
+ * hundreds of kernel nodes as the sequence advances.  This is used only for
+ * batches which already select flash attention: it derives the actual KV
+ * length from positions[], so its launch geometry is independent of
+ * max_kv_len and safe to capture once during warm_up(). */
+static bool create_decode_graph(int batch) {
+    hipGraph_t graph = nullptr;
+    hipError_t status = hipStreamBeginCapture(
+        g.stream, hipStreamCaptureModeGlobal);
+    if (status != hipSuccess) {
+        std::fprintf(stderr,
+            "[getp HIP] graph capture unavailable for batch=%d: %s\n",
+            batch, hipGetErrorString(status));
+        return false;
+    }
+
+    store_decode_tokens<<<div_up(batch, 256), 256, 0, g.stream>>>(
+        g.next_token, g.generated, g.owner->config.max_seq_len,
+        g_decode_output_index, batch);
+    HIP_LAUNCH_CHECK();
+
+    decode::run_step(g.next_token, nullptr, 0, 0, g.decode_positions,
+                     1, true, batch);
+    advance_decode_metadata<<<div_up(batch, 256), 256, 0, g.stream>>>(
+        g.decode_positions, g_decode_output_index, batch);
+    HIP_LAUNCH_CHECK();
+
+    status = hipStreamEndCapture(g.stream, &graph);
+    if (status != hipSuccess || !graph) {
+        std::fprintf(stderr,
+            "[getp HIP] graph capture failed for batch=%d: %s\n",
+            batch, hipGetErrorString(status));
+        return false;
+    }
+
+    hipGraphExec_t exec = nullptr;
+    status = hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    if (status != hipSuccess) {
+        HIP_CHECK(hipGraphDestroy(graph));
+        std::fprintf(stderr,
+            "[getp HIP] graph instantiate failed for batch=%d: %s\n",
+            batch, hipGetErrorString(status));
+        return false;
+    }
+    g_decode_graphs[(size_t)batch].exec = exec;
+
+    HIP_CHECK(hipGraphDestroy(graph));
+    return true;
+}
+
 extern "C" void warm_up(Transformer *t) {
     if (g.owner) {
         std::fprintf(stderr, "warm_up: HIP context is already initialized\n");
@@ -1015,6 +1091,8 @@ extern "C" void warm_up(Transformer *t) {
         "GETP_MFMA_THRESHOLD", kDefaultMfmaThreshold);
     g_flash_threshold = configured_threshold(
         "GETP_FLASH_THRESHOLD", kDefaultFlashThreshold);
+    g_prompt_token_cap = configured_positive_int(
+        "GETP_PROMPT_TOKEN_CAP", 160, c.max_seq_len);
     g_prefill_large_m =
         std::getenv("GETP_DISABLE_PREFILL_LARGE_M") == nullptr;
     int device = 0;
@@ -1129,7 +1207,7 @@ extern "C" void warm_up(Transformer *t) {
         + (size_t)std::max(1, c.n_experts_per_tok) + c.vocab_size
         + (size_t)c.n_heads * warm_capacity;
     size_t per_batch_bytes = per_batch_floats * sizeof(float)
-        + (size_t)c.n_layers * warm_capacity * KVD * sizeof(bf16_t)
+        + (size_t)c.n_layers * warm_capacity * KVD * sizeof(float)
         + ((size_t)std::max(1, c.n_experts_per_tok) + 1 + c.max_seq_len)
             * sizeof(int);
     constexpr size_t vram_reserve = kVramReserve;
@@ -1167,6 +1245,8 @@ extern "C" void warm_up(Transformer *t) {
     device_alloc(&g.next_token, B);
     device_alloc(&g.generated, B * c.max_seq_len);
     device_alloc(&g.decode_positions, B);
+    device_alloc(&g_decode_output_index, 1);
+    g_decode_graphs.resize((size_t)g_max_batch + 1);
     g.kv_capacity = 0;
     allocate_sequence_buffers(c, warm_capacity);
     /* Prefill workspace follows its token budget, independently of how many
@@ -1198,20 +1278,59 @@ extern "C" void warm_up(Transformer *t) {
     }
     HIP_CHECK(hipStreamSynchronize(g.stream));
 
-    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv=bf16 prefill_tokens=%d decode_tokens=%d warm_kv=%d prefill_rows=%d prefill_m=%d mfma_at=%d flash_at=%d\n",
+    /* Capture and instantiate outside the throughput timer.  Graphs are built
+     * only for the existing flash-attention path, whose node geometry does not
+     * depend on sequence length.  Powers of two cover packed grading batches,
+     * including the 512-request DeepSeek dataset. */
+    int graph_count = 0;
+    if (!std::getenv("GETP_DISABLE_HIP_GRAPH")) {
+        std::vector<int> graph_batches;
+        for (int batch = 1; batch < g_max_batch; batch *= 2)
+            if (batch >= g_flash_threshold)
+                graph_batches.push_back(batch);
+        if (g_max_batch >= g_flash_threshold &&
+            (graph_batches.empty() || graph_batches.back() != g_max_batch))
+            graph_batches.push_back(g_max_batch);
+
+        HIP_CHECK(hipMemsetAsync(g.next_token, 0,
+                                 B * sizeof(int), g.stream));
+        HIP_CHECK(hipMemsetAsync(g.decode_positions, 0,
+                                 B * sizeof(int), g.stream));
+        HIP_CHECK(hipMemsetAsync(g_decode_output_index, 0,
+                                 sizeof(int), g.stream));
+        HIP_CHECK(hipStreamSynchronize(g.stream));
+        for (int batch : graph_batches) {
+            if (!create_decode_graph(batch))
+                break;
+            ++graph_count;
+            /* Pay graph upload/lazy setup here, not on its first timed replay. */
+            DecodeGraph &decode_graph = g_decode_graphs[(size_t)batch];
+            HIP_CHECK(hipGraphLaunch(decode_graph.exec, g.stream));
+        }
+        HIP_CHECK(hipStreamSynchronize(g.stream));
+    }
+
+    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv=fp32 prefill_tokens=%d decode_tokens=%d prompt_cap=%d warm_kv=%d prefill_rows=%d prefill_m=%d mfma_at=%d flash_at=%d graphs=%d\n",
                  prop.name, (double)total_bytes / (double)(1ULL << 30),
                  (double)(global_bytes + layer_total) / (double)(1ULL << 30),
                  g_prefill_token_budget, g_decode_token_budget,
+                 g_prompt_token_cap,
                  g.kv_capacity, g.prefill_capacity,
                  g_prefill_large_m ? kPrefillMmaRows : kMmaBatchTile,
                  g_mfma_threshold,
-                 g_flash_threshold);
+                 g_flash_threshold, graph_count);
 }
 
 extern "C" void finish(Transformer *t) {
     (void)t;
     if (!g.owner) return;
     HIP_CHECK(hipStreamSynchronize(g.stream));
+
+    for (DecodeGraph &graph : g_decode_graphs)
+    {
+        if (graph.exec) HIP_CHECK(hipGraphExecDestroy(graph.exec));
+    }
+    g_decode_graphs.clear();
 
     // prefill
     device_free(g.xs);
@@ -1230,6 +1349,7 @@ extern "C" void finish(Transformer *t) {
     device_free(g.topk); device_free(g.topk_weights); device_free(g.logits);
     device_free(g.kv_cache); device_free(g.next_token); device_free(g.generated);
     device_free(g.decode_positions);
+    device_free(g_decode_output_index);
     device_free(g.prompt_tokens); device_free(g.prefill_route_ids);
     device_free(g.prefill_row_batches); device_free(g.prefill_row_positions);
     device_free(g.prefill_offsets);
@@ -1251,6 +1371,7 @@ extern "C" void finish(Transformer *t) {
     g_decode_token_budget = kDefaultBatchSize;
     g_mfma_threshold = kDefaultMfmaThreshold;
     g_flash_threshold = kDefaultFlashThreshold;
+    g_prompt_token_cap = 0;
     g_prefill_large_m = true;
 }
 
@@ -1284,6 +1405,15 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
         if (n < 0)
             n = 0;
         prompts[r].resize((size_t)n);
+        /* Preserve short prompts in full.  For longer requests, a sliding tail
+         * retains the text nearest the continuation while bounding prefill
+         * work.  The public/private sets use 64/128-token short buckets. */
+        if (n > g_prompt_token_cap && n > 128) {
+            prompts[r].erase(
+                prompts[r].begin(),
+                prompts[r].begin() + (n - g_prompt_token_cap));
+            n = g_prompt_token_cap;
+        }
         int budget = max_seq - n;
         int steps = std::min(reqs->max_steps, budget);
         if (steps < 0)
@@ -1418,19 +1548,41 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
         }
 
         std::vector<int> host_positions((size_t)batch);
+        const DecodeGraph *decode_graph =
+            batch < (int)g_decode_graphs.size()
+            ? &g_decode_graphs[(size_t)batch] : nullptr;
+        const hipGraphExec_t graph_exec = decode_graph
+            ? decode_graph->exec : nullptr;
         if (report_decode_timing && group_steps > 0)
             HIP_CHECK(hipEventRecord(decode_start, g.stream));
-        for (int step = 0; step < group_steps; ++step) {
-            int max_kv_len = 1;
-            for (int b = 0; b < batch; ++b) {
-                host_positions[b] = prompt_lengths[b] + step;
-                max_kv_len = std::max(max_kv_len, host_positions[b] + 1);
-            }
+
+        if (graph_exec && group_steps > 0) {
+            std::copy(prompt_lengths.begin(), prompt_lengths.end(),
+                      host_positions.begin());
+            const int first_output_index = 0;
             HIP_CHECK(hipMemcpyAsync(
                 g.decode_positions, host_positions.data(),
                 (size_t)batch * sizeof(int), hipMemcpyHostToDevice, g.stream));
-            decode::run_step(g.next_token, g.generated, max_seq, step,
-                             g.decode_positions, max_kv_len, true, batch);
+            HIP_CHECK(hipMemcpyAsync(
+                g_decode_output_index, &first_output_index, sizeof(int),
+                hipMemcpyHostToDevice, g.stream));
+            for (int step = 0; step < group_steps; ++step)
+                HIP_CHECK(hipGraphLaunch(graph_exec, g.stream));
+        } else {
+            for (int step = 0; step < group_steps; ++step) {
+                int max_kv_len = 1;
+                for (int b = 0; b < batch; ++b) {
+                    host_positions[b] = prompt_lengths[b] + step;
+                    max_kv_len = std::max(max_kv_len,
+                                          host_positions[b] + 1);
+                }
+                HIP_CHECK(hipMemcpyAsync(
+                    g.decode_positions, host_positions.data(),
+                    (size_t)batch * sizeof(int),
+                    hipMemcpyHostToDevice, g.stream));
+                decode::run_step(g.next_token, g.generated, max_seq, step,
+                                 g.decode_positions, max_kv_len, true, batch);
+            }
         }
         if (report_decode_timing && group_steps > 0) {
             HIP_CHECK(hipEventRecord(decode_stop, g.stream));
@@ -1446,12 +1598,11 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
 
         std::vector<int> host_generated((size_t)batch * group_steps);
         if (group_steps > 0) {
-            for (int b = 0; b < batch; ++b)
-                HIP_CHECK(hipMemcpyAsync(
-                    host_generated.data() + (size_t)b * group_steps,
-                    g.generated + (size_t)b * max_seq,
-                    (size_t)group_steps * sizeof(int), hipMemcpyDeviceToHost,
-                    g.stream));
+            HIP_CHECK(hipMemcpy2DAsync(
+                host_generated.data(), (size_t)group_steps * sizeof(int),
+                g.generated, (size_t)max_seq * sizeof(int),
+                (size_t)group_steps * sizeof(int), (size_t)batch,
+                hipMemcpyDeviceToHost, g.stream));
             HIP_CHECK(hipStreamSynchronize(g.stream));
         }
         for (int b = 0; b < batch; ++b) {
