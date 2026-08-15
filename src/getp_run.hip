@@ -68,6 +68,10 @@ namespace batch_decode_kernels {
         __global__ void flash_attention(
             float *, const float *, const float *, const bf16_t *, const int *,
             const int *, int, int, int, int, int, int, int, float);
+        template <int KN>
+        __global__ void flash_attention_mfma(
+            float *, const float *, const float *, const bf16_t *, const int *,
+            const int *, int, int, int, int, int, int, int, float);
         __global__ void gather_last_hidden(
             float *, const float *, const int *, int, int, int);
     }
@@ -158,6 +162,7 @@ constexpr int kFlashLargeBatchThreads = 256;
 constexpr int kFlashLargeBatchKvTile = 8;
 constexpr int kPrefillThreads = 256;
 constexpr int kPrefillKvTile = 8;
+constexpr int kPrefillMfmaKn = 16;  /* key tile for the MFMA prefill flash */
 constexpr size_t kVramReserve = (size_t)512 << 20;
 
 static int div_up(int value, int divisor) {
@@ -217,6 +222,7 @@ static int g_decode_token_budget = kDefaultBatchSize;
 static int g_mfma_threshold = kDefaultMfmaThreshold;
 static int g_flash_threshold = kDefaultFlashThreshold;
 static bool g_prefill_large_m = true;
+static bool g_prefill_mfma_flash = true;
 
 static int configured_threshold(const char *name, int default_value) {
     const char *text = std::getenv(name);
@@ -1016,14 +1022,24 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
         phase_end(qkv_ms);
 
         phase_begin();
-        constexpr int head_tile = kPrefillThreads / HIP_WAVE;
-        dim3 flash_grid((unsigned)div_up(NH, head_tile), (unsigned)rows);
-        batch_decode_kernels::prefill::flash_attention<kPrefillKvTile><<<
-            flash_grid, kPrefillThreads,
-            (size_t)kPrefillKvTile * KVD * sizeof(bf16_t), g.stream>>>(
-                g.prefill_clat, g.prefill_qabs, g.prefill_qrope,
-                layer_cache, row_batches, row_positions, slot_base, rows, NH,
-                g.kv_capacity, KVD, KVL, QKR, c.softmax_scale);
+        if (g_prefill_mfma_flash) {
+            /* One block per (query row, 16-head tile); scores via matrix core. */
+            dim3 flash_grid((unsigned)rows, (unsigned)div_up(NH, 16));
+            batch_decode_kernels::prefill::flash_attention_mfma<
+                kPrefillMfmaKn><<<flash_grid, 256, 0, g.stream>>>(
+                    g.prefill_clat, g.prefill_qabs, g.prefill_qrope,
+                    layer_cache, row_batches, row_positions, slot_base, rows, NH,
+                    g.kv_capacity, KVD, KVL, QKR, c.softmax_scale);
+        } else {
+            constexpr int head_tile = kPrefillThreads / HIP_WAVE;
+            dim3 flash_grid((unsigned)div_up(NH, head_tile), (unsigned)rows);
+            batch_decode_kernels::prefill::flash_attention<kPrefillKvTile><<<
+                flash_grid, kPrefillThreads,
+                (size_t)kPrefillKvTile * KVD * sizeof(bf16_t), g.stream>>>(
+                    g.prefill_clat, g.prefill_qabs, g.prefill_qrope,
+                    layer_cache, row_batches, row_positions, slot_base, rows, NH,
+                    g.kv_capacity, KVD, KVL, QKR, c.softmax_scale);
+        }
         HIP_LAUNCH_CHECK();
         phase_end(flash_ms);
 
@@ -1280,6 +1296,17 @@ extern "C" void warm_up(Transformer *t) {
     g_quant = configured_quant_groups();
     g_prefill_large_m =
         std::getenv("GETP_DISABLE_PREFILL_LARGE_M") == nullptr;
+    /* MFMA prefill flash needs the kv_dim=576 latent geometry both shipped
+     * models share.  It is only a proven win when the heads fit a single 16-wide
+     * MFMA tile (DSV2-Lite, 16 heads): GLM's 20 heads spill to a second tile that
+     * restages the KV cache and is merely break-even, so it stays on the VALU
+     * path by default.  GETP_PREFILL_MFMA=1 forces it on regardless. */
+    const bool geom_ok = (c.kv_lora_rank + c.qk_rope_head_dim) == 576
+        && c.kv_lora_rank == 512;
+    if (const char *t = std::getenv("GETP_PREFILL_MFMA"))
+        g_prefill_mfma_flash = geom_ok && std::strtol(t, nullptr, 10) != 0;
+    else
+        g_prefill_mfma_flash = geom_ok && c.n_heads <= 16;
     int device = 0;
     HIP_CHECK(hipGetDevice(&device));
     hipDeviceProp_t prop;
@@ -1587,6 +1614,7 @@ extern "C" void finish(Transformer *t) {
     g_mfma_threshold = kDefaultMfmaThreshold;
     g_flash_threshold = kDefaultFlashThreshold;
     g_prefill_large_m = true;
+    g_prefill_mfma_flash = true;
 }
 
 extern "C" long long inference(Transformer *t, Requests *reqs)

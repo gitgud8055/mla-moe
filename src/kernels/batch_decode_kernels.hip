@@ -1608,6 +1608,162 @@ template __global__ void flash_attention<8>(
     float *, const float *, const float *, const bf16_t *, const int *,
     const int *, int, int, int, int, int, int, int, float);
 
+/* Supported absorbed-MLA latent geometry (DSV2-Lite and GLM-4.7-Flash both use
+ * kv_lora_rank=512, qk_rope=64 -> kv_dim=576).  Only n_heads differs. */
+constexpr int PF_KVD = 576;   /* kv_dim  (nope-latent 512 + rope 64) */
+constexpr int PF_LDS = PF_KVD + 8;   /* padded LDS row stride (8-elem align) */
+
+/* MFMA causal flash for absorbed MLA prefill.  One block owns one (query row,
+ * 16-head tile).  The score matrix S[16 heads, KN keys] = Qfull[16,576] .
+ * Cacheᵀ[KN,576] is produced by the 16x16x16 bf16 matrix core (all heads share
+ * the staged compressed-KV tile), replacing the per-key wave_sum reductions of
+ * the VALU path.  Q is streamed from global (fp32, L2-hot, converted inline) so
+ * only the compressed-KV tile lives in LDS -- keeping occupancy at ~3 blocks/CU
+ * which the fp32 P.V context phase needs.  Softmax is online/causal per head;
+ * the P.V latent context accumulates in registers straight from the same
+ * [key][kv_dim] LDS tile, so no value transpose is needed.
+ * Grid: (rows, ceil(heads/16)); block: 256. */
+template <int KN>
+__global__ void flash_attention_mfma(
+    float *__restrict__ clat, const float *__restrict__ qabs,
+    const float *__restrict__ qrope, const bf16_t *__restrict__ cache,
+    const int *__restrict__ row_batches,
+    const int *__restrict__ row_positions, int slot_base, int rows, int heads,
+    int capacity, int kv_dim, int kv_rank, int rope_dim, float scale) {
+    static_assert(KN % 16 == 0, "KN must be a multiple of the MFMA N tile");
+    __shared__ bf16_t sC[KN][PF_LDS];
+    __shared__ float sS[16][KN];
+    __shared__ float sP[16][KN];
+
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & (HIP_WAVE - 1);
+    const int wave = tid / HIP_WAVE;               /* 0..3 (256 threads) */
+    const int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    const int head_base = (int)blockIdx.y * 16;
+    const int b = slot_base + row_batches[row];
+    const int qpos = row_positions[row];
+    const int last_query = qpos + 1;
+    const bf16_t *cache_b = cache + (size_t)b * capacity * kv_dim;
+    /* Q row base for the head this lane feeds into the MFMA A operand. */
+    const int q_gh = head_base + (lane & 15);
+    const float *q_abs_lane = qabs + ((size_t)row * heads + q_gh) * kv_rank;
+    const float *q_rope_lane = qrope + ((size_t)row * heads + q_gh) * rope_dim;
+
+    /* Wave w owns heads {w, w+4, w+8, w+12}; O[j] is that head's latent context
+     * (r = lane + q*64), carried in registers across the online-softmax tiles. */
+    constexpr int OWN = 16 / 4;
+    float rmax[OWN], rden[OWN], O[OWN][8];
+#pragma unroll
+    for (int j = 0; j < OWN; ++j) {
+        rmax[j] = -INFINITY;
+        rden[j] = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 8; ++q) O[j][q] = 0.0f;
+    }
+
+    for (int k0 = 0; k0 < last_query; k0 += KN) {
+        const int tile = min(KN, last_query - k0);
+        for (int i = tid; i < KN * kv_dim; i += (int)blockDim.x) {
+            const int t = i / kv_dim, d = i - t * kv_dim;
+            sC[t][d] = t < tile
+                ? cache_b[(size_t)(k0 + t) * kv_dim + d] : (bf16_t)0;
+        }
+        __syncthreads();
+
+        /* Scores: wave w<KN/16 emits S[16 heads][keys w*16 .. w*16+15].  The A
+         * operand (Q for head lane&15, 4 contiguous latent dims) is loaded from
+         * global fp32 and narrowed to bf16 on the fly. */
+        if (wave < KN / 16) {
+            const int keybase = wave * 16;
+            const int k4 = 4 * (lane >> 4);
+            const bool q_active = q_gh < heads;
+            float4v acc = {};
+            for (int kb = 0; kb < kv_dim; kb += 16) {
+                const int col = kb + k4;
+                bf16x4 av = {};
+                if (q_active) {
+                    const float4v qf = col < kv_rank
+                        ? *reinterpret_cast<const float4v *>(q_abs_lane + col)
+                        : *reinterpret_cast<const float4v *>(
+                              q_rope_lane + (col - kv_rank));
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                        av[e] = (short)gpu_f32_to_bf16(qf[e]);
+                }
+                const bf16x4 bv = *reinterpret_cast<const bf16x4 *>(
+                    &sC[keybase + (lane & 15)][col]);
+                acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+                    av, bv, acc, 0, 0, 0);
+            }
+            const int key = keybase + (lane & 15);
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+                sS[4 * (lane >> 4) + q][key] = acc[q] * scale;
+        }
+        __syncthreads();
+
+        /* Online causal softmax per owned head -> rescale O, stage P. */
+#pragma unroll
+        for (int j = 0; j < OWN; ++j) {
+            const int h = wave + j * 4;
+            float mt = -INFINITY;
+            for (int k = lane; k < tile; k += HIP_WAVE)
+                mt = fmaxf(mt, sS[h][k]);
+            mt = __shfl(wave_max(mt), 0, HIP_WAVE);
+            const float nm = fmaxf(rmax[j], mt);
+            const float resc = expf(rmax[j] - nm);
+#pragma unroll
+            for (int q = 0; q < 8; ++q) O[j][q] *= resc;
+            rden[j] *= resc;
+            float ds = 0.0f;
+            for (int k = lane; k < tile; k += HIP_WAVE) {
+                const float p = expf(sS[h][k] - nm);
+                sP[h][k] = p;
+                ds += p;
+            }
+            rden[j] += __shfl(wave_sum(ds), 0, HIP_WAVE);
+            rmax[j] = nm;
+        }
+        __syncthreads();
+
+        /* Latent context: O[h][r] += sum_k P[h][k] * cache[k][r]. */
+#pragma unroll
+        for (int j = 0; j < OWN; ++j) {
+            const int h = wave + j * 4;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                const int r = lane + q * HIP_WAVE;
+                if (r < kv_rank) {
+                    float a = 0.0f;
+                    for (int k = 0; k < tile; ++k)
+                        a += sP[h][k] * gpu_bf16_to_f32(sC[k][r]);
+                    O[j][q] += a;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < OWN; ++j) {
+        const int h = wave + j * 4;
+        const int gh = head_base + h;
+        if (gh >= heads) continue;
+        const float inv = 1.0f / rden[j];
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+            const int r = lane + q * HIP_WAVE;
+            if (r < kv_rank)
+                clat[((size_t)row * heads + gh) * kv_rank + r] = O[j][q] * inv;
+        }
+    }
+}
+
+template __global__ void flash_attention_mfma<16>(
+    float *, const float *, const float *, const bf16_t *, const int *,
+    const int *, int, int, int, int, int, int, int, float);
+
 __global__ void gather_last_hidden(float *dst, const float *src,
                                    const int *offsets, int batch,
                                    int slot_base, int hidden) {
