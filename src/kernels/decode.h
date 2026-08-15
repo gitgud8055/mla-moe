@@ -322,6 +322,19 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
                      batch, max_batch, max_kv_len, g.kv_capacity);
         std::exit(EXIT_FAILURE);
     }
+    {
+        namespace md = utils::constants::model;
+        const bool dsv_shape = NH == md::dsv::N_HEADS &&
+            H == md::dsv::HIDDEN && QKN == md::dsv::QK_NOPE &&
+            QKR == md::dsv::QK_ROPE && VHD == md::dsv::V_HEAD &&
+            KVL == md::dsv::KV_LORA && c.q_lora_rank == md::dsv::Q_LORA;
+        const bool glm_shape = NH == md::glm::N_HEADS &&
+            H == md::glm::HIDDEN && QKN == md::glm::QK_NOPE &&
+            QKR == md::glm::QK_ROPE && VHD == md::glm::V_HEAD &&
+            KVL == md::glm::KV_LORA && c.q_lora_rank == md::glm::Q_LORA;
+        if (!dsv_shape && !glm_shape)
+            ops::unlisted_shape("decode::run", NH, QKN, VHD);
+    }
     const ops::QuantScratch qs{g.act_i8, g.act_s};
 
     ops::embedding(g.x, g.embed, device_tokens, generated, generated_stride,
@@ -371,28 +384,54 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
         HIP_LAUNCH_CHECK();
 
         if (batch >= kt::FLASH_MIN_ROWS) {
-            const bool large = batch >= kt::FLASH_LARGE_BATCH;
-            const int threads = large ? kt::FLASH_LARGE_THREADS
-                                      : kt::FLASH_SMALL_THREADS;
-            dim3 flash_grid(
-                (unsigned)ops::div_up(NH, threads / HIP_WAVE),
-                (unsigned)batch);
-            if (large)
-                flash_attention<kt::FLASH_LARGE_KV_TILE><<<
-                    flash_grid, threads,
-                    (size_t)kt::FLASH_LARGE_KV_TILE * KVD * sizeof(bf16_t),
-                    g.stream>>>(
-                        g.clat, g.qabs, g.qrope, layer_cache, positions,
-                        batch, NH, g.kv_capacity, KVD, KVL, QKR,
-                        c.softmax_scale);
-            else
+            namespace md = utils::constants::model;
+            const auto launch_small = [&] { /* 512 threads, KV tile 16 */
+                dim3 flash_grid((unsigned)ops::div_up(
+                                    NH, kt::FLASH_SMALL_THREADS / HIP_WAVE),
+                                (unsigned)batch);
                 flash_attention<kt::FLASH_SMALL_KV_TILE><<<
-                    flash_grid, threads,
+                    flash_grid, kt::FLASH_SMALL_THREADS,
                     (size_t)kt::FLASH_SMALL_KV_TILE * KVD * sizeof(bf16_t),
                     g.stream>>>(
                         g.clat, g.qabs, g.qrope, layer_cache, positions,
                         batch, NH, g.kv_capacity, KVD, KVL, QKR,
                         c.softmax_scale);
+            };
+            const auto launch_large = [&] { /* 256 threads, KV tile 8 */
+                dim3 flash_grid((unsigned)ops::div_up(
+                                    NH, kt::FLASH_LARGE_THREADS / HIP_WAVE),
+                                (unsigned)batch);
+                flash_attention<kt::FLASH_LARGE_KV_TILE><<<
+                    flash_grid, kt::FLASH_LARGE_THREADS,
+                    (size_t)kt::FLASH_LARGE_KV_TILE * KVD * sizeof(bf16_t),
+                    g.stream>>>(
+                        g.clat, g.qabs, g.qrope, layer_cache, positions,
+                        batch, NH, g.kv_capacity, KVD, KVL, QKR,
+                        c.softmax_scale);
+            };
+            if (NH == md::dsv::N_HEADS) {
+                /* DECODE dsv flash, every batch >= kt::FLASH_MIN_ROWS(8):
+                   H=md::dsv::N_HEADS(16), KV=md::dsv::KV_DIM(576),
+                   tile=kt::FLASH_SMALL_KV_TILE(16),
+                   threads=kt::FLASH_SMALL_THREADS(512) — measured 1205 vs
+                   1187 TPS against the 256thr/tile8 config at batch 512 */
+                launch_small();
+            } else if (NH == md::glm::N_HEADS) {
+                if (batch >= kt::FLASH_LARGE_BATCH)
+                    /* DECODE glm flash, B>=kt::FLASH_LARGE_BATCH(128):
+                       H=md::glm::N_HEADS(20), KV=md::glm::KV_DIM(576),
+                       tile=kt::FLASH_LARGE_KV_TILE(8),
+                       threads=kt::FLASH_LARGE_THREADS(256) — measured 666
+                       vs 662 TPS against 512thr/tile16 at batch 512 */
+                    launch_large();
+                else
+                    /* DECODE glm flash, kt::FLASH_MIN_ROWS(8)<=B<128:
+                       H=20, KV=576, tile=kt::FLASH_SMALL_KV_TILE(16),
+                       threads=kt::FLASH_SMALL_THREADS(512) */
+                    launch_small();
+            } else {
+                ops::unlisted_shape("decode flash_attention", NH, KVD, batch);
+            }
             HIP_LAUNCH_CHECK();
         } else {
             int score_rows = NH * max_kv_len;

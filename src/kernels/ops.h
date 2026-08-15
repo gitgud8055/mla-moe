@@ -42,6 +42,17 @@ static_assert(((size_t)MFMA_M * kt::PREFILL_ROW_TILES + 2 * MFMA_N) * I8_LDS_K
 
 inline int div_up(int value, int divisor) { return (value + divisor - 1) / divisor; }
 
+/* A wrapper hit a shape with no explicit branch in its dispatch ladder.
+ * Every real (model, phase) case must be listed; abort loudly so a missing
+ * case is added instead of silently running an untuned default. */
+[[noreturn]] inline void unlisted_shape(const char *where,
+                                        long d0, long d1, long d2) {
+    std::fprintf(stderr,
+        "[ops] unlisted shape in %s: (%ld, %ld, %ld) — add an explicit "
+        "branch to its dispatch ladder\n", where, d0, d1, d2);
+    std::abort();
+}
+
 /* ------------------------------------------------------------------ */
 /* Quantization kernels                                               */
 /* ------------------------------------------------------------------ */
@@ -1310,9 +1321,12 @@ struct QuantScratch {
     float *act_s = nullptr;   /* [rows]          */
 };
 
+/* Embedding gather: hidden=md::*::HIDDEN(2048) for both models/phases. */
 inline void embedding(float *x, const bf16_t *table, const int *tokens,
                       int *generated, int generated_stride, int output_index,
                       int hidden, int rows, hipStream_t stream) {
+    if (hidden != utils::constants::model::dsv::HIDDEN)
+        unlisted_shape("ops::embedding", hidden, rows, 0);
     dim3 grid((unsigned)div_up(hidden, THREADS), (unsigned)rows);
     embedding_kernel<<<grid, THREADS, 0, stream>>>(
         x, table, tokens, generated, generated_stride, output_index,
@@ -1320,17 +1334,41 @@ inline void embedding(float *x, const bf16_t *table, const int *tokens,
     HIP_LAUNCH_CHECK();
 }
 
+/* RMSNorm over `rows` rows of width `n`.
+ * Shapes: n=md::*::HIDDEN(2048) input/post/final norm (dsv+glm, both phases);
+ *         n=md::glm::Q_LORA(768) glm q_a norm (both phases). */
 inline void rmsnorm(float *y, const float *x, const bf16_t *w, int n,
                     int rows, float eps, hipStream_t stream) {
-    rmsnorm_kernel<<<rows, kt::ELEMENTWISE_THREADS, 0, stream>>>(
-        y, x, w, n, rows, eps);
+    namespace md = utils::constants::model;
+    if (n == md::dsv::HIDDEN) {
+        /* dsv+glm hidden-width norms: N=md::*::HIDDEN(2048) */
+        rmsnorm_kernel<<<rows, kt::ELEMENTWISE_THREADS, 0, stream>>>(
+            y, x, w, n, rows, eps);
+    } else if (n == md::glm::Q_LORA) {
+        /* glm q_a norm: N=md::glm::Q_LORA(768) */
+        rmsnorm_kernel<<<rows, kt::ELEMENTWISE_THREADS, 0, stream>>>(
+            y, x, w, n, rows, eps);
+    } else {
+        unlisted_shape("ops::rmsnorm", n, rows, 0);
+    }
     HIP_LAUNCH_CHECK();
 }
 
+/* Greedy sampling over the vocabulary (both phases). */
 inline void argmax(const float *logits, int n, int *result, int rows,
                    hipStream_t stream) {
-    argmax_kernel<<<rows, kt::ELEMENTWISE_THREADS, 0, stream>>>(
-        logits, n, result, rows);
+    namespace md = utils::constants::model;
+    if (n == md::dsv::VOCAB) {
+        /* dsv logits: N=md::dsv::VOCAB(102400), rows=batch */
+        argmax_kernel<<<rows, kt::ELEMENTWISE_THREADS, 0, stream>>>(
+            logits, n, result, rows);
+    } else if (n == md::glm::VOCAB) {
+        /* glm logits: N=md::glm::VOCAB(154880), rows=batch */
+        argmax_kernel<<<rows, kt::ELEMENTWISE_THREADS, 0, stream>>>(
+            logits, n, result, rows);
+    } else {
+        unlisted_shape("ops::argmax", n, rows, 0);
+    }
     HIP_LAUNCH_CHECK();
 }
 
@@ -1383,100 +1421,192 @@ inline void gemm_mfma(float *y, const float *x, const bf16_t *w,
     HIP_LAUNCH_CHECK();
 }
 
-/* Y[rows x d_out] = X[rows x n_in] @ W[d_out x n_in]^T (+= when add).
- *
- * ===================== shape ladder (model, tensor) =====================
- * Keyed on (d_out, n_in) against utils::constants::model. Every branch
- * launches the same default configuration (gemm_mfma) today — tune each
- * branch independently later. Within a branch:
- *   large_m == false -> decode phase (rows = batch <= 512)
- *   large_m == true  -> prefill phase (rows = packed prompt tokens)     */
-inline void gemm(float *y, const float *x, const bf16_t *w, const float *ws,
-                 int rows, int d_out, int n_in, bool add,
-                 const QuantScratch &qs, hipStream_t stream) {
-    namespace md = utils::constants::model;
+/* Launch a GEMM with the default configuration for its size regime:
+ * rows < kt::MFMA_MIN_ROWS(4) -> one-wave GEMV (dequant int8 in-register);
+ * rows < kt::ROW_TILES_MIN_ROWS(512) -> 16-row MFMA blocks (small decode);
+ * otherwise -> 32-row MFMA blocks (packed prefill). */
+inline void gemm_default(float *y, const float *x, const bf16_t *w,
+                         const float *ws, int rows, int d_out, int n_in,
+                         bool add, const QuantScratch &qs,
+                         hipStream_t stream) {
     if (rows >= kt::MFMA_MIN_ROWS) {
-        const bool large_m = rows >= kt::LARGE_M_MIN_ROWS;
-        if (d_out == md::dsv::N_EXPERTS && n_in == md::dsv::HIDDEN) {
-            /* dsv+glm moe_gate router logits [rows, 64, 2048], bf16 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else if (d_out == md::dsv::Q_DIM && n_in == md::dsv::HIDDEN) {
-            /* dsv q_proj [rows, 3072, 2048], int8+a8 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else if (d_out == md::dsv::KV_DIM && n_in == md::dsv::HIDDEN) {
-            /* dsv kv_a_proj [rows, 576, 2048] int8+a8;
-               glm kv_a_proj [rows, 576, 2048] bf16 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else if (d_out == md::glm::Q_LORA && n_in == md::glm::HIDDEN) {
-            /* glm q_a_proj [rows, 768, 2048], bf16 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else if (d_out == md::glm::Q_DIM && n_in == md::glm::Q_LORA) {
-            /* glm q_b_proj [rows, 5120, 768], bf16 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else if (d_out == md::dsv::HIDDEN && n_in == md::dsv::ATTN_OUT) {
-            /* dsv o_proj [rows, 2048, 2048], int8+a8 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else if (d_out == md::glm::HIDDEN && n_in == md::glm::ATTN_OUT) {
-            /* glm o_proj [rows, 2048, 5120], bf16 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else if (d_out == md::dsv::HIDDEN && n_in == md::dsv::SHARED_INTER) {
-            /* dsv shared_down [rows, 2048, 2816], int8+a8 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else if (d_out == md::glm::HIDDEN && n_in == md::glm::SHARED_INTER) {
-            /* glm shared_down [rows, 2048, 1536], int8+a8 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else if (d_out == md::dsv::HIDDEN && n_in == md::dsv::DENSE_INTER) {
-            /* dsv dense_down (layer 0) [rows, 2048, 10944], int8+a8 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else if (d_out == md::glm::HIDDEN && n_in == md::glm::DENSE_INTER) {
-            /* glm dense_down (layer 0) [rows, 2048, 10240], bf16 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else if (d_out == md::dsv::VOCAB && n_in == md::dsv::HIDDEN) {
-            /* dsv lm_head [rows, 102400, 2048], int8+a8 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else if (d_out == md::glm::VOCAB && n_in == md::glm::HIDDEN) {
-            /* glm lm_head [rows, 154880, 2048], bf16 */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        } else {
-            /* unlisted shape: default configuration */
-            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
-        }
+        gemm_mfma(y, x, w, ws, rows, d_out, n_in, add,
+                  rows >= kt::ROW_TILES_MIN_ROWS, qs, stream);
         return;
     }
-    /* rows < MFMA_MIN_ROWS: one wave per output row (dequant int8 if ws) */
     gemv<<<gemv_grid(d_out, rows), kt::GEMV_THREADS, 0, stream>>>(
         y, x, w, ws, d_out, n_in, rows, add ? 1 : 0);
     HIP_LAUNCH_CHECK();
 }
 
-/* Two GEMMs sharing one activation.
- * decode/prefill: dsv q_proj [.,3072,2048] + kv_a [.,576,2048];
- *                 glm q_a [.,768,2048] + kv_a [.,576,2048]. */
+/* Y[rows x d_out] = X[rows x n_in] @ W[d_out x n_in]^T (+= when add).
+ *
+ * ===================== shape ladder (model, tensor) =====================
+ * Keyed on (d_out, n_in) against utils::constants::model — every shape the
+ * two models produce has its own branch; an unlisted shape aborts. Every
+ * branch launches the same default configuration (gemm_default) today —
+ * tune each branch independently later. Within a branch:
+ *   rows >= kt::LARGE_M_MIN_ROWS(1024) -> prefill (rows = packed tokens)
+ *   rows <  kt::LARGE_M_MIN_ROWS       -> decode (rows = batch,
+ *                                         GEMV below kt::MFMA_MIN_ROWS(4)) */
+inline void gemm(float *y, const float *x, const bf16_t *w, const float *ws,
+                 int rows, int d_out, int n_in, bool add,
+                 const QuantScratch &qs, hipStream_t stream) {
+    namespace md = utils::constants::model;
+    const bool prefill_m = rows >= kt::LARGE_M_MIN_ROWS;
+    if (d_out == md::dsv::N_EXPERTS && n_in == md::dsv::HIDDEN) {
+        if (prefill_m) {
+            /* PREFILL moe_gate router logits (dsv+glm): M=packed tokens (<=md::*::PREFILL_ROWS), N=md::*::N_EXPERTS(64), K=md::*::HIDDEN(2048), bf16 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE moe_gate router logits (dsv+glm): M=batch (<=md::*::DECODE_BATCH(512)), N=md::*::N_EXPERTS(64), K=md::*::HIDDEN(2048), bf16 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else if (d_out == md::dsv::Q_DIM && n_in == md::dsv::HIDDEN) {
+        if (prefill_m) {
+            /* PREFILL dsv q_proj: M=packed tokens (<=md::dsv::PREFILL_ROWS(65520)), N=md::dsv::Q_DIM(3072), K=md::dsv::HIDDEN(2048), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE dsv q_proj: M=batch (<=md::dsv::DECODE_BATCH(512)), N=md::dsv::Q_DIM(3072), K=md::dsv::HIDDEN(2048), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else if (d_out == md::dsv::KV_DIM && n_in == md::dsv::HIDDEN) {
+        if (prefill_m) {
+            /* PREFILL kv_a_proj (dsv+glm): M=packed tokens (<=md::*::PREFILL_ROWS), N=md::*::KV_DIM(576), K=md::*::HIDDEN(2048), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE kv_a_proj (dsv+glm): M=batch (<=md::*::DECODE_BATCH(512)), N=md::*::KV_DIM(576), K=md::*::HIDDEN(2048), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else if (d_out == md::glm::Q_LORA && n_in == md::glm::HIDDEN) {
+        if (prefill_m) {
+            /* PREFILL glm q_a_proj: M=packed tokens (<=md::glm::PREFILL_ROWS(32768)), N=md::glm::Q_LORA(768), K=md::glm::HIDDEN(2048), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE glm q_a_proj: M=batch (<=md::glm::DECODE_BATCH(512)), N=md::glm::Q_LORA(768), K=md::glm::HIDDEN(2048), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else if (d_out == md::glm::Q_DIM && n_in == md::glm::Q_LORA) {
+        if (prefill_m) {
+            /* PREFILL glm q_b_proj: M=packed tokens (<=md::glm::PREFILL_ROWS(32768)), N=md::glm::Q_DIM(5120), K=md::glm::Q_LORA(768), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE glm q_b_proj: M=batch (<=md::glm::DECODE_BATCH(512)), N=md::glm::Q_DIM(5120), K=md::glm::Q_LORA(768), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else if (d_out == md::dsv::HIDDEN && n_in == md::dsv::ATTN_OUT) {
+        if (prefill_m) {
+            /* PREFILL dsv o_proj: M=packed tokens (<=md::dsv::PREFILL_ROWS(65520)), N=md::dsv::HIDDEN(2048), K=md::dsv::ATTN_OUT(2048), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE dsv o_proj: M=batch (<=md::dsv::DECODE_BATCH(512)), N=md::dsv::HIDDEN(2048), K=md::dsv::ATTN_OUT(2048), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else if (d_out == md::glm::HIDDEN && n_in == md::glm::ATTN_OUT) {
+        if (prefill_m) {
+            /* PREFILL glm o_proj: M=packed tokens (<=md::glm::PREFILL_ROWS(32768)), N=md::glm::HIDDEN(2048), K=md::glm::ATTN_OUT(5120), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE glm o_proj: M=batch (<=md::glm::DECODE_BATCH(512)), N=md::glm::HIDDEN(2048), K=md::glm::ATTN_OUT(5120), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else if (d_out == md::dsv::HIDDEN && n_in == md::dsv::SHARED_INTER) {
+        if (prefill_m) {
+            /* PREFILL dsv shared_down: M=packed tokens (<=md::dsv::PREFILL_ROWS(65520)), N=md::dsv::HIDDEN(2048), K=md::dsv::SHARED_INTER(2816), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE dsv shared_down: M=batch (<=md::dsv::DECODE_BATCH(512)), N=md::dsv::HIDDEN(2048), K=md::dsv::SHARED_INTER(2816), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else if (d_out == md::glm::HIDDEN && n_in == md::glm::SHARED_INTER) {
+        if (prefill_m) {
+            /* PREFILL glm shared_down: M=packed tokens (<=md::glm::PREFILL_ROWS(32768)), N=md::glm::HIDDEN(2048), K=md::glm::SHARED_INTER(1536), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE glm shared_down: M=batch (<=md::glm::DECODE_BATCH(512)), N=md::glm::HIDDEN(2048), K=md::glm::SHARED_INTER(1536), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else if (d_out == md::dsv::HIDDEN && n_in == md::dsv::DENSE_INTER) {
+        if (prefill_m) {
+            /* PREFILL dsv dense_down (layer 0): M=packed tokens (<=md::dsv::PREFILL_ROWS(65520)), N=md::dsv::HIDDEN(2048), K=md::dsv::DENSE_INTER(10944), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE dsv dense_down (layer 0): M=batch (<=md::dsv::DECODE_BATCH(512)), N=md::dsv::HIDDEN(2048), K=md::dsv::DENSE_INTER(10944), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else if (d_out == md::glm::HIDDEN && n_in == md::glm::DENSE_INTER) {
+        if (prefill_m) {
+            /* PREFILL glm dense_down (layer 0): M=packed tokens (<=md::glm::PREFILL_ROWS(32768)), N=md::glm::HIDDEN(2048), K=md::glm::DENSE_INTER(10240), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE glm dense_down (layer 0): M=batch (<=md::glm::DECODE_BATCH(512)), N=md::glm::HIDDEN(2048), K=md::glm::DENSE_INTER(10240), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else if (d_out == md::dsv::VOCAB && n_in == md::dsv::HIDDEN) {
+        if (prefill_m) {
+            /* PREFILL dsv lm_head: M=packed tokens (<=md::dsv::PREFILL_ROWS(65520)), N=md::dsv::VOCAB(102400), K=md::dsv::HIDDEN(2048), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE dsv lm_head: M=batch (<=md::dsv::DECODE_BATCH(512)), N=md::dsv::VOCAB(102400), K=md::dsv::HIDDEN(2048), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else if (d_out == md::glm::VOCAB && n_in == md::glm::HIDDEN) {
+        if (prefill_m) {
+            /* PREFILL glm lm_head: M=packed tokens (<=md::glm::PREFILL_ROWS(32768)), N=md::glm::VOCAB(154880), K=md::glm::HIDDEN(2048), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        } else {
+            /* DECODE glm lm_head: M=batch (<=md::glm::DECODE_BATCH(512)), N=md::glm::VOCAB(154880), K=md::glm::HIDDEN(2048), int8+a8 */
+            gemm_default(y, x, w, ws, rows, d_out, n_in, add, qs, stream);
+        }
+    } else {
+        unlisted_shape("ops::gemm", d_out, n_in, rows);
+    }
+}
+
+/* Two GEMMs sharing one activation. Ladder keyed on (out0, out1, n_in);
+ * an unlisted pair aborts. Both phases pass through here. */
 inline void gemm_dual(float *y0, const bf16_t *w0, const float *ws0, int out0,
                       float *y1, const bf16_t *w1, const float *ws1, int out1,
                       const float *x, int n_in, int rows,
                       const QuantScratch &qs, hipStream_t stream) {
-    if (rows >= kt::MFMA_MIN_ROWS) {
-        gemm(y0, x, w0, ws0, rows, out0, n_in, false, qs, stream);
-        gemm(y1, x, w1, ws1, rows, out1, n_in, false, qs, stream);
-        return;
+    namespace md = utils::constants::model;
+    const auto launch = [&] {
+        if (rows >= kt::MFMA_MIN_ROWS) {
+            gemm(y0, x, w0, ws0, rows, out0, n_in, false, qs, stream);
+            gemm(y1, x, w1, ws1, rows, out1, n_in, false, qs, stream);
+            return;
+        }
+        dual_gemv<<<gemv_grid(out0 + out1, rows), kt::GEMV_THREADS, 0,
+            stream>>>(y0, w0, ws0, out0, y1, w1, ws1, out1, x, n_in, rows);
+        HIP_LAUNCH_CHECK();
+    };
+    if (out0 == md::dsv::Q_DIM && out1 == md::dsv::KV_DIM &&
+        n_in == md::dsv::HIDDEN) {
+        /* dsv q_proj [M,3072,2048] + kv_a_proj [M,576,2048], int8+a8;
+           M=batch (decode) or packed tokens (prefill) */
+        launch();
+    } else if (out0 == md::glm::Q_LORA && out1 == md::glm::KV_DIM &&
+               n_in == md::glm::HIDDEN) {
+        /* glm q_a_proj [M,768,2048] + kv_a_proj [M,576,2048], int8+a8;
+           M=batch (decode) or packed tokens (prefill) */
+        launch();
+    } else {
+        unlisted_shape("ops::gemm_dual", out0, out1, n_in);
     }
-    dual_gemv<<<gemv_grid(out0 + out1, rows), kt::GEMV_THREADS, 0, stream>>>(
-        y0, w0, ws0, out0, y1, w1, ws1, out1, x, n_in, rows);
-    HIP_LAUNCH_CHECK();
 }
 
 /* Fused gate/up + SwiGLU.
- * Shapes routed through here:
- *   dense FFN (layer 0): dsv [., 10944, 2048] bf16; glm [., 10240, 2048] bf16
- *   shared experts:      dsv [., 2816, 2048] int8(a8); glm [., 1536, 2048] bf16 */
+ * Shapes routed through here (both models all,w8a8; the bf16 branches stay
+ * for one-line QuantPolicy rollbacks):
+ *   dense FFN (layer 0): dsv [., 10944, 2048]; glm [., 10240, 2048]
+ *   shared experts:      dsv [., 2816, 2048];  glm [., 1536, 2048] */
 /* w8a8 gate/up over an activation that is already quantized into `qs`. */
 inline void gate_up_swiglu_i8_pre(float *y, const QuantScratch &qs,
                                   const bf16_t *gate, const float *gws,
                                   const bf16_t *up, const float *uws,
                                   int rows, int d_out, int n_in,
                                   hipStream_t stream) {
-    const bool large_m = rows >= kt::LARGE_M_MIN_ROWS;
+    const bool large_m = rows >= kt::ROW_TILES_MIN_ROWS;
     dim3 grid((unsigned)div_up(d_out, kt::MFMA_TILE_N),
               (unsigned)div_up(rows, large_m ? kt::PREFILL_ROWS
                                              : kt::MFMA_BATCH_TILE));
@@ -1499,7 +1629,7 @@ inline void gate_up_mfma(float *y, const float *x,
                          const bf16_t *up, const float *uws,
                          int rows, int d_out, int n_in,
                          const QuantScratch &qs, hipStream_t stream) {
-    const bool large_m = rows >= kt::LARGE_M_MIN_ROWS;
+    const bool large_m = rows >= kt::ROW_TILES_MIN_ROWS;
     if (gws && uws) { /* w8a8 */
         quantize_act(x, qs, rows, n_in, stream);
         gate_up_swiglu_i8_pre(y, qs, gate, gws, up, uws, rows, d_out, n_in,
@@ -1518,33 +1648,18 @@ inline void gate_up_mfma(float *y, const float *x,
     HIP_LAUNCH_CHECK();
 }
 
-/* Fused gate/up + SwiGLU.
- * ===================== shape ladder (model, tensor) =====================
- * Same convention as ops::gemm: default configuration everywhere, tune per
- * branch. rows < LARGE_M_MIN_ROWS -> decode, otherwise prefill.          */
-inline void gate_up_swiglu(float *y, const float *x,
-                           const bf16_t *gate, const float *gws,
-                           const bf16_t *up, const float *uws,
-                           int rows, int d_out, int n_in,
-                           const QuantScratch &qs, hipStream_t stream) {
-    namespace md = utils::constants::model;
+/* Fused gate/up + SwiGLU dispatch. Same convention as ops::gemm: keyed on
+ * (d_out, n_in), every real shape has an explicit branch (unlisted shapes
+ * abort), every branch launches the default configuration today. dtype is
+ * int8+a8 when scales are non-null, bf16 after a QuantPolicy rollback. */
+inline void gate_up_default(float *y, const float *x,
+                            const bf16_t *gate, const float *gws,
+                            const bf16_t *up, const float *uws, int rows,
+                            int d_out, int n_in, const QuantScratch &qs,
+                            hipStream_t stream) {
     if (rows >= kt::MFMA_MIN_ROWS) {
-        if (d_out == md::dsv::DENSE_INTER && n_in == md::dsv::HIDDEN) {
-            /* dsv dense FFN (layer 0) [rows, 10944, 2048], int8+a8 */
-            gate_up_mfma(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
-        } else if (d_out == md::glm::DENSE_INTER && n_in == md::glm::HIDDEN) {
-            /* glm dense FFN (layer 0) [rows, 10240, 2048], bf16 */
-            gate_up_mfma(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
-        } else if (d_out == md::dsv::SHARED_INTER && n_in == md::dsv::HIDDEN) {
-            /* dsv shared experts [rows, 2816, 2048], int8+a8 */
-            gate_up_mfma(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
-        } else if (d_out == md::glm::SHARED_INTER && n_in == md::glm::HIDDEN) {
-            /* glm shared expert [rows, 1536, 2048], int8+a8 */
-            gate_up_mfma(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
-        } else {
-            /* unlisted shape: default configuration */
-            gate_up_mfma(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
-        }
+        gate_up_mfma(y, x, gate, gws, up, uws, rows, d_out, n_in, qs,
+                     stream);
         return;
     }
     gate_up_swiglu_gemv<<<gemv_grid(d_out, rows), kt::GEMV_THREADS, 0,
@@ -1552,13 +1667,55 @@ inline void gate_up_swiglu(float *y, const float *x,
     HIP_LAUNCH_CHECK();
 }
 
-/* Per-head projection (weights row-major per head).
- * q-absorb: dsv [., 16h, 512out, 192in]; glm [., 20h, 512out, 192in]
- * value-up: dsv [., 16h, 128out, 512in]; glm [., 20h, 256out, 512in] */
-inline void head_gemm(float *y, const float *x, const bf16_t *w,
-                      int rows, int heads, int d_out, int n_in,
-                      int x_head_dim, int y_head_dim, size_t head_stride,
-                      hipStream_t stream) {
+inline void gate_up_swiglu(float *y, const float *x,
+                           const bf16_t *gate, const float *gws,
+                           const bf16_t *up, const float *uws, int rows,
+                           int d_out, int n_in, const QuantScratch &qs,
+                           hipStream_t stream) {
+    namespace md = utils::constants::model;
+    const bool prefill_m = rows >= kt::LARGE_M_MIN_ROWS;
+    if (d_out == md::dsv::DENSE_INTER && n_in == md::dsv::HIDDEN) {
+        if (prefill_m) {
+            /* PREFILL dsv dense FFN gate/up (layer 0): M=packed tokens (<=md::dsv::PREFILL_ROWS(65520)), N=md::dsv::DENSE_INTER(10944), K=md::dsv::HIDDEN(2048) */
+            gate_up_default(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
+        } else {
+            /* DECODE dsv dense FFN gate/up (layer 0): M=batch (<=md::dsv::DECODE_BATCH(512), GEMV below kt::MFMA_MIN_ROWS(4)), N=md::dsv::DENSE_INTER(10944), K=md::dsv::HIDDEN(2048) */
+            gate_up_default(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
+        }
+    } else if (d_out == md::glm::DENSE_INTER && n_in == md::glm::HIDDEN) {
+        if (prefill_m) {
+            /* PREFILL glm dense FFN gate/up (layer 0): M=packed tokens (<=md::glm::PREFILL_ROWS(32768)), N=md::glm::DENSE_INTER(10240), K=md::glm::HIDDEN(2048) */
+            gate_up_default(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
+        } else {
+            /* DECODE glm dense FFN gate/up (layer 0): M=batch (<=md::glm::DECODE_BATCH(512), GEMV below kt::MFMA_MIN_ROWS(4)), N=md::glm::DENSE_INTER(10240), K=md::glm::HIDDEN(2048) */
+            gate_up_default(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
+        }
+    } else if (d_out == md::dsv::SHARED_INTER && n_in == md::dsv::HIDDEN) {
+        if (prefill_m) {
+            /* PREFILL dsv shared experts gate/up: M=packed tokens (<=md::dsv::PREFILL_ROWS(65520)), N=md::dsv::SHARED_INTER(2816), K=md::dsv::HIDDEN(2048) */
+            gate_up_default(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
+        } else {
+            /* DECODE dsv shared experts gate/up: M=batch (<=md::dsv::DECODE_BATCH(512), GEMV below kt::MFMA_MIN_ROWS(4)), N=md::dsv::SHARED_INTER(2816), K=md::dsv::HIDDEN(2048) */
+            gate_up_default(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
+        }
+    } else if (d_out == md::glm::SHARED_INTER && n_in == md::glm::HIDDEN) {
+        if (prefill_m) {
+            /* PREFILL glm shared expert gate/up: M=packed tokens (<=md::glm::PREFILL_ROWS(32768)), N=md::glm::SHARED_INTER(1536), K=md::glm::HIDDEN(2048) */
+            gate_up_default(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
+        } else {
+            /* DECODE glm shared expert gate/up: M=batch (<=md::glm::DECODE_BATCH(512), GEMV below kt::MFMA_MIN_ROWS(4)), N=md::glm::SHARED_INTER(1536), K=md::glm::HIDDEN(2048) */
+            gate_up_default(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
+        }
+    } else {
+        unlisted_shape("ops::gate_up_swiglu", d_out, n_in, rows);
+    }
+}
+
+/* Launch one per-head projection with the default configuration. */
+inline void head_gemm_mfma(float *y, const float *x, const bf16_t *w,
+                           int rows, int heads, int d_out, int n_in,
+                           int x_head_dim, int y_head_dim, size_t head_stride,
+                           hipStream_t stream) {
     dim3 grid((unsigned)div_up(d_out, kt::MFMA_TILE_N),
               (unsigned)div_up(rows, kt::MFMA_BATCH_TILE),
               (unsigned)heads);
@@ -1568,21 +1725,97 @@ inline void head_gemm(float *y, const float *x, const bf16_t *w,
     HIP_LAUNCH_CHECK();
 }
 
+/* Per-head projection (weights row-major per head), bf16.
+ * ============== shape ladder (model, tensor, phase) ==============
+ * M=rows: decode = batch (<=md::*::DECODE_BATCH(512)), prefill = packed tokens. */
+inline void head_gemm(float *y, const float *x, const bf16_t *w,
+                      int rows, int heads, int d_out, int n_in,
+                      int x_head_dim, int y_head_dim, size_t head_stride,
+                      hipStream_t stream) {
+    namespace md = utils::constants::model;
+    const bool prefill_m = rows >= kt::LARGE_M_MIN_ROWS;
+    if (heads == md::dsv::N_HEADS && d_out == md::dsv::KV_LORA &&
+        n_in == md::dsv::QK_NOPE) {
+        if (prefill_m) {
+            /* PREFILL dsv q-absorb: H=md::dsv::N_HEADS(16),
+               N=md::dsv::KV_LORA(512), K=md::dsv::QK_NOPE(128), bf16 */
+            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
+                           y_head_dim, head_stride, stream);
+        } else {
+            /* DECODE dsv q-absorb: M=batch, H=16, N=512, K=128, bf16 */
+            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
+                           y_head_dim, head_stride, stream);
+        }
+    } else if (heads == md::glm::N_HEADS && d_out == md::glm::KV_LORA &&
+               n_in == md::glm::QK_NOPE) {
+        if (prefill_m) {
+            /* PREFILL glm q-absorb: H=md::glm::N_HEADS(20),
+               N=md::glm::KV_LORA(512), K=md::glm::QK_NOPE(192), bf16 */
+            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
+                           y_head_dim, head_stride, stream);
+        } else {
+            /* DECODE glm q-absorb: M=batch, H=20, N=512, K=192, bf16 */
+            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
+                           y_head_dim, head_stride, stream);
+        }
+    } else if (heads == md::dsv::N_HEADS && d_out == md::dsv::V_HEAD &&
+               n_in == md::dsv::KV_LORA) {
+        if (prefill_m) {
+            /* PREFILL dsv value-up: H=16, N=md::dsv::V_HEAD(128),
+               K=md::dsv::KV_LORA(512), bf16 */
+            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
+                           y_head_dim, head_stride, stream);
+        } else {
+            /* DECODE dsv value-up: M=batch, H=16, N=128, K=512, bf16 */
+            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
+                           y_head_dim, head_stride, stream);
+        }
+    } else if (heads == md::glm::N_HEADS && d_out == md::glm::V_HEAD &&
+               n_in == md::glm::KV_LORA) {
+        if (prefill_m) {
+            /* PREFILL glm value-up: H=20, N=md::glm::V_HEAD(256),
+               K=md::glm::KV_LORA(512), bf16 */
+            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
+                           y_head_dim, head_stride, stream);
+        } else {
+            /* DECODE glm value-up: M=batch, H=20, N=256, K=512, bf16 */
+            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
+                           y_head_dim, head_stride, stream);
+        }
+    } else {
+        unlisted_shape("ops::head_gemm", heads, d_out, n_in);
+    }
+}
+
 /* Router softmax/sigmoid + top-k. Both models have 64 experts (one wave). */
 inline void router_topk(float *scores, const float *bias, int *indices,
                         float *weights, int rows, int experts, int k,
                         int use_sigmoid, int norm_topk, float routed_scale,
                         hipStream_t stream) {
-    router_topk_wave64<<<rows, kt::ROUTER_WAVE_THREADS, 0, stream>>>(
-        scores, bias, indices, weights, rows, experts, k, use_sigmoid,
-        norm_topk, routed_scale);
+    namespace md = utils::constants::model;
+    if (experts == md::dsv::N_EXPERTS && k == md::dsv::TOP_K) {
+        /* dsv router: E=md::dsv::N_EXPERTS(64), top-k=md::dsv::TOP_K(6),
+           softmax; rows=batch (decode) or packed tokens (prefill) */
+        router_topk_wave64<<<rows, kt::ROUTER_WAVE_THREADS, 0, stream>>>(
+            scores, bias, indices, weights, rows, experts, k, use_sigmoid,
+            norm_topk, routed_scale);
+    } else if (experts == md::glm::N_EXPERTS && k == md::glm::TOP_K) {
+        /* glm router: E=md::glm::N_EXPERTS(64), top-k=md::glm::TOP_K(4),
+           sigmoid+bias; rows=batch (decode) or packed tokens (prefill) */
+        router_topk_wave64<<<rows, kt::ROUTER_WAVE_THREADS, 0, stream>>>(
+            scores, bias, indices, weights, rows, experts, k, use_sigmoid,
+            norm_topk, routed_scale);
+    } else {
+        unlisted_shape("ops::router_topk", experts, k, rows);
+    }
     HIP_LAUNCH_CHECK();
 }
 
 /* Routed + shared MoE FFN over `rows` tokens; adds the result into x.
  * Grouped (MFMA) path from MFMA_MIN_ROWS tokens, one-wave fallback below.
- *   dsv: 64 experts top-6, inter 1408, shared 2816, expert weights int8+a8
- *   glm: 64 experts top-4, inter 1536, shared 1536 bf16, expert down w8-only */
+ *   dsv: E=64 top-6, inter=md::dsv::MOE_INTER(1408), shared 2816, all int8+a8
+ *   glm: E=64 top-4, inter=md::glm::MOE_INTER(1536), shared 1536, all int8+a8
+ * (the bf16/w8 branches below stay live for QuantPolicy rollbacks) */
 inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
                     float *x, const float *xn, float *hb, float *router,
                     int *topk, float *topk_weights, int *sorted_ids,
@@ -1595,6 +1828,17 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
     const int K = c.n_experts_per_tok;
     const int inter = c.moe_inter_size;
     const int shared = c.n_shared_experts * inter;
+    {
+        namespace md = utils::constants::model;
+        const bool dsv_shape = E == md::dsv::N_EXPERTS &&
+            K == md::dsv::TOP_K && inter == md::dsv::MOE_INTER &&
+            shared == md::dsv::SHARED_INTER;
+        const bool glm_shape = E == md::glm::N_EXPERTS &&
+            K == md::glm::TOP_K && inter == md::glm::MOE_INTER &&
+            shared == md::glm::SHARED_INTER;
+        if (!dsv_shape && !glm_shape)
+            unlisted_shape("ops::moe_ffn", E, K, inter);
+    }
 
     gemm(router, xn, d.moe_gate, nullptr, rows, E, H, false, qs, stream);
     router_topk(router, d.moe_bias, topk, topk_weights, rows, E, K,
@@ -1609,7 +1853,11 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
             topk, routes, E, block_m, sorted_ids, expert_ids, num_post_pad);
         HIP_LAUNCH_CHECK();
 
-        /* gate/up always runs w8a8 (both models quantize expert gate/up) */
+        /* gate/up always runs w8a8 (both models quantize expert gate/up).
+         * ---- shape ladder (model, phase) — same default everywhere ----
+         *  dsv: routes=M*6, N=md::dsv::MOE_INTER(1408), K=HIDDEN(2048)
+         *  glm: routes=M*4, N=md::glm::MOE_INTER(1536), K=HIDDEN(2048)
+         *  DECODE M=batch (<=md::*::DECODE_BATCH(512)); PREFILL M=packed tokens. */
         quantize_act(xn, qs, rows, H, stream);
         const int up_tiles = div_up(inter, kt::MFMA_TILE_N);
         grouped_expert_gate_up_i8<block_m, 1><<<

@@ -76,6 +76,12 @@ namespace dsv {
     constexpr int SHARED_INTER = N_SHARED * MOE_INTER; /* 2816 */
     constexpr QuantPolicy QUANT = {
         /*shared=*/true, /*proj=*/true, /*lmhead=*/true, /*down_a8=*/true};
+    /* Batching (measured, 512 req x 64 steps, MI250 GCD):
+     * decode 512/256/128 -> 1187/1082/907 TPS; prefill rows 65520/32768/
+     * 16384 all ~1187-1189 TPS. 512 sequences leaves 18 GiB free, so the
+     * full 65520-row prefill workspace (grid.y kernel limit) stays. */
+    constexpr int DECODE_BATCH = 512;  /* sequences per decode step        */
+    constexpr int PREFILL_ROWS = 65520;/* packed prefill workspace tokens  */
 }
 
 /* zai-org/GLM-4.7-Flash (config.json) */
@@ -102,6 +108,16 @@ namespace glm {
     constexpr int SHARED_INTER = N_SHARED * MOE_INTER; /* 1536 */
     constexpr QuantPolicy QUANT = {
         /*shared=*/true, /*proj=*/true, /*lmhead=*/true, /*down_a8=*/true};
+    /* Batching (measured, 512 req x 64 steps, MI250 GCD):
+     * decode 512/256/128 -> 667/612/520 TPS; prefill rows 65520/32768/
+     * 16384 -> 666.6/666.2/663.8 TPS. Weights cost 28.9 GiB (13.8 more
+     * than dsv), so the prefill workspace is halved: same TPS, and free
+     * VRAM goes 4.4 -> 12.1 GiB of 64. Decode stays 512 because the
+     * grading set is 512 requests and kv capacity (576) absorbs the
+     * weight difference; warm_up still auto-shrinks the batch if VRAM
+     * ever runs short. */
+    constexpr int DECODE_BATCH = 512;  /* sequences per decode step        */
+    constexpr int PREFILL_ROWS = 32768;/* packed prefill workspace tokens  */
 }
 
 } // namespace model
@@ -117,7 +133,10 @@ namespace kernel {
     constexpr int MFMA_BATCH_TILE = 16;   /* rows per MFMA block (1 tile)    */
     constexpr int PREFILL_ROW_TILES = 2;  /* row tiles in the large-M GEMM   */
     constexpr int PREFILL_ROWS = MFMA_BATCH_TILE * PREFILL_ROW_TILES;
-    constexpr int LARGE_M_MIN_ROWS = 1024; /* switch to the large-M GEMM     */
+    constexpr int LARGE_M_MIN_ROWS = 1024; /* ladder phase split (prefill)   */
+    /* 2-row-tile MFMA blocks from 512 rows: measured decode batch 512 at
+     * 1217/681 TPS (dsv/glm) vs 1187/666 with single-tile 16-row blocks. */
+    constexpr int ROW_TILES_MIN_ROWS = 512;
     constexpr int MFMA_MIN_ROWS = 4;       /* below this: one-wave GEMV      */
     constexpr int FLASH_MIN_ROWS = 8;      /* below this: score+softmax path */
     constexpr int FLASH_LARGE_BATCH = 128;

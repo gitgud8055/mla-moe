@@ -184,6 +184,22 @@ __global__ void flash_attention(
     }
 }
 
+/* Rebuild per-row metadata on device: row r belongs to the sequence b whose
+ * [offsets[b], offsets[b+1]) range contains r; its position is the offset
+ * into that range. Lets the host upload only the token slices + offsets. */
+__global__ void build_row_meta(int *row_batches, int *row_positions,
+                               const int *offsets, int batch, int rows) {
+    const int row = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (row >= rows) return;
+    int lo = 0, hi = batch; /* invariant: offsets[lo] <= row < offsets[hi] */
+    while (lo + 1 < hi) {
+        const int mid = (lo + hi) / 2;
+        if (offsets[mid] <= row) lo = mid; else hi = mid;
+    }
+    row_batches[row] = lo;
+    row_positions[row] = row - offsets[lo];
+}
+
 __global__ void gather_last_hidden(float *dst, const float *src,
                                    const int *offsets, int batch,
                                    int slot_base, int hidden) {
@@ -217,6 +233,19 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
             "HIP packed prefill: slots=%d+%d/%d tokens=%d/%d\n",
             slot_base, batch, max_batch, rows, g.prefill_capacity);
         std::exit(EXIT_FAILURE);
+    }
+    {
+        namespace md = utils::constants::model;
+        const bool dsv_shape = NH == md::dsv::N_HEADS &&
+            H == md::dsv::HIDDEN && QKN == md::dsv::QK_NOPE &&
+            QKR == md::dsv::QK_ROPE && VHD == md::dsv::V_HEAD &&
+            KVL == md::dsv::KV_LORA && c.q_lora_rank == md::dsv::Q_LORA;
+        const bool glm_shape = NH == md::glm::N_HEADS &&
+            H == md::glm::HIDDEN && QKN == md::glm::QK_NOPE &&
+            QKR == md::glm::QK_ROPE && VHD == md::glm::V_HEAD &&
+            KVL == md::glm::KV_LORA && c.q_lora_rank == md::glm::Q_LORA;
+        if (!dsv_shape && !glm_shape)
+            ops::unlisted_shape("prefill::run", NH, QKN, VHD);
     }
     const ops::QuantScratch qs{g.prefill_act_i8, g.prefill_act_s};
 
@@ -260,14 +289,32 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
                 QKN, g.rope_inv_freq, c.rope_interleaved);
         HIP_LAUNCH_CHECK();
 
+        namespace md = utils::constants::model;
         constexpr int head_tile = kt::PREFILL_THREADS / HIP_WAVE;
         dim3 flash_grid((unsigned)ops::div_up(NH, head_tile), (unsigned)rows);
-        flash_attention<kt::PREFILL_KV_TILE><<<
-            flash_grid, kt::PREFILL_THREADS,
-            (size_t)kt::PREFILL_KV_TILE * KVD * sizeof(bf16_t), g.stream>>>(
-                g.prefill_clat, g.prefill_qabs, g.prefill_qrope,
-                layer_cache, row_batches, row_positions, slot_base, rows, NH,
-                g.kv_capacity, KVD, KVL, QKR, c.softmax_scale);
+        const size_t flash_lds =
+            (size_t)kt::PREFILL_KV_TILE * KVD * sizeof(bf16_t);
+        if (NH == md::dsv::N_HEADS) {
+            /* PREFILL dsv flash: rows=packed tokens, H=md::dsv::N_HEADS(16),
+               KV=md::dsv::KV_DIM(576), tile=kt::PREFILL_KV_TILE(8),
+               threads=kt::PREFILL_THREADS(256), bf16 cache */
+            flash_attention<kt::PREFILL_KV_TILE><<<
+                flash_grid, kt::PREFILL_THREADS, flash_lds, g.stream>>>(
+                    g.prefill_clat, g.prefill_qabs, g.prefill_qrope,
+                    layer_cache, row_batches, row_positions, slot_base, rows,
+                    NH, g.kv_capacity, KVD, KVL, QKR, c.softmax_scale);
+        } else if (NH == md::glm::N_HEADS) {
+            /* PREFILL glm flash: rows=packed tokens, H=md::glm::N_HEADS(20),
+               KV=md::glm::KV_DIM(576), tile=kt::PREFILL_KV_TILE(8),
+               threads=kt::PREFILL_THREADS(256), bf16 cache */
+            flash_attention<kt::PREFILL_KV_TILE><<<
+                flash_grid, kt::PREFILL_THREADS, flash_lds, g.stream>>>(
+                    g.prefill_clat, g.prefill_qabs, g.prefill_qrope,
+                    layer_cache, row_batches, row_positions, slot_base, rows,
+                    NH, g.kv_capacity, KVD, KVL, QKR, c.softmax_scale);
+        } else {
+            ops::unlisted_shape("prefill flash_attention", NH, KVD, rows);
+        }
         HIP_LAUNCH_CHECK();
 
         ops::head_gemm(g.prefill_ctx, g.prefill_clat, d.W_UV, rows, NH,

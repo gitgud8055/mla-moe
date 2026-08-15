@@ -139,8 +139,6 @@ struct GpuContext {
     std::vector<int> h_prompt_tokens;   /* [request][kv_capacity], flat      */
     std::vector<int> h_prompt_len;      /* tokens per request                */
     std::vector<int> h_active;          /* indices of non-empty requests     */
-    std::vector<int> h_flat_tokens;     /* packed prefill chunk tokens       */
-    std::vector<int> h_row_batches, h_row_positions;
     std::vector<int> h_offsets;         /* per-chunk prompt offsets          */
     std::vector<int> h_positions;       /* decode positions per sequence     */
     std::vector<int> h_generated;       /* copied-back generated tokens      */

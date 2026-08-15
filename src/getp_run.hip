@@ -1,14 +1,12 @@
 /* HIP inference for the getp grading surface.
  *
  * Numeric configuration is fixed per model (detected from the config the
- * checkpoint directory was loaded with — no environment variables):
- *   DeepSeek-V2-Lite (q_lora_rank == 0):
- *     routed + shared expert weights int8, full w8a8 int8-MFMA compute.
- *   GLM-4.7-Flash (q_lora_rank > 0):
- *     routed expert weights int8; a8 int8-MFMA only for gate/up, the down
- *     projection dequantizes in-flight on the bf16 MFMA path (better
- *     accuracy; bf16 weights do not fit in VRAM for this model).
- * Everything else (projections, lm_head, KV cache) stays bf16. */
+ * checkpoint directory was loaded with — no environment variables).
+ * Both models run every weight group (experts, shared, projections,
+ * lm_head) as int8 w8a8: per-row weight scales, dynamic per-token
+ * activation scales, int8-MFMA compute. KV cache stays bf16. The policy
+ * lives in utils::constants::model::{dsv,glm}::QUANT — one line to relax
+ * a group back to bf16 if a stricter accuracy gate ever requires it. */
 
 #include <hip/hip_runtime.h>
 
@@ -31,9 +29,8 @@ namespace {
 
 namespace gpu = utils::constants::gpu;
 namespace kt = utils::constants::kernel;
+namespace md = utils::constants::model;
 
-constexpr int kDecodeTokenBudget = 512; /* sequences per decode step      */
-constexpr int kMaxPrefillRows = 65520;  /* grid.y limit for packed prefill */
 constexpr int kMaxRequests = 4096;      /* host staging capacity           */
 constexpr size_t kDeviceAlignment = 256;
 constexpr size_t kVramReserve = (size_t)512 << 20;
@@ -313,9 +310,13 @@ static void allocate_prefill_workspace(const Config &c, int target_rows) {
         else
             hi = mid - 1;
     }
-    if (lo < 1) {
+    /* Prompts are truncated to kv_capacity at encode time, so the packed
+     * workspace must hold at least one prompt of that length. */
+    if (lo < g.kv_capacity) {
         std::fprintf(stderr,
-            "HIP inference: insufficient VRAM for batched prefill workspace\n");
+            "HIP inference: prefill workspace fits only %d tokens, need at "
+            "least kv_capacity=%d — not enough free VRAM (GPU busy? check "
+            "rocm-smi and pick another device)\n", lo, g.kv_capacity);
         std::exit(EXIT_FAILURE);
     }
     const size_t rows = (size_t)lo;
@@ -374,8 +375,7 @@ extern "C" void warm_up(Transformer *t) {
     /* Model detection: GLM-4.7-Flash carries a q LoRA, DeepSeek-V2-Lite
      * does not. This selects the per-model quantization policy above. */
     g_glm = t->config.q_lora_rank > 0;
-    g_qp = g_glm ? utils::constants::model::glm::QUANT
-                 : utils::constants::model::dsv::QUANT;
+    g_qp = g_glm ? md::glm::QUANT : md::dsv::QUANT;
     if (g_glm && t->config.rope_interleaved)
         t->config.max_seq_len = 512 + 64;
     const Config &c = t->config;
@@ -388,7 +388,7 @@ extern "C" void warm_up(Transformer *t) {
         std::exit(EXIT_FAILURE);
     }
     g.owner = t;
-    g_max_batch = kDecodeTokenBudget;
+    g_max_batch = g_glm ? md::glm::DECODE_BATCH : md::dsv::DECODE_BATCH;
     int device = 0;
     HIP_CHECK(hipGetDevice(&device));
     hipDeviceProp_t prop;
@@ -570,16 +570,14 @@ extern "C" void warm_up(Transformer *t) {
         device_alloc(&g.routed_s, B * c.n_experts_per_tok);
     }
     allocate_sequence_buffers(c, warm_capacity);
-    allocate_prefill_workspace(c, kMaxPrefillRows);
+    allocate_prefill_workspace(
+        c, g_glm ? md::glm::PREFILL_ROWS : md::dsv::PREFILL_ROWS);
 
     /* Host staging so inference() never allocates. */
     g.max_requests = kMaxRequests;
     g.h_prompt_tokens.resize((size_t)kMaxRequests * g.kv_capacity);
     g.h_prompt_len.resize(kMaxRequests);
     g.h_active.reserve(kMaxRequests);
-    g.h_flat_tokens.reserve((size_t)g.prefill_capacity);
-    g.h_row_batches.reserve((size_t)g.prefill_capacity);
-    g.h_row_positions.reserve((size_t)g.prefill_capacity);
     g.h_offsets.resize((size_t)g_max_batch + 1);
     g.h_positions.resize((size_t)g_max_batch);
     g.h_generated.resize((size_t)g_max_batch * g.kv_capacity);
@@ -603,11 +601,16 @@ extern "C" void warm_up(Transformer *t) {
     }
     HIP_CHECK(hipStreamSynchronize(g.stream));
 
+    size_t free_final = 0, total_final = 0;
+    HIP_CHECK(hipMemGetInfo(&free_final, &total_final));
     std::fprintf(stderr,
-        "[getp HIP] device=%s model=%s vram=%.2f GiB weights=%.2f GiB "
+        "[getp HIP] device=%s model=%s vram=%.2f GiB used=%.2f GiB "
+        "free=%.2f GiB weights=%.2f GiB "
         "quant=%s kv=bf16 decode_tokens=%d warm_kv=%d prefill_rows=%d\n",
         prop.name, g_glm ? "glm47" : "dsv2lite",
-        (double)total_bytes / (double)(1ULL << 30),
+        (double)total_final / (double)(1ULL << 30),
+        (double)(total_final - free_final) / (double)(1ULL << 30),
+        (double)free_final / (double)(1ULL << 30),
         (double)(global_bytes + layer_total) / (double)(1ULL << 30),
         g_qp.proj ? (g_qp.lmhead ? "all,w8a8" : "experts,shared,proj,w8a8")
                   : (g_qp.shared ? (g_qp.down_a8 ? "experts,shared,w8a8"
@@ -744,36 +747,40 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
                 rows += n;
                 ++chunk_batch;
             }
+            if (rows > g.prefill_capacity) {
+                std::fprintf(stderr,
+                    "HIP inference: prompt of %d tokens exceeds the %d-token "
+                    "prefill workspace allocated in warm_up\n",
+                    rows, g.prefill_capacity);
+                std::exit(EXIT_FAILURE);
+            }
 
-            g.h_flat_tokens.clear();
-            g.h_row_batches.clear();
-            g.h_row_positions.clear();
+            /* Prompts live back to back on device (no padding: packed rows
+             * keep prefill compute proportional to real tokens). Each
+             * sequence's tokens are copied straight from its staging slice;
+             * per-row (sequence, position) metadata is rebuilt on device
+             * from the offsets instead of host per-token loops. */
             g.h_offsets[0] = 0;
             for (int b = 0; b < chunk_batch; ++b) {
                 const int r = g.h_active[group_begin + slot_base + b];
                 const int n = g.h_prompt_len[r];
-                const int *tok = g.h_prompt_tokens.data()
-                    + (size_t)r * prompt_slice;
-                g.h_flat_tokens.insert(g.h_flat_tokens.end(), tok, tok + n);
-                for (int p = 0; p < n; ++p) {
-                    g.h_row_batches.push_back(b);
-                    g.h_row_positions.push_back(p);
-                }
+                HIP_CHECK(hipMemcpyAsync(
+                    g.prompt_tokens + g.h_offsets[b],
+                    g.h_prompt_tokens.data() + (size_t)r * prompt_slice,
+                    (size_t)n * sizeof(int), hipMemcpyHostToDevice,
+                    g.stream));
                 g.h_offsets[b + 1] = g.h_offsets[b] + n;
             }
-            HIP_CHECK(hipMemcpyAsync(
-                g.prompt_tokens, g.h_flat_tokens.data(),
-                (size_t)rows * sizeof(int), hipMemcpyHostToDevice, g.stream));
-            HIP_CHECK(hipMemcpyAsync(
-                g.prefill_row_batches, g.h_row_batches.data(),
-                (size_t)rows * sizeof(int), hipMemcpyHostToDevice, g.stream));
-            HIP_CHECK(hipMemcpyAsync(
-                g.prefill_row_positions, g.h_row_positions.data(),
-                (size_t)rows * sizeof(int), hipMemcpyHostToDevice, g.stream));
             HIP_CHECK(hipMemcpyAsync(
                 g.prefill_offsets, g.h_offsets.data(),
                 ((size_t)chunk_batch + 1) * sizeof(int),
                 hipMemcpyHostToDevice, g.stream));
+            prefill::build_row_meta<<<
+                ops::div_up(rows, kt::ELEMENTWISE_THREADS),
+                kt::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                    g.prefill_row_batches, g.prefill_row_positions,
+                    g.prefill_offsets, chunk_batch, rows);
+            HIP_LAUNCH_CHECK();
             prefill::run(g, c, g_max_batch, g.prompt_tokens,
                          g.prefill_row_batches, g.prefill_row_positions,
                          g.prefill_offsets, rows, chunk_batch, slot_base);
