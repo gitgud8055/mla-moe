@@ -17,22 +17,10 @@ constexpr int MFMA_N = 64;
 constexpr int MFMA_K = 64;
 constexpr int MFMA_LDS_K = MFMA_K + 4;
 
-__device__ __forceinline__ bf16_t gpu_f32_to_bf16(float value) {
-    uint32_t bits = __float_as_uint(value);
-    if ((bits & 0x7f800000U) != 0x7f800000U) {
-        /* IEEE round-to-nearest-even, matching HIP/PyTorch BF16 casts. */
-        bits += 0x7fffU + ((bits >> 16) & 1U);
-    } else if (bits & 0xffffU) {
-        /* Keep a NaN payload instead of rounding it to infinity. */
-        bits |= 0x10000U;
-    }
-    return (bf16_t)(bits >> 16);
-}
-
 __global__ void mfma_gemm(float *__restrict__ y,
                           const float *__restrict__ x,
                           const bf16_t *__restrict__ w,
-                          int rows, int d_out, int n_in, int add) {
+                          int rows, int d_out, int n_in, int add, int w8) {
     __shared__ bf16_t sx[MFMA_M][MFMA_LDS_K];
     __shared__ bf16_t sw[MFMA_N][MFMA_LDS_K];
 
@@ -58,18 +46,7 @@ __global__ void mfma_gemm(float *__restrict__ y,
              i += (int)blockDim.x) {
             const int c = i / (MFMA_K / 8);
             const int k = (i % (MFMA_K / 8)) * 8;
-            bf16x8 value = {};
-            const int gc = col0 + c;
-            if (gc < d_out && bk + k + 8 <= n_in)
-                value = *reinterpret_cast<const bf16x8 *>(
-                    w + (size_t)gc * n_in + bk + k);
-            else if (gc < d_out) {
-#pragma unroll
-                for (int q = 0; q < 8; ++q)
-                    if (bk + k + q < n_in)
-                        value[q] = reinterpret_cast<const short *>(w)[
-                            (size_t)gc * n_in + bk + k + q];
-            }
+            bf16x8 value = load_weight_x8(w, col0 + c, d_out, bk, k, n_in, w8);
             *reinterpret_cast<bf16x8 *>(&sw[c][k]) = value;
         }
         __syncthreads();
@@ -86,13 +63,14 @@ __global__ void mfma_gemm(float *__restrict__ y,
     }
 
     if (col < d_out) {
+        const float scale = w8_scale(w, d_out, n_in, col, w8);
         const int r0 = row0 + 4 * (lane >> 4);
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
             const int r = r0 + q;
             if (r < rows) {
                 float *dst = y + (size_t)r * d_out + col;
-                if (add) *dst += acc[q]; else *dst = acc[q];
+                if (add) *dst += acc[q] * scale; else *dst = acc[q] * scale;
             }
         }
     }
@@ -104,7 +82,7 @@ template <int M_TILES>
 __global__ void mfma_gemm_rows(float *__restrict__ y,
                                const float *__restrict__ x,
                                const bf16_t *__restrict__ w,
-                               int rows, int d_out, int n_in, int add) {
+                               int rows, int d_out, int n_in, int add, int w8) {
     constexpr int BLOCK_M = MFMA_M * M_TILES;
     __shared__ bf16_t sx[BLOCK_M][MFMA_LDS_K];
     __shared__ bf16_t sw[MFMA_N][MFMA_LDS_K];
@@ -130,18 +108,7 @@ __global__ void mfma_gemm_rows(float *__restrict__ y,
              i += (int)blockDim.x) {
             const int c = i / (MFMA_K / 8);
             const int k = (i % (MFMA_K / 8)) * 8;
-            const int gc = col0 + c;
-            bf16x8 value = {};
-            if (gc < d_out && bk + k + 8 <= n_in)
-                value = *reinterpret_cast<const bf16x8 *>(
-                    w + (size_t)gc * n_in + bk + k);
-            else if (gc < d_out) {
-#pragma unroll
-                for (int q = 0; q < 8; ++q)
-                    if (bk + k + q < n_in)
-                        value[q] = reinterpret_cast<const short *>(w)[
-                            (size_t)gc * n_in + bk + k + q];
-            }
+            bf16x8 value = load_weight_x8(w, col0 + c, d_out, bk, k, n_in, w8);
             *reinterpret_cast<bf16x8 *>(&sw[c][k]) = value;
         }
         __syncthreads();
@@ -161,6 +128,7 @@ __global__ void mfma_gemm_rows(float *__restrict__ y,
     }
 
     if (col < d_out) {
+        const float scale = w8_scale(w, d_out, n_in, col, w8);
 #pragma unroll
         for (int mt = 0; mt < M_TILES; ++mt) {
             const int r0 = row0 + mt * MFMA_M + 4 * (lane >> 4);
@@ -169,8 +137,8 @@ __global__ void mfma_gemm_rows(float *__restrict__ y,
                 const int r = r0 + q;
                 if (r < rows) {
                     float *dst = y + (size_t)r * d_out + col;
-                    if (add) *dst += acc[mt][q];
-                    else *dst = acc[mt][q];
+                    if (add) *dst += acc[mt][q] * scale;
+                    else *dst = acc[mt][q] * scale;
                 }
             }
         }
@@ -178,7 +146,7 @@ __global__ void mfma_gemm_rows(float *__restrict__ y,
 }
 
 template __global__ void mfma_gemm_rows<2>(
-    float *, const float *, const bf16_t *, int, int, int, int);
+    float *, const float *, const bf16_t *, int, int, int, int, int);
 
 /* Batched per-head projection.  The activation and result are both
  * [batch, head, dim], while weights are independently row-major per head. */
@@ -262,7 +230,7 @@ __global__ void mfma_gate_up_swiglu(float *__restrict__ y,
                                     const float *__restrict__ x,
                                     const bf16_t *__restrict__ gate,
                                     const bf16_t *__restrict__ up,
-                                    int rows, int d_out, int n_in) {
+                                    int rows, int d_out, int n_in, int w8) {
     __shared__ bf16_t sx[MFMA_M][MFMA_LDS_K];
     __shared__ bf16_t sg[MFMA_N][MFMA_LDS_K];
     __shared__ bf16_t su[MFMA_N][MFMA_LDS_K];
@@ -290,14 +258,8 @@ __global__ void mfma_gate_up_swiglu(float *__restrict__ y,
              i += (int)blockDim.x) {
             const int c = i / (MFMA_K / 8);
             const int k = (i % (MFMA_K / 8)) * 8;
-            const int gc = col0 + c;
-            bf16x8 gv = {}, uv = {};
-            if (gc < d_out && bk + k + 8 <= n_in) {
-                gv = *reinterpret_cast<const bf16x8 *>(
-                    gate + (size_t)gc * n_in + bk + k);
-                uv = *reinterpret_cast<const bf16x8 *>(
-                    up + (size_t)gc * n_in + bk + k);
-            }
+            bf16x8 gv = load_weight_x8(gate, col0 + c, d_out, bk, k, n_in, w8);
+            bf16x8 uv = load_weight_x8(up, col0 + c, d_out, bk, k, n_in, w8);
             *reinterpret_cast<bf16x8 *>(&sg[c][k]) = gv;
             *reinterpret_cast<bf16x8 *>(&su[c][k]) = uv;
         }
@@ -322,6 +284,8 @@ __global__ void mfma_gate_up_swiglu(float *__restrict__ y,
     }
 
     if (col < d_out) {
+        const float gate_s = w8_scale(gate, d_out, n_in, col, w8);
+        const float up_s = w8_scale(up, d_out, n_in, col, w8);
 #pragma unroll
         for (int mt = 0; mt < MFMA_M / 16; ++mt) {
             const int r0 = row0 + mt * 16 + 4 * (lane >> 4);
@@ -329,9 +293,9 @@ __global__ void mfma_gate_up_swiglu(float *__restrict__ y,
             for (int q = 0; q < 4; ++q) {
                 const int r = r0 + q;
                 if (r < rows) {
-                    const float gv = gate_acc[mt][q];
+                    const float gv = gate_acc[mt][q] * gate_s;
                     y[(size_t)r * d_out + col] =
-                        (gv / (1.0f + expf(-gv))) * up_acc[mt][q];
+                        (gv / (1.0f + expf(-gv))) * (up_acc[mt][q] * up_s);
                 }
             }
         }
@@ -342,7 +306,7 @@ template <int M_TILES>
 __global__ void mfma_gate_up_swiglu_rows(
     float *__restrict__ y, const float *__restrict__ x,
     const bf16_t *__restrict__ gate, const bf16_t *__restrict__ up,
-    int rows, int d_out, int n_in) {
+    int rows, int d_out, int n_in, int w8) {
     constexpr int BLOCK_M = MFMA_M * M_TILES;
     __shared__ bf16_t sx[BLOCK_M][MFMA_LDS_K];
     __shared__ bf16_t sg[MFMA_N][MFMA_LDS_K];
@@ -370,14 +334,8 @@ __global__ void mfma_gate_up_swiglu_rows(
              i += (int)blockDim.x) {
             const int c = i / (MFMA_K / 8);
             const int k = (i % (MFMA_K / 8)) * 8;
-            const int gc = col0 + c;
-            bf16x8 gv = {}, uv = {};
-            if (gc < d_out && bk + k + 8 <= n_in) {
-                gv = *reinterpret_cast<const bf16x8 *>(
-                    gate + (size_t)gc * n_in + bk + k);
-                uv = *reinterpret_cast<const bf16x8 *>(
-                    up + (size_t)gc * n_in + bk + k);
-            }
+            bf16x8 gv = load_weight_x8(gate, col0 + c, d_out, bk, k, n_in, w8);
+            bf16x8 uv = load_weight_x8(up, col0 + c, d_out, bk, k, n_in, w8);
             *reinterpret_cast<bf16x8 *>(&sg[c][k]) = gv;
             *reinterpret_cast<bf16x8 *>(&su[c][k]) = uv;
         }
@@ -402,6 +360,8 @@ __global__ void mfma_gate_up_swiglu_rows(
     }
 
     if (col < d_out) {
+        const float gate_s = w8_scale(gate, d_out, n_in, col, w8);
+        const float up_s = w8_scale(up, d_out, n_in, col, w8);
 #pragma unroll
         for (int mt = 0; mt < M_TILES; ++mt) {
             const int r0 = row0 + mt * MFMA_M + 4 * (lane >> 4);
@@ -409,9 +369,9 @@ __global__ void mfma_gate_up_swiglu_rows(
             for (int q = 0; q < 4; ++q) {
                 const int r = r0 + q;
                 if (r < rows) {
-                    const float gv = gate_acc[mt][q];
+                    const float gv = gate_acc[mt][q] * gate_s;
                     y[(size_t)r * d_out + col] =
-                        (gv / (1.0f + expf(-gv))) * up_acc[mt][q];
+                        (gv / (1.0f + expf(-gv))) * (up_acc[mt][q] * up_s);
                 }
             }
         }
@@ -419,7 +379,7 @@ __global__ void mfma_gate_up_swiglu_rows(
 }
 
 template __global__ void mfma_gate_up_swiglu_rows<2>(
-    float *, const float *, const bf16_t *, const bf16_t *, int, int, int);
+    float *, const float *, const bf16_t *, const bf16_t *, int, int, int, int);
 
 __global__ void swiglu(float *y, const float *gate, const float *up, int n) {
     const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
@@ -491,7 +451,7 @@ __global__ void grouped_expert_gate_up(
     const int *__restrict__ sorted_ids,
     const int *__restrict__ expert_ids,
     float *__restrict__ inter, bf16_t *__restrict__ inter_bf16,
-    int routes, int hidden, int inter_dim, int top_k, int n_tiles) {
+    int routes, int hidden, int inter_dim, int top_k, int n_tiles, int w8) {
     __shared__ bf16_t sa[BLOCK_M][MFMA_LDS_K];
     __shared__ bf16_t sg[MFMA_N][MFMA_LDS_K];
     __shared__ bf16_t su[MFMA_N][MFMA_LDS_K];
@@ -522,14 +482,8 @@ __global__ void grouped_expert_gate_up(
              i += (int)blockDim.x) {
             const int c = i / (MFMA_K / 8);
             const int k = (i % (MFMA_K / 8)) * 8;
-            const int gc = ntile * MFMA_N + c;
-            bf16x8 gv = {}, uv = {};
-            if (gc < inter_dim && bk + k + 8 <= hidden) {
-                gv = *reinterpret_cast<const bf16x8 *>(
-                    wg + (size_t)gc * hidden + bk + k);
-                uv = *reinterpret_cast<const bf16x8 *>(
-                    wu + (size_t)gc * hidden + bk + k);
-            }
+            bf16x8 gv = load_weight_x8(wg, ntile * MFMA_N + c, inter_dim, bk, k, hidden, w8);
+            bf16x8 uv = load_weight_x8(wu, ntile * MFMA_N + c, inter_dim, bk, k, hidden, w8);
             *reinterpret_cast<bf16x8 *>(&sg[c][k]) = gv;
             *reinterpret_cast<bf16x8 *>(&su[c][k]) = uv;
         }
@@ -554,6 +508,8 @@ __global__ void grouped_expert_gate_up(
     }
 
     if (col < inter_dim) {
+        const float gate_s = w8_scale(wg, inter_dim, hidden, col, w8);
+        const float up_s = w8_scale(wu, inter_dim, hidden, col, w8);
 #pragma unroll
         for (int mt = 0; mt < M_TILES; ++mt) {
             const int r0 = mt * 16 + 4 * (lane >> 4);
@@ -561,9 +517,9 @@ __global__ void grouped_expert_gate_up(
             for (int q = 0; q < 4; ++q) {
                 const int route = sorted_ids[mblock * BLOCK_M + r0 + q];
                 if (route < routes) {
-                    const float gv = gate[mt][q];
+                    const float gv = gate[mt][q] * gate_s;
                     const float value =
-                        (gv / (1.0f + expf(-gv))) * up[mt][q];
+                        (gv / (1.0f + expf(-gv))) * (up[mt][q] * up_s);
                     if (inter_bf16)
                         inter_bf16[(size_t)route * inter_dim + col] =
                             gpu_f32_to_bf16(value);
@@ -584,7 +540,7 @@ __global__ void grouped_expert_down(
     const int *__restrict__ sorted_ids,
     const int *__restrict__ expert_ids,
     float *__restrict__ route_out, int routes, int hidden, int inter_dim,
-    int n_tiles) {
+    int n_tiles, int w8) {
     __shared__ bf16_t sa[BLOCK_M][MFMA_LDS_K];
     __shared__ bf16_t sw[MFMA_N][MFMA_LDS_K];
     const int mblock = (int)blockIdx.x / n_tiles;
@@ -616,11 +572,7 @@ __global__ void grouped_expert_down(
              i += (int)blockDim.x) {
             const int c = i / (MFMA_K / 8);
             const int k = (i % (MFMA_K / 8)) * 8;
-            const int gc = ntile * MFMA_N + c;
-            bf16x8 value = {};
-            if (gc < hidden && bk + k + 8 <= inter_dim)
-                value = *reinterpret_cast<const bf16x8 *>(
-                    wd + (size_t)gc * inter_dim + bk + k);
+            bf16x8 value = load_weight_x8(wd, ntile * MFMA_N + c, hidden, bk, k, inter_dim, w8);
             *reinterpret_cast<bf16x8 *>(&sw[c][k]) = value;
         }
         __syncthreads();
@@ -640,6 +592,7 @@ __global__ void grouped_expert_down(
     }
 
     if (col < hidden) {
+        const float scale = w8_scale(wd, hidden, inter_dim, col, w8);
 #pragma unroll
         for (int mt = 0; mt < M_TILES; ++mt) {
             const int r0 = mt * 16 + 4 * (lane >> 4);
@@ -647,7 +600,7 @@ __global__ void grouped_expert_down(
             for (int q = 0; q < 4; ++q) {
                 const int route = sorted_ids[mblock * BLOCK_M + r0 + q];
                 if (route < routes)
-                    route_out[(size_t)route * hidden + col] = acc[mt][q];
+                    route_out[(size_t)route * hidden + col] = acc[mt][q] * scale;
             }
         }
     }
@@ -670,10 +623,10 @@ __global__ void reduce_routes_add(float *x, const float *route_out,
 
 template __global__ void grouped_expert_gate_up<16, 1>(
     const float *, const char *, const size_t *, const size_t *, const int *,
-    const int *, float *, bf16_t *, int, int, int, int, int);
+    const int *, float *, bf16_t *, int, int, int, int, int, int);
 template __global__ void grouped_expert_down<16, 1>(
     const float *, const bf16_t *, const char *, const size_t *, const int *,
-    const int *, float *, int, int, int, int);
+    const int *, float *, int, int, int, int, int);
 
 __global__ void embedding(float *x, const bf16_t *table, const int *tokens,
                           int *generated, int generated_stride, int output_index,
@@ -708,23 +661,23 @@ __global__ void rmsnorm(float *y, const float *x, const bf16_t *w,
 }
 
 __global__ void gemv(float *y, const float *x, const bf16_t *w,
-                     int d_out, int n_in, int batch, int add) {
+                     int d_out, int n_in, int batch, int add, int w8) {
     int wave = (int)threadIdx.x / HIP_WAVE;
     int lane = (int)threadIdx.x & (HIP_WAVE - 1);
     int row = (int)blockIdx.x * WAVES + wave;
     int b0 = (int)blockIdx.y * BATCH_TILE;
     if (row >= d_out || b0 >= batch) return;
     float sums[BATCH_TILE] = {};
-    const bf16_t *wr = w + (size_t)row * n_in;
+    const float scale = w8_scale(w, d_out, n_in, row, w8);
     for (int i = lane; i < n_in; i += HIP_WAVE) {
-        float wi = gpu_bf16_to_f32(wr[i]);
+        float wi = load_weight_f32(w, (size_t)row * n_in + i, w8);
 #pragma unroll
         for (int j = 0; j < BATCH_TILE; ++j)
             if (b0 + j < batch) sums[j] += x[(size_t)(b0 + j) * n_in + i] * wi;
     }
 #pragma unroll
     for (int j = 0; j < BATCH_TILE; ++j) {
-        sums[j] = wave_sum(sums[j]);
+        sums[j] = wave_sum(sums[j]) * scale;
         if (lane == 0 && b0 + j < batch) {
             float *dst = y + (size_t)(b0 + j) * d_out + row;
             if (add) *dst += sums[j]; else *dst = sums[j];
@@ -734,7 +687,7 @@ __global__ void gemv(float *y, const float *x, const bf16_t *w,
 
 __global__ void dual_gemv(float *y0, const bf16_t *w0, int d_out0,
                           float *y1, const bf16_t *w1, int d_out1,
-                          const float *x, int n_in, int batch) {
+                          const float *x, int n_in, int batch, int w8) {
     int wave = (int)threadIdx.x / HIP_WAVE;
     int lane = (int)threadIdx.x & (HIP_WAVE - 1);
     int row = (int)blockIdx.x * WAVES + wave;
@@ -744,17 +697,18 @@ __global__ void dual_gemv(float *y0, const bf16_t *w0, int d_out0,
     bool first = row < d_out0;
     int local = first ? row : row - d_out0;
     int d_out = first ? d_out0 : d_out1;
-    const bf16_t *wr = (first ? w0 : w1) + (size_t)local * n_in;
+    const bf16_t *w = first ? w0 : w1;
+    const float scale = w8_scale(w, d_out, n_in, local, w8);
     float sums[BATCH_TILE] = {};
     for (int i = lane; i < n_in; i += HIP_WAVE) {
-        float wi = gpu_bf16_to_f32(wr[i]);
+        float wi = load_weight_f32(w, (size_t)local * n_in + i, w8);
 #pragma unroll
         for (int j = 0; j < BATCH_TILE; ++j)
             if (b0 + j < batch) sums[j] += x[(size_t)(b0 + j) * n_in + i] * wi;
     }
 #pragma unroll
     for (int j = 0; j < BATCH_TILE; ++j) {
-        sums[j] = wave_sum(sums[j]);
+        sums[j] = wave_sum(sums[j]) * scale;
         if (lane == 0 && b0 + j < batch) {
             float *base = first ? y0 : y1;
             base[(size_t)(b0 + j) * d_out + local] = sums[j];
@@ -763,17 +717,18 @@ __global__ void dual_gemv(float *y0, const bf16_t *w0, int d_out0,
 }
 
 __global__ void gate_up_swiglu(float *y, const float *x, const bf16_t *gate,
-                               const bf16_t *up, int d_out, int n_in, int batch) {
+                               const bf16_t *up, int d_out, int n_in, int batch, int w8) {
     int wave = (int)threadIdx.x / HIP_WAVE;
     int lane = (int)threadIdx.x & (HIP_WAVE - 1);
     int row = (int)blockIdx.x * WAVES + wave;
     int b0 = (int)blockIdx.y * BATCH_TILE;
     if (row >= d_out || b0 >= batch) return;
-    const bf16_t *gr = gate + (size_t)row * n_in;
-    const bf16_t *ur = up + (size_t)row * n_in;
+    const float gate_s = w8_scale(gate, d_out, n_in, row, w8);
+    const float up_s = w8_scale(up, d_out, n_in, row, w8);
     float gs[BATCH_TILE] = {}, us[BATCH_TILE] = {};
     for (int i = lane; i < n_in; i += HIP_WAVE) {
-        float gw = gpu_bf16_to_f32(gr[i]), uw = gpu_bf16_to_f32(ur[i]);
+        float gw = load_weight_f32(gate, (size_t)row * n_in + i, w8);
+        float uw = load_weight_f32(up, (size_t)row * n_in + i, w8);
 #pragma unroll
         for (int j = 0; j < BATCH_TILE; ++j) if (b0 + j < batch) {
             float xv = x[(size_t)(b0 + j) * n_in + i];
@@ -782,7 +737,8 @@ __global__ void gate_up_swiglu(float *y, const float *x, const bf16_t *gate,
     }
 #pragma unroll
     for (int j = 0; j < BATCH_TILE; ++j) {
-        gs[j] = wave_sum(gs[j]); us[j] = wave_sum(us[j]);
+        gs[j] = wave_sum(gs[j]) * gate_s;
+        us[j] = wave_sum(us[j]) * up_s;
         if (lane == 0 && b0 + j < batch)
             y[(size_t)(b0 + j) * d_out + row] =
                 (gs[j] / (1.0f + expf(-gs[j]))) * us[j];
@@ -980,40 +936,47 @@ __global__ void routed_shared_gate_up(float *routed, float *shared, const float 
                                       const size_t *up_offsets, const int *topk,
                                       const bf16_t *shared_gate, const bf16_t *shared_up,
                                       int batch, int top_k, int inter, int shared_inter,
-                                      int input_dim) {
+                                      int input_dim, int w8) {
     int wave=(int)threadIdx.x/HIP_WAVE,lane=(int)threadIdx.x&(HIP_WAVE-1);
     int row=(int)blockIdx.x*WAVES+wave,b=(int)blockIdx.y;
     int routed_rows=top_k*inter,total=routed_rows+shared_inter;
     if(row>=total||b>=batch)return;
-    const bf16_t *gate,*up;float *dst;int j;
+    const bf16_t *gate,*up;float *dst;int j;int out_rows;
     if(row<routed_rows){int slot=row/inter;j=row-slot*inter;int e=topk[(size_t)b*top_k+slot];
         gate=(const bf16_t*)(pool+gate_offsets[e]);up=(const bf16_t*)(pool+up_offsets[e]);
-        dst=routed+((size_t)b*top_k+slot)*inter;}
-    else{j=row-routed_rows;gate=shared_gate;up=shared_up;dst=shared+(size_t)b*shared_inter;}
-    const bf16_t *gr=gate+(size_t)j*input_dim,*ur=up+(size_t)j*input_dim;
+        dst=routed+((size_t)b*top_k+slot)*inter;out_rows=inter;}
+    else{j=row-routed_rows;gate=shared_gate;up=shared_up;dst=shared+(size_t)b*shared_inter;out_rows=shared_inter;}
     const float *xb=x+(size_t)b*input_dim;float gs=0.0f,us=0.0f;
-    for(int i=lane;i<input_dim;i+=HIP_WAVE){float xv=xb[i];gs+=xv*gpu_bf16_to_f32(gr[i]);us+=xv*gpu_bf16_to_f32(ur[i]);}
-    gs=wave_sum(gs);us=wave_sum(us);if(lane==0)dst[j]=(gs/(1.0f+expf(-gs)))*us;
+    for(int i=lane;i<input_dim;i+=HIP_WAVE){
+        float xv=xb[i];
+        gs+=xv*load_weight_f32(gate,(size_t)j*input_dim+i,w8);
+        us+=xv*load_weight_f32(up,(size_t)j*input_dim+i,w8);
+    }
+    gs=wave_sum(gs)*w8_scale(gate,out_rows,input_dim,j,w8);
+    us=wave_sum(us)*w8_scale(up,out_rows,input_dim,j,w8);
+    if(lane==0)dst[j]=(gs/(1.0f+expf(-gs)))*us;
 }
 
 __global__ void routed_shared_down(float *out, const float *routed, const float *shared,
                                    const char *pool, const size_t *down_offsets,
                                    const int *topk, const float *topk_weights,
                                    const bf16_t *shared_down, int batch, int top_k,
-                                   int hidden, int inter, int shared_inter) {
+                                   int hidden, int inter, int shared_inter, int w8) {
     int wave=(int)threadIdx.x/HIP_WAVE,lane=(int)threadIdx.x&(HIP_WAVE-1);
     int d=(int)blockIdx.x*WAVES+wave,b=(int)blockIdx.y;
     if(d>=hidden||b>=batch)return;float total=0.0f;
     for(int slot=0;slot<top_k;++slot){int e=topk[(size_t)b*top_k+slot];
-        const bf16_t *wr=(const bf16_t*)(pool+down_offsets[e])+(size_t)d*inter;
+        const bf16_t *wd=(const bf16_t*)(pool+down_offsets[e]);
         const float *hp=routed+((size_t)b*top_k+slot)*inter;float sum=0.0f;
-        for(int j=lane;j<inter;j+=HIP_WAVE)sum+=hp[j]*gpu_bf16_to_f32(wr[j]);
-        sum=wave_sum(sum);if(lane==0)total+=topk_weights[(size_t)b*top_k+slot]*sum;}
+        for(int j=lane;j<inter;j+=HIP_WAVE)sum+=hp[j]*load_weight_f32(wd,(size_t)d*inter+j,w8);
+        sum=wave_sum(sum)*w8_scale(wd,hidden,inter,d,w8);
+        if(lane==0)total+=topk_weights[(size_t)b*top_k+slot]*sum;}
     float ss=0.0f;
-    if(shared_inter>0){const bf16_t *swr=shared_down+(size_t)d*shared_inter;
+    if(shared_inter>0){
         const float *sh=shared+(size_t)b*shared_inter;
-        for(int j=lane;j<shared_inter;j+=HIP_WAVE)ss+=sh[j]*gpu_bf16_to_f32(swr[j]);
-        ss=wave_sum(ss);}
+        for(int j=lane;j<shared_inter;j+=HIP_WAVE)
+            ss+=sh[j]*load_weight_f32(shared_down,(size_t)d*shared_inter+j,w8);
+        ss=wave_sum(ss)*w8_scale(shared_down,hidden,shared_inter,d,w8);}
     if(lane==0)out[(size_t)b*hidden+d]+=total+ss;
 }
 

@@ -25,11 +25,11 @@ namespace prefill_kernels {
     __global__ void embedding(float *, const bf16_t *, const int *, int *,
                               int, int, int, int);
     __global__ void rmsnorm(float *, const float *, const bf16_t *, int, int, float);
-    __global__ void gemv(float *, const float *, const bf16_t *, int, int, int, int);
+    __global__ void gemv(float *, const float *, const bf16_t *, int, int, int, int, int);
     __global__ void dual_gemv(float *, const bf16_t *, int, float *, const bf16_t *,
-                              int, const float *, int, int);
+                              int, const float *, int, int, int);
     __global__ void gate_up_swiglu(float *, const float *, const bf16_t *,
-                                   const bf16_t *, int, int, int);
+                                   const bf16_t *, int, int, int, int);
     __global__ void kv_norm_rope(
         bf16_t *, const float *, const bf16_t *, const int *, const int *,
         int, int, int, int, int, int, const float *, int, float);
@@ -45,33 +45,33 @@ namespace prefill_kernels {
     __global__ void routed_shared_gate_up(float *, float *, const float *,
                                           const char *, const size_t *, const size_t *,
                                           const int *, const bf16_t *, const bf16_t *,
-                                          int, int, int, int, int);
+                                          int, int, int, int, int, int);
     __global__ void routed_shared_down(float *, const float *, const float *,
                                        const char *, const size_t *, const int *,
                                        const float *, const bf16_t *, int, int, int,
-                                       int, int);
+                                       int, int, int);
     __global__ void argmax(const float *, int, int *, int);
     __global__ void mfma_gemm(float *, const float *, const bf16_t *,
-                              int, int, int, int);
+                              int, int, int, int, int);
     template <int M_TILES>
     __global__ void mfma_gemm_rows(float *, const float *, const bf16_t *,
-                                   int, int, int, int);
+                                   int, int, int, int, int);
     __global__ void mfma_head_gemm(float *, const float *, const bf16_t *,
                                    int, int, int, int, int, int, size_t);
     __global__ void mfma_gate_up_swiglu(float *, const float *, const bf16_t *,
-                                        const bf16_t *, int, int, int);
+                                        const bf16_t *, int, int, int, int);
     template <int M_TILES>
     __global__ void mfma_gate_up_swiglu_rows(
-        float *, const float *, const bf16_t *, const bf16_t *, int, int, int);
+        float *, const float *, const bf16_t *, const bf16_t *, int, int, int, int);
     __global__ void align_routes(const int *, int, int, int, int *, int *, int *);
     template <int BLOCK_M, int M_TILES>
     __global__ void grouped_expert_gate_up(
         const float *, const char *, const size_t *, const size_t *,
-        const int *, const int *, float *, bf16_t *, int, int, int, int, int);
+        const int *, const int *, float *, bf16_t *, int, int, int, int, int, int);
     template <int BLOCK_M, int M_TILES>
     __global__ void grouped_expert_down(
         const float *, const bf16_t *, const char *, const size_t *,
-        const int *, const int *, float *, int, int, int, int);
+        const int *, const int *, float *, int, int, int, int, int);
     __global__ void reduce_routes_add(float *, const float *, const float *,
                                       int, int, int);
     template <int THREADS>
@@ -87,11 +87,11 @@ namespace batch_decode_kernels {
         __global__ void embedding(float *, const bf16_t *, const int *, int *,
                                   int, int, int, int);
         __global__ void rmsnorm(float *, const float *, const bf16_t *, int, int, float);
-        __global__ void gemv(float *, const float *, const bf16_t *, int, int, int, int);
+        __global__ void gemv(float *, const float *, const bf16_t *, int, int, int, int, int);
         __global__ void dual_gemv(float *, const bf16_t *, int, float *, const bf16_t *,
-                                  int, const float *, int, int);
+                                  int, const float *, int, int, int);
         __global__ void gate_up_swiglu(float *, const float *, const bf16_t *,
-                                       const bf16_t *, int, int, int);
+                                       const bf16_t *, int, int, int, int);
         __global__ void kv_norm_rope(
             bf16_t *, const float *, const bf16_t *, const int *, int, int,
             int, int, int, const float *, int, float);
@@ -114,30 +114,30 @@ namespace batch_decode_kernels {
         __global__ void value_up(
             float *, const float *, const bf16_t *, int, int, int, int, size_t);
         __global__ void mfma_gemm(
-            float *, const float *, const bf16_t *, int, int, int, int);
+            float *, const float *, const bf16_t *, int, int, int, int, int);
         __global__ void mfma_head_gemm(float *, const float *, const bf16_t *,
                                        int, int, int, int, int, int, size_t);
         __global__ void mfma_gate_up_swiglu(float *, const float *, const bf16_t *,
-                                            const bf16_t *, int, int, int);
+                                            const bf16_t *, int, int, int, int);
         __global__ void align_routes(const int *, int, int, int, int *, int *, int *);
         template <int BLOCK_M, int M_TILES>
         __global__ void grouped_expert_gate_up(
             const float *, const char *, const size_t *, const size_t *,
-            const int *, const int *, float *, bf16_t *, int, int, int, int, int);
+            const int *, const int *, float *, bf16_t *, int, int, int, int, int, int);
         template <int BLOCK_M, int M_TILES>
         __global__ void grouped_expert_down(
             const float *, const bf16_t *, const char *, const size_t *,
-            const int *, const int *, float *, int, int, int, int);
+            const int *, const int *, float *, int, int, int, int, int);
         __global__ void reduce_routes_add(float *, const float *, const float *,
                                           int, int, int);
         __global__ void routed_shared_gate_up(float *, float *, const float *,
                                               const char *, const size_t *, const size_t *,
                                               const int *, const bf16_t *, const bf16_t *,
-                                              int, int, int, int, int);
+                                              int, int, int, int, int, int);
         __global__ void routed_shared_down(float *, const float *, const float *,
                                            const char *, const size_t *, const int *,
                                            const float *, const bf16_t *, int, int, int,
-                                           int, int);
+                                           int, int, int);
         template <int THREADS>
         __global__ void softmax_rows(float *, int, int, int, int);
         __global__ void argmax(const float *, int, int *, int);
@@ -187,7 +187,9 @@ static int g_decode_token_budget = kDefaultBatchSize;
 static int g_mfma_threshold = kDefaultMfmaThreshold;
 static int g_flash_threshold = kDefaultFlashThreshold;
 static int g_prompt_token_cap = 0;
+static int g_w8 = 0;
 static bool g_prefill_large_m = true;
+static std::vector<std::vector<char>> g_quant_host;
 
 struct DecodeGraph {
     hipGraphExec_t exec = nullptr;
@@ -279,12 +281,67 @@ static size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+static int configured_quant_w8() {
+    const char *text = std::getenv("GETP_QUANT");
+    if (!text || !*text) return 0;
+    if (!std::strcmp(text, "w8a16") || !std::strcmp(text, "a8w16") ||
+        !std::strcmp(text, "w8"))
+        return 1;
+    if (!std::strcmp(text, "bf16") || !std::strcmp(text, "none") ||
+        !std::strcmp(text, "w16a16"))
+        return 0;
+    if (!std::strcmp(text, "w8a8") || !std::strcmp(text, "a8w8")) {
+        std::fprintf(stderr,
+            "GETP_QUANT=%s is not implemented; use w8a16 (int8 weights, "
+            "bf16/fp32 activations). On gfx90a INT8 MFMA peak equals BF16, so "
+            "weight-only int8 is the bandwidth path.\n", text);
+        std::exit(EXIT_FAILURE);
+    }
+    std::fprintf(stderr,
+        "GETP_QUANT must be bf16 or w8a16 (got '%s')\n", text);
+    std::exit(EXIT_FAILURE);
+}
+
+static void pack_w8_matrix(const bf16_t *src, int rows, int cols,
+                           std::vector<char> &dst) {
+    const size_t qbytes = (size_t)rows * (size_t)cols;
+    const size_t aligned = align_up(qbytes, kDeviceAlignment);
+    dst.assign(aligned + (size_t)rows * sizeof(float), 0);
+    int8_t *q = reinterpret_cast<int8_t *>(dst.data());
+    float *scale = reinterpret_cast<float *>(dst.data() + aligned);
+    for (int r = 0; r < rows; ++r) {
+        const bf16_t *row = src + (size_t)r * cols;
+        float amax = 0.0f;
+        for (int c = 0; c < cols; ++c)
+            amax = std::max(amax, fabsf(bf16_to_f32(row[c])));
+        const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+        scale[r] = s;
+        const float inv = 1.0f / s;
+        for (int c = 0; c < cols; ++c) {
+            int v = (int)lrintf(bf16_to_f32(row[c]) * inv);
+            if (v > 127) v = 127;
+            if (v < -127) v = -127;
+            q[(size_t)r * cols + c] = (int8_t)v;
+        }
+    }
+}
+
 static size_t add_chunk(LayerLayout &layout, const void *host, size_t bytes) {
     layout.bytes = align_up(layout.bytes, kDeviceAlignment);
     size_t offset = layout.bytes;
     layout.chunks.push_back({host, offset, bytes});
     layout.bytes += bytes;
     return offset;
+}
+
+static size_t add_gemm_weight(LayerLayout &layout, const bf16_t *host,
+                              int rows, int cols) {
+    if (!g_w8)
+        return add_chunk(layout, host, (size_t)rows * cols * sizeof(bf16_t));
+    g_quant_host.emplace_back();
+    pack_w8_matrix(host, rows, cols, g_quant_host.back());
+    return add_chunk(layout, g_quant_host.back().data(),
+                     g_quant_host.back().size());
 }
 
 static LayerLayout make_layer_layout(const Transformer *t, int l,
@@ -300,44 +357,41 @@ static LayerLayout make_layer_layout(const Transformer *t, int l,
     auto bfbytes = [](size_t n) { return n * sizeof(bf16_t); };
 
     if (c.q_lora_rank > 0) {
-        a.q_a_proj = add_chunk(a, w.q_a_proj[l], bfbytes((size_t)c.q_lora_rank * H));
-        a.q_b_proj = add_chunk(a, w.q_b_proj[l], bfbytes((size_t)QD * c.q_lora_rank));
+        a.q_a_proj = add_gemm_weight(a, w.q_a_proj[l], c.q_lora_rank, H);
+        a.q_b_proj = add_gemm_weight(a, w.q_b_proj[l], QD, c.q_lora_rank);
         a.q_a_norm = add_chunk(a, w.q_a_layernorm[l], bfbytes(c.q_lora_rank));
     } else {
-        a.q_proj = add_chunk(a, w.q_proj[l], bfbytes((size_t)QD * H));
+        a.q_proj = add_gemm_weight(a, w.q_proj[l], QD, H);
     }
-    a.kv_a_proj = add_chunk(a, w.kv_a_proj[l], bfbytes((size_t)KVD * H));
+    a.kv_a_proj = add_gemm_weight(a, w.kv_a_proj[l], KVD, H);
     size_t kv_b_elems = (size_t)c.n_heads * (c.qk_nope_head_dim + c.v_head_dim) * c.kv_lora_rank;
     a.kv_b_proj = add_chunk(a, w.W_UK[l], bfbytes(kv_b_elems));
     size_t wuk_elems = (size_t)c.n_heads * c.kv_lora_rank * c.qk_nope_head_dim;
     a.wuk_t = add_chunk(a, wuk_t, bfbytes(wuk_elems));
-    a.o_proj = add_chunk(a, w.o_proj[l], bfbytes((size_t)H * AOUT));
+    a.o_proj = add_gemm_weight(a, w.o_proj[l], H, AOUT);
     a.input_norm = add_chunk(a, w.input_layernorm[l], bfbytes(H));
     a.post_norm = add_chunk(a, w.post_attn_norm[l], bfbytes(H));
     a.kv_a_norm = add_chunk(a, w.kv_a_layernorm[l], bfbytes(c.kv_lora_rank));
 
     if (l < c.first_k_dense) {
-        size_t ih = (size_t)c.dense_inter_size * H;
-        a.dense_gate = add_chunk(a, w.dense_gate[l], bfbytes(ih));
-        a.dense_up = add_chunk(a, w.dense_up[l], bfbytes(ih));
-        a.dense_down = add_chunk(a, w.dense_down[l], bfbytes(ih));
+        a.dense_gate = add_gemm_weight(a, w.dense_gate[l], c.dense_inter_size, H);
+        a.dense_up = add_gemm_weight(a, w.dense_up[l], c.dense_inter_size, H);
+        a.dense_down = add_gemm_weight(a, w.dense_down[l], H, c.dense_inter_size);
     } else {
-        a.moe_gate = add_chunk(a, w.moe_gate[l], bfbytes((size_t)c.n_routed_experts * H));
+        a.moe_gate = add_gemm_weight(a, w.moe_gate[l], c.n_routed_experts, H);
         if (w.moe_gate_bias[l])
             a.moe_bias = add_chunk(a, w.moe_gate_bias[l], (size_t)c.n_routed_experts * sizeof(float));
         int shared = c.n_shared_experts * c.moe_inter_size;
-        size_t sh = (size_t)shared * H;
-        a.shared_gate = add_chunk(a, w.shared_gate[l], bfbytes(sh));
-        a.shared_up = add_chunk(a, w.shared_up[l], bfbytes(sh));
-        a.shared_down = add_chunk(a, w.shared_down[l], bfbytes(sh));
+        a.shared_gate = add_gemm_weight(a, w.shared_gate[l], shared, H);
+        a.shared_up = add_gemm_weight(a, w.shared_up[l], shared, H);
+        a.shared_down = add_gemm_weight(a, w.shared_down[l], H, shared);
         a.expert_gate.resize(c.n_routed_experts);
         a.expert_up.resize(c.n_routed_experts);
         a.expert_down.resize(c.n_routed_experts);
-        size_t eh = (size_t)c.moe_inter_size * H;
         for (int e = 0; e < c.n_routed_experts; ++e) {
-            a.expert_gate[e] = add_chunk(a, w.expert_gate[l][e], bfbytes(eh));
-            a.expert_up[e] = add_chunk(a, w.expert_up[l][e], bfbytes(eh));
-            a.expert_down[e] = add_chunk(a, w.expert_down[l][e], bfbytes(eh));
+            a.expert_gate[e] = add_gemm_weight(a, w.expert_gate[l][e], c.moe_inter_size, H);
+            a.expert_up[e] = add_gemm_weight(a, w.expert_up[l][e], c.moe_inter_size, H);
+            a.expert_down[e] = add_gemm_weight(a, w.expert_down[l][e], H, c.moe_inter_size);
         }
     }
     a.bytes = align_up(a.bytes, kDeviceAlignment);
@@ -560,16 +614,16 @@ static void launch_gemv(float *y, const float *x, const bf16_t *w,
         if (g_prefill_large_m && batch >= kPrefillMmaThreshold)
             prefill_kernels::mfma_gemm_rows<kPrefillMmaRowTiles><<<
                 grid, 256, 0, g.stream>>>(
-                    y, x, w, batch, out, in, add ? 1 : 0);
+                    y, x, w, batch, out, in, add ? 1 : 0, g_w8);
         else
             prefill_kernels::mfma_gemm<<<grid, 256, 0, g.stream>>>(
-                y, x, w, batch, out, in, add ? 1 : 0);
+                y, x, w, batch, out, in, add ? 1 : 0, g_w8);
         HIP_LAUNCH_CHECK();
         return;
     }
     prefill_kernels::gemv<<<projection_grid(out, batch),
         kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-            y, x, w, out, in, batch, add ? 1 : 0);
+            y, x, w, out, in, batch, add ? 1 : 0, g_w8);
     HIP_LAUNCH_CHECK();
 }
 
@@ -585,7 +639,7 @@ static void launch_dual_gemv(
     }
     prefill_kernels::dual_gemv<<<projection_grid(out0 + out1, batch),
         kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-            y0, w0, out0, y1, w1, out1, x, in, batch);
+            y0, w0, out0, y1, w1, out1, x, in, batch, g_w8);
     HIP_LAUNCH_CHECK();
 }
 
@@ -601,17 +655,17 @@ static void launch_gate_up_swiglu(float *y, const float *x,
         if (g_prefill_large_m && batch >= kPrefillMmaThreshold)
             prefill_kernels::mfma_gate_up_swiglu_rows<
                 kPrefillMmaRowTiles><<<grid, 256, 0, g.stream>>>(
-                    y, x, gate, up, batch, out, in);
+                    y, x, gate, up, batch, out, in, g_w8);
         else
             prefill_kernels::mfma_gate_up_swiglu<<<
                 grid, 256, 0, g.stream>>>(
-                    y, x, gate, up, batch, out, in);
+                    y, x, gate, up, batch, out, in, g_w8);
         HIP_LAUNCH_CHECK();
         return;
     }
     prefill_kernels::gate_up_swiglu<<<projection_grid(out, batch),
         kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-            y, x, gate, up, out, in, batch);
+            y, x, gate, up, out, in, batch, g_w8);
     HIP_LAUNCH_CHECK();
 }
 
@@ -686,7 +740,7 @@ static void gpu_ffn(
             max_blocks * up_tiles, 256, 0, g.stream>>>(
                 xn, d.pool, d.expert_gate_offsets, d.expert_up_offsets,
                 sorted_ids, expert_ids, routed_hidden, routed_hidden_bf16,
-                routes, H, inter, K, up_tiles);
+                routes, H, inter, K, up_tiles, g_w8);
         HIP_LAUNCH_CHECK();
     } else {
         dim3 gate_grid((unsigned)div_up(output_rows, rows_per_block),
@@ -695,7 +749,7 @@ static void gpu_ffn(
             kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 routed_hidden, hb, xn, d.pool,
                 d.expert_gate_offsets, d.expert_up_offsets, topk,
-                d.shared_gate, d.shared_up, rows, K, inter, 0, H);
+                d.shared_gate, d.shared_up, rows, K, inter, 0, H, g_w8);
         HIP_LAUNCH_CHECK();
     }
     launch_gate_up_swiglu(hb, xn, d.shared_gate, d.shared_up,
@@ -708,7 +762,7 @@ static void gpu_ffn(
                 routed_hidden, routed_hidden_bf16, d.pool,
                 d.expert_down_offsets,
                 sorted_ids, expert_ids, route_out,
-                routes, H, inter, down_tiles);
+                routes, H, inter, down_tiles, g_w8);
         HIP_LAUNCH_CHECK();
         prefill_kernels::reduce_routes_add<<<
             rows, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
@@ -720,7 +774,7 @@ static void gpu_ffn(
         prefill_kernels::routed_shared_down<<<down_grid,
             kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 x, routed_hidden, hb, d.pool, d.expert_down_offsets,
-                topk, topk_weights, d.shared_down, rows, K, H, inter, 0);
+                topk, topk_weights, d.shared_down, rows, K, H, inter, 0, g_w8);
         HIP_LAUNCH_CHECK();
     }
     launch_gemv(x, hb, d.shared_down, H, shared, rows, true);
@@ -937,13 +991,13 @@ static void launch_gemv(float *y, const float *x, const bf16_t *w,
         dim3 grid((unsigned)div_up(out, kMmaTileSize),
                   (unsigned)div_up(batch, kMmaBatchTile));
         batch_decode_kernels::decode::mfma_gemm<<<grid, 256, 0, g.stream>>>(
-            y, x, w, batch, out, in, add ? 1 : 0);
+            y, x, w, batch, out, in, add ? 1 : 0, g_w8);
         HIP_LAUNCH_CHECK();
         return;
     }
     batch_decode_kernels::decode::gemv<<<projection_grid(out, batch),
         kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-            y, x, w, out, in, batch, add ? 1 : 0);
+            y, x, w, out, in, batch, add ? 1 : 0, g_w8);
     HIP_LAUNCH_CHECK();
 }
 
@@ -959,7 +1013,7 @@ static void launch_dual_gemv(
     }
     batch_decode_kernels::decode::dual_gemv<<<projection_grid(out0 + out1, batch),
         kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-            y0, w0, out0, y1, w1, out1, x, in, batch);
+            y0, w0, out0, y1, w1, out1, x, in, batch, g_w8);
     HIP_LAUNCH_CHECK();
 }
 
@@ -972,13 +1026,13 @@ static void launch_gate_up_swiglu(float *y, const float *x,
                   (unsigned)div_up(batch, kMmaBatchTile));
         batch_decode_kernels::decode::mfma_gate_up_swiglu<<<
             grid, 256, 0, g.stream>>>(
-                y, x, gate, up, batch, out, in);
+                y, x, gate, up, batch, out, in, g_w8);
         HIP_LAUNCH_CHECK();
         return;
     }
     batch_decode_kernels::decode::gate_up_swiglu<<<projection_grid(out, batch),
         kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
-            y, x, gate, up, out, in, batch);
+            y, x, gate, up, out, in, batch, g_w8);
     HIP_LAUNCH_CHECK();
 }
 
@@ -1020,7 +1074,7 @@ static void gpu_ffn(const Config &c, const DeviceLayer &d, int l, int batch)
             max_blocks * up_tiles, 256, 0, g.stream>>>(
                 g.xn, d.pool, d.expert_gate_offsets, d.expert_up_offsets,
                 g.prefill_topk, g.prefill_expert_counts, g.routed_hidden,
-                g.prefill_routed_hidden, routes, H, inter, K, up_tiles);
+                g.prefill_routed_hidden, routes, H, inter, K, up_tiles, g_w8);
         HIP_LAUNCH_CHECK();
     } else {
         dim3 gate_grid((unsigned)div_up(output_rows, rows_per_block),
@@ -1029,7 +1083,7 @@ static void gpu_ffn(const Config &c, const DeviceLayer &d, int l, int batch)
             kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 g.routed_hidden, g.hb, g.xn, d.pool,
                 d.expert_gate_offsets, d.expert_up_offsets, g.topk,
-                d.shared_gate, d.shared_up, batch, K, inter, 0, H);
+                d.shared_gate, d.shared_up, batch, K, inter, 0, H, g_w8);
         HIP_LAUNCH_CHECK();
     }
     launch_gate_up_swiglu(g.hb, g.xn, d.shared_gate, d.shared_up,
@@ -1042,7 +1096,7 @@ static void gpu_ffn(const Config &c, const DeviceLayer &d, int l, int batch)
                 g.routed_hidden, g.prefill_routed_hidden, d.pool,
                 d.expert_down_offsets, g.prefill_topk,
                 g.prefill_expert_counts, g.prefill_ffn,
-                routes, H, inter, down_tiles);
+                routes, H, inter, down_tiles, g_w8);
         HIP_LAUNCH_CHECK();
         batch_decode_kernels::decode::reduce_routes_add<<<
             batch, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
@@ -1054,7 +1108,7 @@ static void gpu_ffn(const Config &c, const DeviceLayer &d, int l, int batch)
         batch_decode_kernels::decode::routed_shared_down<<<down_grid,
             kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 g.x, g.routed_hidden, g.hb, d.pool, d.expert_down_offsets,
-                g.topk, g.topk_weights, d.shared_down, batch, K, H, inter, 0);
+                g.topk, g.topk_weights, d.shared_down, batch, K, H, inter, 0, g_w8);
         HIP_LAUNCH_CHECK();
     }
     launch_gemv(g.x, g.hb, d.shared_down, H, shared, batch, true);
@@ -1301,7 +1355,8 @@ extern "C" void warm_up(Transformer *t) {
     g_flash_threshold = configured_threshold(
         "GETP_FLASH_THRESHOLD", kDefaultFlashThreshold);
     g_prompt_token_cap = configured_positive_int(
-        "GETP_PROMPT_TOKEN_CAP", 120, c.max_seq_len);
+        "GETP_PROMPT_TOKEN_CAP", c.max_seq_len, c.max_seq_len);
+    g_w8 = configured_quant_w8();
     g_prefill_large_m =
         std::getenv("GETP_DISABLE_PREFILL_LARGE_M") == nullptr;
     int device = 0;
@@ -1349,7 +1404,18 @@ extern "C" void warm_up(Transformer *t) {
         g.layouts.push_back(make_layer_layout(t, l, g.host_wuk_t[l].data()));
         layer_total += g.layouts.back().bytes;
     }
-    size_t global_bytes = ((size_t)2 * c.vocab_size * c.hidden_size + c.hidden_size) * sizeof(bf16_t)
+    size_t lm_bytes = (size_t)c.vocab_size * c.hidden_size * sizeof(bf16_t);
+    const void *lm_src = t->weights.lm_head;
+    if (g_w8) {
+        g_quant_host.emplace_back();
+        pack_w8_matrix(t->weights.lm_head, c.vocab_size, c.hidden_size,
+                       g_quant_host.back());
+        lm_bytes = g_quant_host.back().size();
+        lm_src = g_quant_host.back().data();
+    }
+    size_t global_bytes = (size_t)c.vocab_size * c.hidden_size * sizeof(bf16_t)
+                        + (size_t)c.hidden_size * sizeof(bf16_t)
+                        + lm_bytes
                         + (size_t)(c.qk_rope_head_dim / 2) * sizeof(float);
 
     const int warm_capacity = configured_kv_capacity(c);
@@ -1358,7 +1424,7 @@ extern "C" void warm_up(Transformer *t) {
 
     device_alloc(&g.embed, (size_t)c.vocab_size * c.hidden_size);
     device_alloc(&g.final_norm, c.hidden_size);
-    device_alloc(&g.lm_head, (size_t)c.vocab_size * c.hidden_size);
+    HIP_CHECK(hipMalloc(reinterpret_cast<void **>(&g.lm_head), lm_bytes));
     device_alloc(&g.rope_inv_freq, c.qk_rope_head_dim / 2);
     HIP_CHECK(hipMemcpyAsync(g.embed, t->weights.embed_tokens,
                              (size_t)c.vocab_size * c.hidden_size * sizeof(bf16_t),
@@ -1366,8 +1432,7 @@ extern "C" void warm_up(Transformer *t) {
     HIP_CHECK(hipMemcpyAsync(g.final_norm, t->weights.norm,
                              (size_t)c.hidden_size * sizeof(bf16_t),
                              hipMemcpyHostToDevice, g.stream));
-    HIP_CHECK(hipMemcpyAsync(g.lm_head, t->weights.lm_head,
-                             (size_t)c.vocab_size * c.hidden_size * sizeof(bf16_t),
+    HIP_CHECK(hipMemcpyAsync(g.lm_head, lm_src, lm_bytes,
                              hipMemcpyHostToDevice, g.stream));
     HIP_CHECK(hipMemcpyAsync(g.rope_inv_freq, t->rope_inv_freq,
                              (size_t)(c.qk_rope_head_dim / 2) * sizeof(float),
@@ -1467,6 +1532,8 @@ extern "C" void warm_up(Transformer *t) {
     g_prefill_token_budget = std::min(
         g_prefill_token_budget, g.prefill_capacity);
     HIP_CHECK(hipStreamSynchronize(g.stream));
+    g_quant_host.clear();
+    g_quant_host.shrink_to_fit();
 
     /* Exercise every inference kernel family before the timed call.  Batch 1
      * covers the GEMV/non-grouped path; batch 16+ covers MFMA/grouped MoE and
@@ -1519,9 +1586,10 @@ extern "C" void warm_up(Transformer *t) {
         HIP_CHECK(hipStreamSynchronize(g.stream));
     }
 
-    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv=bf16-rne prefill_tokens=%d decode_tokens=%d prompt_cap=%d warm_kv=%d prefill_rows=%d prefill_m=%d mfma_at=%d flash_at=%d graphs=%d\n",
+    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv=bf16-rne quant=%s prefill_tokens=%d decode_tokens=%d prompt_cap=%d warm_kv=%d prefill_rows=%d prefill_m=%d mfma_at=%d flash_at=%d graphs=%d\n",
                  prop.name, (double)total_bytes / (double)(1ULL << 30),
                  (double)(global_bytes + layer_total) / (double)(1ULL << 30),
+                 g_w8 ? "w8a16" : "bf16",
                  g_prefill_token_budget, g_decode_token_budget,
                  g_prompt_token_cap,
                  g.kv_capacity, g.prefill_capacity,
@@ -1581,6 +1649,8 @@ extern "C" void finish(Transformer *t) {
     g_mfma_threshold = kDefaultMfmaThreshold;
     g_flash_threshold = kDefaultFlashThreshold;
     g_prompt_token_cap = 0;
+    g_w8 = 0;
+    g_quant_host.clear();
     g_prefill_large_m = true;
 }
 
@@ -1614,10 +1684,10 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
         if (n < 0)
             n = 0;
         prompts[r].resize((size_t)n);
-        /* Preserve short prompts in full.  For longer requests, a sliding tail
-         * retains the text nearest the continuation while bounding prefill
-         * work.  The public/private sets use 64/128-token short buckets. */
-        if (n > g_prompt_token_cap && n > 128) {
+        /* Optional sliding-window cap via GETP_PROMPT_TOKEN_CAP.  Default is
+         * the model max_seq_len so public 64/128/256/384/512 prompts run in
+         * full. */
+        if (n > g_prompt_token_cap) {
             prompts[r].erase(
                 prompts[r].begin(),
                 prompts[r].begin() + (n - g_prompt_token_cap));
