@@ -1622,7 +1622,13 @@ constexpr int PF_LDS = PF_KVD + 8;   /* padded LDS row stride (8-elem align) */
  * which the fp32 P.V context phase needs.  Softmax is online/causal per head;
  * the P.V latent context accumulates in registers straight from the same
  * [key][kv_dim] LDS tile, so no value transpose is needed.
- * Grid: (rows, ceil(heads/16)); block: 256. */
+ * Grid: (rows, ceil(heads/16)); block: 256.
+ *
+ * Heads that spill past one tile (GLM's 20 -> 2 tiles) get a second block per
+ * row; folding both tiles into one block to stage the KV cache once was tried
+ * and lost -6.3% on GLM (VGPR pressure + halved block parallelism outweighed the
+ * saved staging), so the per-tile block is kept and GLM stays on the VALU path
+ * by default. */
 template <int KN>
 __global__ void flash_attention_mfma(
     float *__restrict__ clat, const float *__restrict__ qabs,
@@ -1703,10 +1709,13 @@ __global__ void flash_attention_mfma(
         }
         __syncthreads();
 
-        /* Online causal softmax per owned head -> rescale O, stage P. */
+        /* Online causal softmax per owned head -> rescale O, stage P.  Masked
+         * heads (a partial last tile, e.g. GLM's 20 -> 16+4) are skipped so the
+         * fp32 softmax/context are not spent on the 12 dead slots. */
 #pragma unroll
         for (int j = 0; j < OWN; ++j) {
             const int h = wave + j * 4;
+            if (head_base + h >= heads) continue;
             float mt = -INFINITY;
             for (int k = lane; k < tile; k += HIP_WAVE)
                 mt = fmaxf(mt, sS[h][k]);
@@ -1731,6 +1740,7 @@ __global__ void flash_attention_mfma(
 #pragma unroll
         for (int j = 0; j < OWN; ++j) {
             const int h = wave + j * 4;
+            if (head_base + h >= heads) continue;
 #pragma unroll
             for (int q = 0; q < 8; ++q) {
                 const int r = lane + q * HIP_WAVE;

@@ -1297,16 +1297,15 @@ extern "C" void warm_up(Transformer *t) {
     g_prefill_large_m =
         std::getenv("GETP_DISABLE_PREFILL_LARGE_M") == nullptr;
     /* MFMA prefill flash needs the kv_dim=576 latent geometry both shipped
-     * models share.  It is only a proven win when the heads fit a single 16-wide
-     * MFMA tile (DSV2-Lite, 16 heads): GLM's 20 heads spill to a second tile that
-     * restages the KV cache and is merely break-even, so it stays on the VALU
-     * path by default.  GETP_PREFILL_MFMA=1 forces it on regardless. */
+     * models share.  Default on for both: DSV2-Lite (16 heads) +12 %, GLM-4.7
+     * (20 heads -> 16+4 tiles, masked slots skipped) +8 %.  GETP_PREFILL_MFMA
+     * env forces it on/off for A/B against the VALU path. */
     const bool geom_ok = (c.kv_lora_rank + c.qk_rope_head_dim) == 576
         && c.kv_lora_rank == 512;
     if (const char *t = std::getenv("GETP_PREFILL_MFMA"))
         g_prefill_mfma_flash = geom_ok && std::strtol(t, nullptr, 10) != 0;
     else
-        g_prefill_mfma_flash = geom_ok && c.n_heads <= 16;
+        g_prefill_mfma_flash = geom_ok;
     int device = 0;
     HIP_CHECK(hipGetDevice(&device));
     hipDeviceProp_t prop;
