@@ -305,8 +305,7 @@ __global__ void value_up(float *ctx, const float *clat, const bf16_t *wuv,
 inline void run(GpuContext &g, const Config &c, int max_batch,
                 const int *device_tokens, int *generated,
                 int generated_stride, int output_index,
-                const int *positions, int max_kv_len,
-                bool produce_token, int batch) {
+                const int *positions, int max_kv_len, int batch) {
     const int H = c.hidden_size;
     const int NH = c.n_heads;
     const int QKN = c.qk_nope_head_dim;
@@ -333,17 +332,17 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
         ops::rmsnorm(g.xn, g.x, d.input_norm, H, batch, c.rms_eps, g.stream);
         if (c.q_lora_rank > 0) {
             /* glm: q_a [B,768,2048] + kv_a [B,576,2048]; q_b [B,5120,768] */
-            ops::gemm_dual(g.q_a, d.q_a_proj, nullptr, c.q_lora_rank,
-                           g.comp, d.kv_a_proj, nullptr, KVD,
+            ops::gemm_dual(g.q_a, d.q_a_proj, d.q_a_proj_s, c.q_lora_rank,
+                           g.comp, d.kv_a_proj, d.kv_a_proj_s, KVD,
                            g.xn, H, batch, qs, g.stream);
             ops::rmsnorm(g.q_a, g.q_a, d.q_a_norm, c.q_lora_rank, batch,
                          c.mla_norm_eps, g.stream);
-            ops::gemm(g.q, g.q_a, d.q_b_proj, nullptr, batch, QD,
+            ops::gemm(g.q, g.q_a, d.q_b_proj, d.q_b_proj_s, batch, QD,
                       c.q_lora_rank, false, qs, g.stream);
         } else {
             /* dsv: q_proj [B,3072,2048] + kv_a [B,576,2048] */
-            ops::gemm_dual(g.q, d.q_proj, nullptr, QD,
-                           g.comp, d.kv_a_proj, nullptr, KVD,
+            ops::gemm_dual(g.q, d.q_proj, d.q_proj_s, QD,
+                           g.comp, d.kv_a_proj, d.kv_a_proj_s, KVD,
                            g.xn, H, batch, qs, g.stream);
         }
         bf16_t *layer_cache = g.kv_cache +
@@ -427,7 +426,7 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
                     g.ctx, g.clat, d.W_UV, batch, NH, VHD, KVL, head_stride);
             HIP_LAUNCH_CHECK();
         }
-        ops::gemm(g.x, g.ctx, d.o_proj, nullptr, batch, H, NH * VHD, true,
+        ops::gemm(g.x, g.ctx, d.o_proj, d.o_proj_s, batch, H, NH * VHD, true,
                   qs, g.stream);
 
         ops::rmsnorm(g.xn, g.x, d.post_norm, H, batch, c.rms_eps, g.stream);
@@ -435,15 +434,14 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
             ops::dense_ffn(c, d, batch, g.x, g.xn, g.hb, qs, g.stream);
         else
             ops::moe_ffn(c, d, batch, g.x, g.xn, g.hb, g.router, g.topk,
-                         g.topk_weights, g.prefill_topk,
-                         g.prefill_expert_counts, g.prefill_expert_buckets,
-                         g.routed_hidden, nullptr, g.prefill_ffn,
+                         g.topk_weights, g.moe_sorted_ids,
+                         g.moe_expert_ids, g.moe_num_padded,
+                         g.routed_hidden, nullptr, g.moe_route_out,
                          qs, g.routed_i8, g.routed_s, g.stream);
     }
 
-    if (!produce_token) return;
     ops::rmsnorm(g.xn, g.x, g.final_norm, H, batch, c.rms_eps, g.stream);
-    ops::gemm(g.logits, g.xn, g.lm_head, nullptr, batch, c.vocab_size, H,
+    ops::gemm(g.logits, g.xn, g.lm_head, g.lm_head_s, batch, c.vocab_size, H,
               false, qs, g.stream);
     ops::argmax(g.logits, c.vocab_size, g.next_token, batch, g.stream);
 }

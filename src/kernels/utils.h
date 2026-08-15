@@ -42,6 +42,16 @@ namespace gpu {
 
 namespace model {
 
+/* Which weight groups are stored as per-row int8 and whether the expert down
+ * projection runs on the int8 MFMA path (a8) or dequantizes on the bf16 MFMA
+ * path. Tuned on the 512-request sets against METEOR > 0.3, BERT-F1 > 0.83. */
+struct QuantPolicy {
+    bool shared;   /* shared expert gate/up/down int8 (+a8)          */
+    bool proj;     /* attention projections + dense FFN int8 (+a8)   */
+    bool lmhead;   /* lm_head int8 (+a8)                             */
+    bool down_a8;  /* expert down: int8 MFMA (true) | w8 dequant (false) */
+};
+
 /* deepseek-ai/DeepSeek-V2-Lite (config.json) */
 namespace dsv {
     constexpr int N_LAYERS = 27;
@@ -64,6 +74,8 @@ namespace dsv {
     constexpr int KV_DIM = KV_LORA + QK_ROPE;          /* 576  */
     constexpr int ATTN_OUT = N_HEADS * V_HEAD;         /* 2048 */
     constexpr int SHARED_INTER = N_SHARED * MOE_INTER; /* 2816 */
+    constexpr QuantPolicy QUANT = {
+        /*shared=*/true, /*proj=*/true, /*lmhead=*/true, /*down_a8=*/true};
 }
 
 /* zai-org/GLM-4.7-Flash (config.json) */
@@ -88,6 +100,8 @@ namespace glm {
     constexpr int KV_DIM = KV_LORA + QK_ROPE;          /* 576  */
     constexpr int ATTN_OUT = N_HEADS * V_HEAD;         /* 5120 */
     constexpr int SHARED_INTER = N_SHARED * MOE_INTER; /* 1536 */
+    constexpr QuantPolicy QUANT = {
+        /*shared=*/true, /*proj=*/true, /*lmhead=*/true, /*down_a8=*/true};
 }
 
 } // namespace model
@@ -98,7 +112,6 @@ namespace kernel {
     constexpr int GEMV_THREADS = 256;
     constexpr int ELEMENTWISE_THREADS = 256;
     constexpr int ATTENTION_THREADS = 256;
-    constexpr int ROUTER_THREADS = 256;
     constexpr int ROUTER_WAVE_THREADS = 64;
     constexpr int MFMA_TILE_N = 64;       /* output columns per MFMA block   */
     constexpr int MFMA_BATCH_TILE = 16;   /* rows per MFMA block (1 tile)    */
@@ -144,25 +157,27 @@ __device__ __forceinline__ float wave_sum(float value) {
     return value;
 }
 
-/* Weight-only int8: when `ws` (per-output-row scales) is set, `w` actually
- * holds row-major int8 and each element dequantizes as ws[row] * w8[i].
- * When `ws` is null, `w` is plain bf16. */
-__device__ __forceinline__ utils::types::bf16x8 load_w8(
-    const bf16_t *w, const float *ws, size_t gc, int n_in, int k0) {
+/* Stage 8 bf16 weights of row `gc` starting at column `k0` (tail-safe). */
+__device__ __forceinline__ utils::types::bf16x8 load_bf16x8(
+    const bf16_t *w, size_t gc, int n_in, int k0) {
     utils::types::bf16x8 value = {};
-    if (!ws) {
-        if (k0 + 8 <= n_in)
-            value = *reinterpret_cast<const utils::types::bf16x8 *>(
-                w + gc * n_in + k0);
-        else
+    if (k0 + 8 <= n_in)
+        value = *reinterpret_cast<const utils::types::bf16x8 *>(
+            w + gc * n_in + k0);
+    else
 #pragma unroll
-            for (int q = 0; q < 8; ++q)
-                if (k0 + q < n_in)
-                    value[q] = reinterpret_cast<const short *>(
-                        w)[gc * n_in + k0 + q];
-        return value;
-    }
-    const char *w8 = reinterpret_cast<const char *>(w);
+        for (int q = 0; q < 8; ++q)
+            if (k0 + q < n_in)
+                value[q] = reinterpret_cast<const short *>(
+                    w)[gc * n_in + k0 + q];
+    return value;
+}
+
+/* Same, but the source row is int8 with a per-row scale: dequantize to bf16
+ * while staging (weight-only int8 on the bf16 MFMA path). */
+__device__ __forceinline__ utils::types::bf16x8 load_w8_dequant(
+    const char *w8, const float *ws, size_t gc, int n_in, int k0) {
+    utils::types::bf16x8 value = {};
     const float s = ws[gc];
     if (k0 + 8 <= n_in) {
         const utils::types::i8x8 wv =

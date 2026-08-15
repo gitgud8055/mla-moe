@@ -38,8 +38,6 @@ constexpr int kMaxRequests = 4096;      /* host staging capacity           */
 constexpr size_t kDeviceAlignment = 256;
 constexpr size_t kVramReserve = (size_t)512 << 20;
 
-int div_up(int value, int divisor) { return (value + divisor - 1) / divisor; }
-
 size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
@@ -49,6 +47,7 @@ size_t align_up(size_t value, size_t alignment) {
 static GpuContext g;
 static int g_max_batch = 1;
 static bool g_glm = false; /* detected from config: q_lora_rank > 0 */
+static utils::constants::model::QuantPolicy g_qp; /* per-model, set in warm_up */
 
 /* ------------------------------------------------------------------ */
 /* Weight layout                                                      */
@@ -91,42 +90,46 @@ static LayerLayout make_layer_layout(const Transformer *t, int l,
     const int QD = c.n_heads * QHD;
     const int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
     const int AOUT = c.n_heads * c.v_head_dim;
-    const bool quant_shared = !g_glm; /* dsv: shared experts run w8a8 too */
     auto bfbytes = [](size_t n) { return n * sizeof(bf16_t); };
 
     if (c.q_lora_rank > 0) {
-        a.q_a_proj = add_chunk(a, w.q_a_proj[l], bfbytes((size_t)c.q_lora_rank * H));
-        a.q_b_proj = add_chunk(a, w.q_b_proj[l], bfbytes((size_t)QD * c.q_lora_rank));
+        a.q_a_proj = add_weight(a, w.q_a_proj[l], c.q_lora_rank, H,
+                                g_qp.proj, &a.q_a_proj_s);
+        a.q_b_proj = add_weight(a, w.q_b_proj[l], QD, c.q_lora_rank,
+                                g_qp.proj, &a.q_b_proj_s);
         a.q_a_norm = add_chunk(a, w.q_a_layernorm[l], bfbytes(c.q_lora_rank));
     } else {
-        a.q_proj = add_chunk(a, w.q_proj[l], bfbytes((size_t)QD * H));
+        a.q_proj = add_weight(a, w.q_proj[l], QD, H, g_qp.proj, &a.q_proj_s);
     }
-    a.kv_a_proj = add_chunk(a, w.kv_a_proj[l], bfbytes((size_t)KVD * H));
+    a.kv_a_proj = add_weight(a, w.kv_a_proj[l], KVD, H, g_qp.proj,
+                             &a.kv_a_proj_s);
     size_t kv_b_elems = (size_t)c.n_heads * (c.qk_nope_head_dim + c.v_head_dim) * c.kv_lora_rank;
     a.kv_b_proj = add_chunk(a, w.W_UK[l], bfbytes(kv_b_elems));
     size_t wuk_elems = (size_t)c.n_heads * c.kv_lora_rank * c.qk_nope_head_dim;
     a.wuk_t = add_chunk(a, wuk_t, bfbytes(wuk_elems));
-    a.o_proj = add_chunk(a, w.o_proj[l], bfbytes((size_t)H * AOUT));
+    a.o_proj = add_weight(a, w.o_proj[l], H, AOUT, g_qp.proj, &a.o_proj_s);
     a.input_norm = add_chunk(a, w.input_layernorm[l], bfbytes(H));
     a.post_norm = add_chunk(a, w.post_attn_norm[l], bfbytes(H));
     a.kv_a_norm = add_chunk(a, w.kv_a_layernorm[l], bfbytes(c.kv_lora_rank));
 
     if (l < c.first_k_dense) {
-        size_t ih = (size_t)c.dense_inter_size * H;
-        a.dense_gate = add_chunk(a, w.dense_gate[l], bfbytes(ih));
-        a.dense_up = add_chunk(a, w.dense_up[l], bfbytes(ih));
-        a.dense_down = add_chunk(a, w.dense_down[l], bfbytes(ih));
+        a.dense_gate = add_weight(a, w.dense_gate[l], c.dense_inter_size, H,
+                                  g_qp.proj, &a.dense_gate_s);
+        a.dense_up = add_weight(a, w.dense_up[l], c.dense_inter_size, H,
+                                g_qp.proj, &a.dense_up_s);
+        a.dense_down = add_weight(a, w.dense_down[l], H, c.dense_inter_size,
+                                  g_qp.proj, &a.dense_down_s);
     } else {
         a.moe_gate = add_chunk(a, w.moe_gate[l], bfbytes((size_t)c.n_routed_experts * H));
         if (w.moe_gate_bias[l])
             a.moe_bias = add_chunk(a, w.moe_gate_bias[l], (size_t)c.n_routed_experts * sizeof(float));
         int shared = c.n_shared_experts * c.moe_inter_size;
         a.shared_gate = add_weight(a, w.shared_gate[l], shared, H,
-                                   quant_shared, &a.shared_gate_s);
+                                   g_qp.shared, &a.shared_gate_s);
         a.shared_up = add_weight(a, w.shared_up[l], shared, H,
-                                 quant_shared, &a.shared_up_s);
+                                 g_qp.shared, &a.shared_up_s);
         a.shared_down = add_weight(a, w.shared_down[l], H, shared,
-                                   quant_shared, &a.shared_down_s);
+                                   g_qp.shared, &a.shared_down_s);
         a.expert_gate.resize(c.n_routed_experts);
         a.expert_up.resize(c.n_routed_experts);
         a.expert_down.resize(c.n_routed_experts);
@@ -191,6 +194,14 @@ static DeviceLayer materialize_layer(const LayerLayout &a, void *pool, int l) {
     d.shared_gate = reinterpret_cast<const bf16_t *>(offset_ptr(base, a.shared_gate));
     d.shared_up = reinterpret_cast<const bf16_t *>(offset_ptr(base, a.shared_up));
     d.shared_down = reinterpret_cast<const bf16_t *>(offset_ptr(base, a.shared_down));
+    d.q_proj_s = reinterpret_cast<const float *>(offset_ptr(base, a.q_proj_s));
+    d.q_a_proj_s = reinterpret_cast<const float *>(offset_ptr(base, a.q_a_proj_s));
+    d.q_b_proj_s = reinterpret_cast<const float *>(offset_ptr(base, a.q_b_proj_s));
+    d.kv_a_proj_s = reinterpret_cast<const float *>(offset_ptr(base, a.kv_a_proj_s));
+    d.o_proj_s = reinterpret_cast<const float *>(offset_ptr(base, a.o_proj_s));
+    d.dense_gate_s = reinterpret_cast<const float *>(offset_ptr(base, a.dense_gate_s));
+    d.dense_up_s = reinterpret_cast<const float *>(offset_ptr(base, a.dense_up_s));
+    d.dense_down_s = reinterpret_cast<const float *>(offset_ptr(base, a.dense_down_s));
     d.shared_gate_s = reinterpret_cast<const float *>(offset_ptr(base, a.shared_gate_s));
     d.shared_up_s = reinterpret_cast<const float *>(offset_ptr(base, a.shared_up_s));
     d.shared_down_s = reinterpret_cast<const float *>(offset_ptr(base, a.shared_down_s));
@@ -273,8 +284,8 @@ static size_t prefill_workspace_bytes(const Config &c, size_t rows) {
         + (size_t)c.n_routed_experts * (kt::GROUPED_ROUTE_TILE - 1);
     const size_t w8a8_bytes =
         rows * act_scratch_cols(c) + rows * sizeof(float)
-        + (g_glm ? 0 : routes * (size_t)c.moe_inter_size
-                       + routes * sizeof(float));
+        + (g_qp.down_a8 ? routes * (size_t)c.moe_inter_size
+                          + routes * sizeof(float) : 0);
     return rows * floats_per_row * sizeof(float)
         + rows * k * c.moe_inter_size * sizeof(bf16_t)
         + w8a8_bytes
@@ -335,15 +346,15 @@ static void allocate_prefill_workspace(const Config &c, int target_rows) {
     device_alloc(&g.prefill_router, rows * std::max(1, c.n_routed_experts));
     device_alloc(&g.prefill_route_ids, rows * k);
     device_alloc(&g.prefill_topk_weights, rows * k);
-    device_alloc(&g.prefill_topk, max_padded);
-    device_alloc(&g.prefill_expert_counts,
-                 div_up((int)max_padded, kt::GROUPED_ROUTE_TILE));
-    device_alloc(&g.prefill_expert_buckets, 1);
+    device_alloc(&g.moe_sorted_ids, max_padded);
+    device_alloc(&g.moe_expert_ids,
+                 ops::div_up((int)max_padded, kt::GROUPED_ROUTE_TILE));
+    device_alloc(&g.moe_num_padded, 1);
     device_alloc(&g.prefill_routed_hidden, routes * c.moe_inter_size);
-    device_alloc(&g.prefill_ffn, routes * c.hidden_size);
+    device_alloc(&g.moe_route_out, routes * c.hidden_size);
     device_alloc(&g.prefill_act_i8, rows * act_scratch_cols(c));
     device_alloc(&g.prefill_act_s, rows);
-    if (!g_glm) {
+    if (g_qp.down_a8) {
         device_alloc(&g.prefill_routed_i8, routes * c.moe_inter_size);
         device_alloc(&g.prefill_routed_s, routes);
     }
@@ -363,6 +374,8 @@ extern "C" void warm_up(Transformer *t) {
     /* Model detection: GLM-4.7-Flash carries a q LoRA, DeepSeek-V2-Lite
      * does not. This selects the per-model quantization policy above. */
     g_glm = t->config.q_lora_rank > 0;
+    g_qp = g_glm ? utils::constants::model::glm::QUANT
+                 : utils::constants::model::dsv::QUANT;
     if (g_glm && t->config.rope_interleaved)
         t->config.max_seq_len = 512 + 64;
     const Config &c = t->config;
@@ -416,13 +429,22 @@ extern "C" void warm_up(Transformer *t) {
         for (const QuantChunk &chunk : a.qchunks)
             quant_stage_elems = std::max(
                 quant_stage_elems, (size_t)chunk.rows * chunk.cols);
+    if (g_qp.lmhead)
+        quant_stage_elems = std::max(
+            quant_stage_elems, (size_t)c.vocab_size * c.hidden_size);
     bf16_t *quant_stage = nullptr;
     if (quant_stage_elems > 0)
         device_alloc(&quant_stage, quant_stage_elems);
 
     device_alloc(&g.embed, (size_t)c.vocab_size * c.hidden_size);
     device_alloc(&g.final_norm, c.hidden_size);
-    device_alloc(&g.lm_head, (size_t)c.vocab_size * c.hidden_size);
+    if (g_qp.lmhead) {
+        HIP_CHECK(hipMalloc(reinterpret_cast<void **>(&g.lm_head),
+                            (size_t)c.vocab_size * c.hidden_size));
+        device_alloc(&g.lm_head_s, (size_t)c.vocab_size);
+    } else {
+        device_alloc(&g.lm_head, (size_t)c.vocab_size * c.hidden_size);
+    }
     device_alloc(&g.rope_inv_freq, c.qk_rope_head_dim / 2);
     HIP_CHECK(hipMemcpyAsync(g.embed, t->weights.embed_tokens,
                              (size_t)c.vocab_size * c.hidden_size * sizeof(bf16_t),
@@ -430,9 +452,20 @@ extern "C" void warm_up(Transformer *t) {
     HIP_CHECK(hipMemcpyAsync(g.final_norm, t->weights.norm,
                              (size_t)c.hidden_size * sizeof(bf16_t),
                              hipMemcpyHostToDevice, g.stream));
-    HIP_CHECK(hipMemcpyAsync(g.lm_head, t->weights.lm_head,
-                             (size_t)c.vocab_size * c.hidden_size * sizeof(bf16_t),
-                             hipMemcpyHostToDevice, g.stream));
+    if (g_qp.lmhead) {
+        HIP_CHECK(hipMemcpyAsync(
+            quant_stage, t->weights.lm_head,
+            (size_t)c.vocab_size * c.hidden_size * sizeof(bf16_t),
+            hipMemcpyHostToDevice, g.stream));
+        ops::quantize_weight_rows(
+            quant_stage, reinterpret_cast<char *>(g.lm_head), g.lm_head_s,
+            c.vocab_size, c.hidden_size, g.stream);
+    } else {
+        HIP_CHECK(hipMemcpyAsync(
+            g.lm_head, t->weights.lm_head,
+            (size_t)c.vocab_size * c.hidden_size * sizeof(bf16_t),
+            hipMemcpyHostToDevice, g.stream));
+    }
     HIP_CHECK(hipMemcpyAsync(g.rope_inv_freq, t->rope_inv_freq,
                              (size_t)(c.qk_rope_head_dim / 2) * sizeof(float),
                              hipMemcpyHostToDevice, g.stream));
@@ -532,7 +565,7 @@ extern "C" void warm_up(Transformer *t) {
     device_alloc(&g.decode_positions, B);
     device_alloc(&g.act_i8, B * act_scratch_cols(c));
     device_alloc(&g.act_s, B);
-    if (!g_glm) {
+    if (g_qp.down_a8) {
         device_alloc(&g.routed_i8, B * c.n_experts_per_tok * c.moe_inter_size);
         device_alloc(&g.routed_s, B * c.n_experts_per_tok);
     }
@@ -560,12 +593,12 @@ extern "C" void warm_up(Transformer *t) {
     HIP_CHECK(hipMemsetAsync(g.decode_positions, 0,
                              (size_t)kernel_warm_batch * sizeof(int), g.stream));
     decode::run(g, c, g_max_batch, g.next_token, g.generated, c.max_seq_len,
-                0, g.decode_positions, 1, true, 1);
+                0, g.decode_positions, 1, 1);
     if (kernel_warm_batch > 1) {
         HIP_CHECK(hipMemsetAsync(g.next_token, 0,
                                  (size_t)kernel_warm_batch * sizeof(int), g.stream));
         decode::run(g, c, g_max_batch, g.next_token, g.generated,
-                    c.max_seq_len, 0, g.decode_positions, 1, true,
+                    c.max_seq_len, 0, g.decode_positions, 1,
                     kernel_warm_batch);
     }
     HIP_CHECK(hipStreamSynchronize(g.stream));
@@ -576,7 +609,10 @@ extern "C" void warm_up(Transformer *t) {
         prop.name, g_glm ? "glm47" : "dsv2lite",
         (double)total_bytes / (double)(1ULL << 30),
         (double)(global_bytes + layer_total) / (double)(1ULL << 30),
-        g_glm ? "experts,w8a8up" : "experts,shared,w8a8",
+        g_qp.proj ? (g_qp.lmhead ? "all,w8a8" : "experts,shared,proj,w8a8")
+                  : (g_qp.shared ? (g_qp.down_a8 ? "experts,shared,w8a8"
+                                                 : "experts,shared,w8a8up")
+                                 : "experts,w8a8up"),
         g_max_batch, g.kv_capacity, g.prefill_capacity);
 }
 
@@ -587,7 +623,7 @@ extern "C" void finish(Transformer *t) {
 
     device_free(g.embed);
     device_free(g.final_norm);
-    device_free(g.lm_head);
+    device_free(g.lm_head); device_free(g.lm_head_s);
     device_free(g.rope_inv_freq);
     for (void *pool : g.layer_pools) if (pool) HIP_CHECK(hipFree(pool));
     g.layer_pools.clear();
@@ -607,13 +643,13 @@ extern "C" void finish(Transformer *t) {
     device_free(g.prompt_tokens); device_free(g.prefill_route_ids);
     device_free(g.prefill_row_batches); device_free(g.prefill_row_positions);
     device_free(g.prefill_offsets);
-    device_free(g.prefill_topk);
-    device_free(g.prefill_expert_counts); device_free(g.prefill_expert_buckets);
+    device_free(g.moe_sorted_ids);
+    device_free(g.moe_expert_ids); device_free(g.moe_num_padded);
     device_free(g.prefill_x); device_free(g.prefill_xn);
     device_free(g.prefill_q); device_free(g.prefill_q_a); device_free(g.prefill_comp);
     device_free(g.prefill_qrope); device_free(g.prefill_qabs);
     device_free(g.prefill_clat); device_free(g.prefill_ctx);
-    device_free(g.prefill_ffn);
+    device_free(g.moe_route_out);
     device_free(g.prefill_router); device_free(g.prefill_topk_weights);
     device_free(g.prefill_hb); device_free(g.routed_hidden);
     device_free(g.prefill_routed_hidden);
@@ -757,7 +793,7 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
                 (size_t)batch * sizeof(int), hipMemcpyHostToDevice, g.stream));
             decode::run(g, c, g_max_batch, g.next_token, g.generated,
                         max_seq, step, g.decode_positions, max_kv_len,
-                        true, batch);
+                        batch);
         }
 
         /* --- copy back and cut at EOS --- */

@@ -229,18 +229,18 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
                      c.rms_eps, g.stream);
         if (c.q_lora_rank > 0) {
             /* glm: q_a [rows,768,2048] + kv_a [rows,576,2048] */
-            ops::gemm_dual(g.prefill_q_a, d.q_a_proj, nullptr, c.q_lora_rank,
-                           g.prefill_comp, d.kv_a_proj, nullptr, KVD,
+            ops::gemm_dual(g.prefill_q_a, d.q_a_proj, d.q_a_proj_s, c.q_lora_rank,
+                           g.prefill_comp, d.kv_a_proj, d.kv_a_proj_s, KVD,
                            g.prefill_xn, H, rows, qs, g.stream);
             ops::rmsnorm(g.prefill_q_a, g.prefill_q_a, d.q_a_norm,
                          c.q_lora_rank, rows, c.mla_norm_eps, g.stream);
             /* glm: q_b [rows,5120,768] */
-            ops::gemm(g.prefill_q, g.prefill_q_a, d.q_b_proj, nullptr,
+            ops::gemm(g.prefill_q, g.prefill_q_a, d.q_b_proj, d.q_b_proj_s,
                       rows, QD, c.q_lora_rank, false, qs, g.stream);
         } else {
             /* dsv: q_proj [rows,3072,2048] + kv_a [rows,576,2048] */
-            ops::gemm_dual(g.prefill_q, d.q_proj, nullptr, QD,
-                           g.prefill_comp, d.kv_a_proj, nullptr, KVD,
+            ops::gemm_dual(g.prefill_q, d.q_proj, d.q_proj_s, QD,
+                           g.prefill_comp, d.kv_a_proj, d.kv_a_proj_s, KVD,
                            g.prefill_xn, H, rows, qs, g.stream);
         }
 
@@ -273,7 +273,7 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
         ops::head_gemm(g.prefill_ctx, g.prefill_clat, d.W_UV, rows, NH,
                        VHD, KVL, KVL, VHD, head_stride, g.stream);
         /* o_proj: dsv [rows,2048,2048]; glm [rows,2048,5120] */
-        ops::gemm(g.prefill_x, g.prefill_ctx, d.o_proj, nullptr,
+        ops::gemm(g.prefill_x, g.prefill_ctx, d.o_proj, d.o_proj_s,
                   rows, H, NH * VHD, true, qs, g.stream);
 
         ops::rmsnorm(g.prefill_xn, g.prefill_x, d.post_norm, H, rows,
@@ -284,9 +284,9 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
         else
             ops::moe_ffn(c, d, rows, g.prefill_x, g.prefill_xn, g.prefill_hb,
                          g.prefill_router, g.prefill_route_ids,
-                         g.prefill_topk_weights, g.prefill_topk,
-                         g.prefill_expert_counts, g.prefill_expert_buckets,
-                         nullptr, g.prefill_routed_hidden, g.prefill_ffn,
+                         g.prefill_topk_weights, g.moe_sorted_ids,
+                         g.moe_expert_ids, g.moe_num_padded,
+                         nullptr, g.prefill_routed_hidden, g.moe_route_out,
                          qs, g.prefill_routed_i8, g.prefill_routed_s,
                          g.stream);
     }
@@ -300,7 +300,7 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
                  g.final_norm, H, batch, c.rms_eps, g.stream);
     const ops::QuantScratch decode_qs{g.act_i8, g.act_s};
     ops::gemm(g.logits + (size_t)slot_base * c.vocab_size,
-              g.xn + (size_t)slot_base * H, g.lm_head, nullptr,
+              g.xn + (size_t)slot_base * H, g.lm_head, g.lm_head_s,
               batch, c.vocab_size, H, false, decode_qs, g.stream);
     ops::argmax(g.logits + (size_t)slot_base * c.vocab_size, c.vocab_size,
                 g.next_token + slot_base, batch, g.stream);

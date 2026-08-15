@@ -33,6 +33,13 @@ constexpr int MFMA_K = 64;
 constexpr int MFMA_LDS_K = MFMA_K + 4;
 constexpr int I8_LDS_K = MFMA_K + 8; /* stride % 8 == 0 keeps i8x8 stores aligned */
 
+/* Worst-case LDS footprints (gate/up kernels stage x + two weight tiles). */
+static_assert(((size_t)MFMA_M * kt::PREFILL_ROW_TILES + 2 * MFMA_N)
+                  * MFMA_LDS_K * sizeof(bf16_t)
+              <= utils::constants::gpu::LDS);
+static_assert(((size_t)MFMA_M * kt::PREFILL_ROW_TILES + 2 * MFMA_N) * I8_LDS_K
+              <= utils::constants::gpu::LDS);
+
 inline int div_up(int value, int divisor) { return (value + divisor - 1) / divisor; }
 
 /* ------------------------------------------------------------------ */
@@ -152,7 +159,7 @@ __global__ void mfma_gemm(float *__restrict__ y,
             bf16x8 value = {};
             const int gc = col0 + c;
             if (gc < d_out)
-                value = load_w8(w, nullptr, (size_t)gc, n_in, bk + k);
+                value = load_bf16x8(w, (size_t)gc, n_in, bk + k);
             *reinterpret_cast<bf16x8 *>(&sw[c][k]) = value;
         }
         __syncthreads();
@@ -216,7 +223,7 @@ __global__ void mfma_gemm_rows(float *__restrict__ y,
             const int gc = col0 + c;
             bf16x8 value = {};
             if (gc < d_out)
-                value = load_w8(w, nullptr, (size_t)gc, n_in, bk + k);
+                value = load_bf16x8(w, (size_t)gc, n_in, bk + k);
             *reinterpret_cast<bf16x8 *>(&sw[c][k]) = value;
         }
         __syncthreads();
@@ -365,8 +372,8 @@ __global__ void mfma_head_gemm(float *__restrict__ y,
             const int gc = col0 + c;
             bf16x8 value = {};
             if (gc < d_out)
-                value = load_w8(w + (size_t)head * weight_head_stride,
-                                nullptr, (size_t)gc, n_in, bk + k);
+                value = load_bf16x8(w + (size_t)head * weight_head_stride,
+                                    (size_t)gc, n_in, bk + k);
             *reinterpret_cast<bf16x8 *>(&sw[c][k]) = value;
         }
         __syncthreads();
@@ -432,8 +439,8 @@ __global__ void mfma_gate_up_swiglu(float *__restrict__ y,
             const int gc = col0 + c;
             bf16x8 gv = {}, uv = {};
             if (gc < d_out) {
-                gv = load_w8(gate, nullptr, (size_t)gc, n_in, bk + k);
-                uv = load_w8(up, nullptr, (size_t)gc, n_in, bk + k);
+                gv = load_bf16x8(gate, (size_t)gc, n_in, bk + k);
+                uv = load_bf16x8(up, (size_t)gc, n_in, bk + k);
             }
             *reinterpret_cast<bf16x8 *>(&sg[c][k]) = gv;
             *reinterpret_cast<bf16x8 *>(&su[c][k]) = uv;
@@ -504,8 +511,8 @@ __global__ void mfma_gate_up_swiglu_rows(
             const int gc = col0 + c;
             bf16x8 gv = {}, uv = {};
             if (gc < d_out) {
-                gv = load_w8(gate, nullptr, (size_t)gc, n_in, bk + k);
-                uv = load_w8(up, nullptr, (size_t)gc, n_in, bk + k);
+                gv = load_bf16x8(gate, (size_t)gc, n_in, bk + k);
+                uv = load_bf16x8(up, (size_t)gc, n_in, bk + k);
             }
             *reinterpret_cast<bf16x8 *>(&sg[c][k]) = gv;
             *reinterpret_cast<bf16x8 *>(&su[c][k]) = uv;
@@ -951,10 +958,9 @@ __global__ void grouped_expert_down(
     const int wave = (int)threadIdx.x / HIP_WAVE;
     const int k4 = 4 * (lane >> 4);
     const int col = ntile * MFMA_N + wave * 16 + (lane & 15);
-    const bf16_t *wd = reinterpret_cast<const bf16_t *>(pool + down_offsets[expert]);
-    const float *dws = down_scale_offsets
-        ? reinterpret_cast<const float *>(pool + down_scale_offsets[expert])
-        : nullptr;
+    const char *wd8 = pool + down_offsets[expert];
+    const float *dws =
+        reinterpret_cast<const float *>(pool + down_scale_offsets[expert]);
     fp32v4 acc[M_TILES] = {};
 
     for (int bk = 0; bk < inter_dim; bk += MFMA_K) {
@@ -978,7 +984,7 @@ __global__ void grouped_expert_down(
             const int gc = ntile * MFMA_N + c;
             bf16x8 value = {};
             if (gc < hidden)
-                value = load_w8(wd, dws, (size_t)gc, inter_dim, bk + k);
+                value = load_w8_dequant(wd8, dws, (size_t)gc, inter_dim, bk + k);
             *reinterpret_cast<bf16x8 *>(&sw[c][k]) = value;
         }
         __syncthreads();
@@ -1347,48 +1353,97 @@ inline dim3 gemv_grid(int rows, int batch) {
                 (unsigned)div_up(batch, BATCH_TILE));
 }
 
+/* Launch one MFMA GEMM with the given configuration; `ws` non-null selects
+ * the w8a8 int8-MFMA kernel (activations quantized on the fly). The shape
+ * ladder in ops::gemm decides which configuration each tensor gets. */
+inline void gemm_mfma(float *y, const float *x, const bf16_t *w,
+                      const float *ws, int rows, int d_out, int n_in,
+                      bool add, bool large_m, const QuantScratch &qs,
+                      hipStream_t stream) {
+    dim3 grid((unsigned)div_up(d_out, kt::MFMA_TILE_N),
+              (unsigned)div_up(rows, large_m ? kt::PREFILL_ROWS
+                                             : kt::MFMA_BATCH_TILE));
+    if (ws) {
+        quantize_act(x, qs, rows, n_in, stream);
+        if (large_m)
+            mfma_gemm_i8<kt::PREFILL_ROW_TILES><<<grid, 256, 0, stream>>>(
+                y, qs.act_i8, qs.act_s, reinterpret_cast<const char *>(w),
+                ws, rows, d_out, n_in, add ? 1 : 0);
+        else
+            mfma_gemm_i8<1><<<grid, 256, 0, stream>>>(
+                y, qs.act_i8, qs.act_s, reinterpret_cast<const char *>(w),
+                ws, rows, d_out, n_in, add ? 1 : 0);
+    } else if (large_m) {
+        mfma_gemm_rows<kt::PREFILL_ROW_TILES><<<grid, 256, 0, stream>>>(
+            y, x, w, rows, d_out, n_in, add ? 1 : 0);
+    } else {
+        mfma_gemm<<<grid, 256, 0, stream>>>(
+            y, x, w, rows, d_out, n_in, add ? 1 : 0);
+    }
+    HIP_LAUNCH_CHECK();
+}
+
 /* Y[rows x d_out] = X[rows x n_in] @ W[d_out x n_in]^T (+= when add).
- * `ws` non-null means W is int8 with per-row scales: on the MFMA path the
- * activations are dynamically quantized and the int8 MFMA kernel runs.
  *
- * Shapes routed through here:
- *   decode (rows = batch <= 512)
- *     dsv: o_proj [B,2048,2048]  lm_head [B,102400,2048] moe_gate [B,64,2048]
- *          shared_down int8 [B,2048,2816]  dense_down l0 [B,2048,10944]
- *     glm: q_b [B,5120,768]  o_proj [B,2048,5120]  lm_head [B,154880,2048]
- *          moe_gate [B,64,2048]  shared_down bf16 [B,2048,1536]
- *          dense_down l0 [B,2048,10240]
- *   prefill (rows = packed tokens, up to ~62k)
- *     same weight shapes with large rows -> large-M kernels. */
+ * ===================== shape ladder (model, tensor) =====================
+ * Keyed on (d_out, n_in) against utils::constants::model. Every branch
+ * launches the same default configuration (gemm_mfma) today — tune each
+ * branch independently later. Within a branch:
+ *   large_m == false -> decode phase (rows = batch <= 512)
+ *   large_m == true  -> prefill phase (rows = packed prompt tokens)     */
 inline void gemm(float *y, const float *x, const bf16_t *w, const float *ws,
                  int rows, int d_out, int n_in, bool add,
                  const QuantScratch &qs, hipStream_t stream) {
+    namespace md = utils::constants::model;
     if (rows >= kt::MFMA_MIN_ROWS) {
         const bool large_m = rows >= kt::LARGE_M_MIN_ROWS;
-        dim3 grid((unsigned)div_up(d_out, kt::MFMA_TILE_N),
-                  (unsigned)div_up(rows, large_m ? kt::PREFILL_ROWS
-                                                 : kt::MFMA_BATCH_TILE));
-        if (ws) { /* w8a8: quantize activations, run int8 MFMA */
-            quantize_act(x, qs, rows, n_in, stream);
-            if (large_m)
-                mfma_gemm_i8<kt::PREFILL_ROW_TILES><<<grid, 256, 0, stream>>>(
-                    y, qs.act_i8, qs.act_s, reinterpret_cast<const char *>(w),
-                    ws, rows, d_out, n_in, add ? 1 : 0);
-            else
-                mfma_gemm_i8<1><<<grid, 256, 0, stream>>>(
-                    y, qs.act_i8, qs.act_s, reinterpret_cast<const char *>(w),
-                    ws, rows, d_out, n_in, add ? 1 : 0);
-        } else if (large_m) {
-            mfma_gemm_rows<kt::PREFILL_ROW_TILES><<<grid, 256, 0, stream>>>(
-                y, x, w, rows, d_out, n_in, add ? 1 : 0);
+        if (d_out == md::dsv::N_EXPERTS && n_in == md::dsv::HIDDEN) {
+            /* dsv+glm moe_gate router logits [rows, 64, 2048], bf16 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
+        } else if (d_out == md::dsv::Q_DIM && n_in == md::dsv::HIDDEN) {
+            /* dsv q_proj [rows, 3072, 2048], int8+a8 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
+        } else if (d_out == md::dsv::KV_DIM && n_in == md::dsv::HIDDEN) {
+            /* dsv kv_a_proj [rows, 576, 2048] int8+a8;
+               glm kv_a_proj [rows, 576, 2048] bf16 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
+        } else if (d_out == md::glm::Q_LORA && n_in == md::glm::HIDDEN) {
+            /* glm q_a_proj [rows, 768, 2048], bf16 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
+        } else if (d_out == md::glm::Q_DIM && n_in == md::glm::Q_LORA) {
+            /* glm q_b_proj [rows, 5120, 768], bf16 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
+        } else if (d_out == md::dsv::HIDDEN && n_in == md::dsv::ATTN_OUT) {
+            /* dsv o_proj [rows, 2048, 2048], int8+a8 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
+        } else if (d_out == md::glm::HIDDEN && n_in == md::glm::ATTN_OUT) {
+            /* glm o_proj [rows, 2048, 5120], bf16 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
+        } else if (d_out == md::dsv::HIDDEN && n_in == md::dsv::SHARED_INTER) {
+            /* dsv shared_down [rows, 2048, 2816], int8+a8 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
+        } else if (d_out == md::glm::HIDDEN && n_in == md::glm::SHARED_INTER) {
+            /* glm shared_down [rows, 2048, 1536], int8+a8 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
+        } else if (d_out == md::dsv::HIDDEN && n_in == md::dsv::DENSE_INTER) {
+            /* dsv dense_down (layer 0) [rows, 2048, 10944], int8+a8 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
+        } else if (d_out == md::glm::HIDDEN && n_in == md::glm::DENSE_INTER) {
+            /* glm dense_down (layer 0) [rows, 2048, 10240], bf16 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
+        } else if (d_out == md::dsv::VOCAB && n_in == md::dsv::HIDDEN) {
+            /* dsv lm_head [rows, 102400, 2048], int8+a8 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
+        } else if (d_out == md::glm::VOCAB && n_in == md::glm::HIDDEN) {
+            /* glm lm_head [rows, 154880, 2048], bf16 */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
         } else {
-            mfma_gemm<<<grid, 256, 0, stream>>>(
-                y, x, w, rows, d_out, n_in, add ? 1 : 0);
+            /* unlisted shape: default configuration */
+            gemm_mfma(y, x, w, ws, rows, d_out, n_in, add, large_m, qs, stream);
         }
-        HIP_LAUNCH_CHECK();
         return;
     }
-    /* rows < 4: one wave per output row */
+    /* rows < MFMA_MIN_ROWS: one wave per output row (dequant int8 if ws) */
     gemv<<<gemv_grid(d_out, rows), kt::GEMV_THREADS, 0, stream>>>(
         y, x, w, ws, d_out, n_in, rows, add ? 1 : 0);
     HIP_LAUNCH_CHECK();
@@ -1415,39 +1470,81 @@ inline void gemm_dual(float *y0, const bf16_t *w0, const float *ws0, int out0,
  * Shapes routed through here:
  *   dense FFN (layer 0): dsv [., 10944, 2048] bf16; glm [., 10240, 2048] bf16
  *   shared experts:      dsv [., 2816, 2048] int8(a8); glm [., 1536, 2048] bf16 */
+/* w8a8 gate/up over an activation that is already quantized into `qs`. */
+inline void gate_up_swiglu_i8_pre(float *y, const QuantScratch &qs,
+                                  const bf16_t *gate, const float *gws,
+                                  const bf16_t *up, const float *uws,
+                                  int rows, int d_out, int n_in,
+                                  hipStream_t stream) {
+    const bool large_m = rows >= kt::LARGE_M_MIN_ROWS;
+    dim3 grid((unsigned)div_up(d_out, kt::MFMA_TILE_N),
+              (unsigned)div_up(rows, large_m ? kt::PREFILL_ROWS
+                                             : kt::MFMA_BATCH_TILE));
+    if (large_m)
+        mfma_gate_up_swiglu_i8<kt::PREFILL_ROW_TILES><<<grid, 256, 0, stream>>>(
+            y, qs.act_i8, qs.act_s,
+            reinterpret_cast<const char *>(gate), gws,
+            reinterpret_cast<const char *>(up), uws, rows, d_out, n_in);
+    else
+        mfma_gate_up_swiglu_i8<1><<<grid, 256, 0, stream>>>(
+            y, qs.act_i8, qs.act_s,
+            reinterpret_cast<const char *>(gate), gws,
+            reinterpret_cast<const char *>(up), uws, rows, d_out, n_in);
+    HIP_LAUNCH_CHECK();
+}
+
+/* Launch one fused gate/up + SwiGLU with the default configuration. */
+inline void gate_up_mfma(float *y, const float *x,
+                         const bf16_t *gate, const float *gws,
+                         const bf16_t *up, const float *uws,
+                         int rows, int d_out, int n_in,
+                         const QuantScratch &qs, hipStream_t stream) {
+    const bool large_m = rows >= kt::LARGE_M_MIN_ROWS;
+    if (gws && uws) { /* w8a8 */
+        quantize_act(x, qs, rows, n_in, stream);
+        gate_up_swiglu_i8_pre(y, qs, gate, gws, up, uws, rows, d_out, n_in,
+                              stream);
+        return;
+    }
+    dim3 grid((unsigned)div_up(d_out, kt::MFMA_TILE_N),
+              (unsigned)div_up(rows, large_m ? kt::PREFILL_ROWS
+                                             : kt::MFMA_BATCH_TILE));
+    if (large_m)
+        mfma_gate_up_swiglu_rows<kt::PREFILL_ROW_TILES><<<grid, 256, 0,
+            stream>>>(y, x, gate, up, rows, d_out, n_in);
+    else
+        mfma_gate_up_swiglu<<<grid, 256, 0, stream>>>(
+            y, x, gate, up, rows, d_out, n_in);
+    HIP_LAUNCH_CHECK();
+}
+
+/* Fused gate/up + SwiGLU.
+ * ===================== shape ladder (model, tensor) =====================
+ * Same convention as ops::gemm: default configuration everywhere, tune per
+ * branch. rows < LARGE_M_MIN_ROWS -> decode, otherwise prefill.          */
 inline void gate_up_swiglu(float *y, const float *x,
                            const bf16_t *gate, const float *gws,
                            const bf16_t *up, const float *uws,
                            int rows, int d_out, int n_in,
                            const QuantScratch &qs, hipStream_t stream) {
+    namespace md = utils::constants::model;
     if (rows >= kt::MFMA_MIN_ROWS) {
-        const bool large_m = rows >= kt::LARGE_M_MIN_ROWS;
-        dim3 grid((unsigned)div_up(d_out, kt::MFMA_TILE_N),
-                  (unsigned)div_up(rows, large_m ? kt::PREFILL_ROWS
-                                                 : kt::MFMA_BATCH_TILE));
-        if (gws && uws) { /* w8a8 */
-            quantize_act(x, qs, rows, n_in, stream);
-            if (large_m)
-                mfma_gate_up_swiglu_i8<kt::PREFILL_ROW_TILES><<<
-                    grid, 256, 0, stream>>>(
-                        y, qs.act_i8, qs.act_s,
-                        reinterpret_cast<const char *>(gate), gws,
-                        reinterpret_cast<const char *>(up), uws,
-                        rows, d_out, n_in);
-            else
-                mfma_gate_up_swiglu_i8<1><<<grid, 256, 0, stream>>>(
-                    y, qs.act_i8, qs.act_s,
-                    reinterpret_cast<const char *>(gate), gws,
-                    reinterpret_cast<const char *>(up), uws,
-                    rows, d_out, n_in);
-        } else if (large_m) {
-            mfma_gate_up_swiglu_rows<kt::PREFILL_ROW_TILES><<<
-                grid, 256, 0, stream>>>(y, x, gate, up, rows, d_out, n_in);
+        if (d_out == md::dsv::DENSE_INTER && n_in == md::dsv::HIDDEN) {
+            /* dsv dense FFN (layer 0) [rows, 10944, 2048], int8+a8 */
+            gate_up_mfma(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
+        } else if (d_out == md::glm::DENSE_INTER && n_in == md::glm::HIDDEN) {
+            /* glm dense FFN (layer 0) [rows, 10240, 2048], bf16 */
+            gate_up_mfma(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
+        } else if (d_out == md::dsv::SHARED_INTER && n_in == md::dsv::HIDDEN) {
+            /* dsv shared experts [rows, 2816, 2048], int8+a8 */
+            gate_up_mfma(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
+        } else if (d_out == md::glm::SHARED_INTER && n_in == md::glm::HIDDEN) {
+            /* glm shared expert [rows, 1536, 2048], int8+a8 */
+            gate_up_mfma(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
         } else {
-            mfma_gate_up_swiglu<<<grid, 256, 0, stream>>>(
-                y, x, gate, up, rows, d_out, n_in);
+            /* unlisted shape: default configuration */
+            gate_up_mfma(y, x, gate, gws, up, uws, rows, d_out, n_in, qs, stream);
         }
-        HIP_LAUNCH_CHECK();
         return;
     }
     gate_up_swiglu_gemv<<<gemv_grid(d_out, rows), kt::GEMV_THREADS, 0,
@@ -1524,9 +1621,13 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
                 routes, H, inter, K, up_tiles);
         HIP_LAUNCH_CHECK();
 
-        gate_up_swiglu(hb, xn, d.shared_gate, d.shared_gate_s,
-                       d.shared_up, d.shared_up_s, rows, shared, H, qs,
-                       stream);
+        if (d.shared_gate_s) /* dsv: xn is already quantized in `qs` above */
+            gate_up_swiglu_i8_pre(hb, qs, d.shared_gate, d.shared_gate_s,
+                                  d.shared_up, d.shared_up_s, rows, shared,
+                                  H, stream);
+        else /* glm: shared experts stay bf16 */
+            gate_up_swiglu(hb, xn, d.shared_gate, nullptr,
+                           d.shared_up, nullptr, rows, shared, H, qs, stream);
 
         const int down_tiles = div_up(H, kt::MFMA_TILE_N);
         if (routed_i8) {
@@ -1589,9 +1690,10 @@ inline void dense_ffn(const Config &c, const DeviceLayer &d, int rows,
                       const QuantScratch &qs, hipStream_t stream) {
     const int H = c.hidden_size;
     const int inter = c.dense_inter_size;
-    gate_up_swiglu(hb, xn, d.dense_gate, nullptr, d.dense_up, nullptr,
-                   rows, inter, H, qs, stream);
-    gemm(x, hb, d.dense_down, nullptr, rows, H, inter, true, qs, stream);
+    gate_up_swiglu(hb, xn, d.dense_gate, d.dense_gate_s,
+                   d.dense_up, d.dense_up_s, rows, inter, H, qs, stream);
+    gemm(x, hb, d.dense_down, d.dense_down_s, rows, H, inter, true, qs,
+         stream);
 }
 
 } // namespace ops

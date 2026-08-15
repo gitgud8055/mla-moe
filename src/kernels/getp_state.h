@@ -46,6 +46,9 @@ struct LayerLayout {
     size_t moe_gate = NO_OFFSET, moe_bias = NO_OFFSET;
     size_t shared_gate = NO_OFFSET, shared_up = NO_OFFSET, shared_down = NO_OFFSET;
     /* Per-row int8 scale offsets; NO_OFFSET when that tensor stays bf16. */
+    size_t q_proj_s = NO_OFFSET, q_a_proj_s = NO_OFFSET, q_b_proj_s = NO_OFFSET;
+    size_t kv_a_proj_s = NO_OFFSET, o_proj_s = NO_OFFSET;
+    size_t dense_gate_s = NO_OFFSET, dense_up_s = NO_OFFSET, dense_down_s = NO_OFFSET;
     size_t shared_gate_s = NO_OFFSET, shared_up_s = NO_OFFSET, shared_down_s = NO_OFFSET;
     std::vector<size_t> expert_gate, expert_up, expert_down;
     std::vector<size_t> expert_gate_s, expert_up_s, expert_down_s;
@@ -66,6 +69,9 @@ struct DeviceLayer
     const bf16_t *shared_gate = nullptr, *shared_up = nullptr, *shared_down = nullptr;
     /* Non-null only for tensors quantized to int8 (then the matching weight
      * pointer above actually holds int8 data). */
+    const float *q_proj_s = nullptr, *q_a_proj_s = nullptr, *q_b_proj_s = nullptr;
+    const float *kv_a_proj_s = nullptr, *o_proj_s = nullptr;
+    const float *dense_gate_s = nullptr, *dense_up_s = nullptr, *dense_down_s = nullptr;
     const float *shared_gate_s = nullptr, *shared_up_s = nullptr, *shared_down_s = nullptr;
     const size_t *expert_gate_offsets = nullptr;
     const size_t *expert_up_offsets = nullptr;
@@ -79,6 +85,7 @@ struct GpuContext {
     Transformer *owner = nullptr;
     hipStream_t stream = nullptr;
     bf16_t *embed = nullptr, *final_norm = nullptr, *lm_head = nullptr;
+    float *lm_head_s = nullptr; /* non-null when lm_head is int8 */
     float *rope_inv_freq = nullptr;
     std::vector<LayerLayout> layouts;
     std::vector<std::vector<bf16_t>> host_wuk_t;
@@ -109,16 +116,20 @@ struct GpuContext {
     char *prefill_routed_i8 = nullptr;
     float *prefill_routed_s = nullptr;
 
+    /* MoE grouped-path scratch, shared by prefill and decode. */
+    int *moe_sorted_ids = nullptr;   /* expert-aligned route ids            */
+    int *moe_expert_ids = nullptr;   /* expert per aligned route block      */
+    int *moe_num_padded = nullptr;   /* single int: total padded routes     */
+    float *moe_route_out = nullptr;  /* per-route down-projection output    */
+
     /* Layer-major packed prefill workspace. */
     int *prompt_tokens = nullptr, *prefill_route_ids = nullptr;
     int *prefill_row_batches = nullptr, *prefill_row_positions = nullptr;
     int *prefill_offsets = nullptr;
-    int *prefill_topk = nullptr;
-    int *prefill_expert_counts = nullptr, *prefill_expert_buckets = nullptr;
     float *prefill_x = nullptr, *prefill_xn = nullptr;
     float *prefill_q = nullptr, *prefill_q_a = nullptr, *prefill_comp = nullptr;
     float *prefill_qrope = nullptr, *prefill_qabs = nullptr, *prefill_clat = nullptr;
-    float *prefill_ctx = nullptr, *prefill_ffn = nullptr;
+    float *prefill_ctx = nullptr;
     float *prefill_router = nullptr, *prefill_topk_weights = nullptr;
     float *prefill_hb = nullptr, *routed_hidden = nullptr;
     bf16_t *prefill_routed_hidden = nullptr;
