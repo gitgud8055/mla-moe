@@ -35,3 +35,9 @@ profile/
 /docs/decode-end-to-end.md
 rocprof*
 TOKEN*
+CLAUDE.md
+trace_out/
+reports/
+.rocprofv3/
+workloads/
+.claude/
