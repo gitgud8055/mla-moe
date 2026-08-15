@@ -44,3 +44,6 @@ token_batch_public_maxprefill_d512.txt
 request511.out
 
 AGENTS.md
+score_completions.py
+output2.txt
+docs/
