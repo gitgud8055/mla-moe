@@ -278,7 +278,7 @@ static size_t prefill_workspace_bytes(const Config &c, size_t rows) {
         + k * c.hidden_size;
     const size_t routes = rows * k;
     const size_t max_padded = routes
-        + (size_t)c.n_routed_experts * (kt::GROUPED_ROUTE_TILE - 1);
+        + (size_t)c.n_routed_experts * (kt::GROUPED_ALIGN_TILE - 1);
     const size_t w8a8_bytes =
         rows * act_scratch_cols(c) + rows * sizeof(float)
         + (g_qp.down_a8 ? routes * (size_t)c.moe_inter_size
@@ -291,7 +291,7 @@ static size_t prefill_workspace_bytes(const Config &c, size_t rows) {
         + ((size_t)g_max_batch + 1) * sizeof(int)
         + rows * k * sizeof(int)             /* top-k expert ids        */
         + max_padded * sizeof(int)
-        + (max_padded + kt::GROUPED_ROUTE_TILE - 1) / kt::GROUPED_ROUTE_TILE
+        + (max_padded + kt::GROUPED_ALIGN_TILE - 1) / kt::GROUPED_ALIGN_TILE
             * sizeof(int)
         + sizeof(int);
 }
@@ -328,7 +328,7 @@ static void allocate_prefill_workspace(const Config &c, int target_rows) {
     const size_t k = std::max(1, c.n_experts_per_tok);
     const size_t routes = rows * k;
     const size_t max_padded = routes
-        + (size_t)c.n_routed_experts * (kt::GROUPED_ROUTE_TILE - 1);
+        + (size_t)c.n_routed_experts * (kt::GROUPED_ALIGN_TILE - 1);
 
     device_alloc(&g.prompt_tokens, rows);
     device_alloc(&g.prefill_row_batches, rows);
@@ -349,7 +349,7 @@ static void allocate_prefill_workspace(const Config &c, int target_rows) {
     device_alloc(&g.prefill_topk_weights, rows * k);
     device_alloc(&g.moe_sorted_ids, max_padded);
     device_alloc(&g.moe_expert_ids,
-                 ops::div_up((int)max_padded, kt::GROUPED_ROUTE_TILE));
+                 ops::div_up((int)max_padded, kt::GROUPED_ALIGN_TILE));
     device_alloc(&g.moe_num_padded, 1);
     device_alloc(&g.prefill_routed_hidden, routes * c.moe_inter_size);
     device_alloc(&g.moe_route_out, routes * c.hidden_size);

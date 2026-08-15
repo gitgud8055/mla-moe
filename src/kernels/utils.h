@@ -143,7 +143,13 @@ namespace kernel {
     constexpr int FLASH_SMALL_THREADS = 512, FLASH_SMALL_KV_TILE = 16;
     constexpr int FLASH_LARGE_THREADS = 256, FLASH_LARGE_KV_TILE = 8;
     constexpr int PREFILL_THREADS = 256, PREFILL_KV_TILE = 8;
-    constexpr int GROUPED_ROUTE_TILE = 16; /* MoE route alignment tile      */
+    constexpr int GROUPED_ROUTE_TILE = 16; /* MoE MFMA row tile (BLOCK_M)    */
+    /* Row tiles per grouped-expert block. Decode is weight-bound: each
+     * m-block reloads the full expert weight, so packing more routed rows per
+     * block (align tile = GROUPED_ROUTE_TILE * GROUPED_M_TILES) cuts redundant
+     * weight traffic at the cost of extra padding for sparse experts. */
+    constexpr int GROUPED_M_TILES = 4;
+    constexpr int GROUPED_ALIGN_TILE = GROUPED_ROUTE_TILE * GROUPED_M_TILES;
 }
 
 } // namespace constants
