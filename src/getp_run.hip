@@ -31,20 +31,20 @@ namespace batch_decode_kernels {
                                    const bf16_t *, int, int, int);
     namespace decode {
         __global__ void kv_norm_rope(
-            float *, const float *, const bf16_t *, const int *, int, int,
+            bf16_t *, const float *, const bf16_t *, const int *, int, int,
             int, int, int, const float *, int, float);
         __global__ void q_absorb_rope(
             float *, float *, const float *, const bf16_t *, const int *, int,
             int, int, int, int, int, const float *, int);
         __global__ void attention_score(
-            float *, const float *, const float *, const float *, const int *,
+            float *, const float *, const float *, const bf16_t *, const int *,
             int, int, int, int, int, int, int, float);
         __global__ void latent_context(
-            float *, const float *, const float *, const int *, int, int, int,
+            float *, const float *, const bf16_t *, const int *, int, int, int,
             int, int, int);
         template <int KV_TILE>
         __global__ void flash_attention(
-            float *, const float *, const float *, const float *, const int *,
+            float *, const float *, const float *, const bf16_t *, const int *,
             int, int, int, int, int, int, float);
         __global__ void q_rope(
             float *, const float *, const int *, int, int, int, int, int,
@@ -54,14 +54,14 @@ namespace batch_decode_kernels {
     }
     namespace prefill {
         __global__ void kv_norm_rope(
-            float *, const float *, const bf16_t *, const int *, const int *,
+            bf16_t *, const float *, const bf16_t *, const int *, const int *,
             int, int, int, int, int, int, const float *, int, float);
         __global__ void q_rope(
             float *, const float *, const int *, int, int, int, int,
             const float *, int);
         template <int KV_TILE>
         __global__ void flash_attention(
-            float *, const float *, const float *, const float *, const int *,
+            float *, const float *, const float *, const bf16_t *, const int *,
             const int *, int, int, int, int, int, int, int, float);
         __global__ void gather_last_hidden(
             float *, const float *, const int *, int, int, int);
@@ -359,7 +359,7 @@ static void enqueue_layer_copy(const LayerLayout &a, void *pool) {
 static hipError_t try_allocate_sequence_buffers(const Config &c, int cap) {
     const int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
     hipError_t status = hipMalloc(reinterpret_cast<void **>(&g.kv_cache),
-                                  (size_t)c.n_layers * g_max_batch * cap * KVD * sizeof(float));
+                                  (size_t)c.n_layers * g_max_batch * cap * KVD * sizeof(bf16_t));
     if (status != hipSuccess)
         return status;
 
@@ -757,7 +757,7 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
                 g.prefill_xn, H, rows);
         }
 
-        float *layer_cache = g.kv_cache
+        bf16_t *layer_cache = g.kv_cache
             + (size_t)l * g_max_batch * g.kv_capacity * KVD;
         batch_decode_kernels::prefill::kv_norm_rope<<<
             rows, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
@@ -788,7 +788,7 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
         dim3 flash_grid((unsigned)div_up(NH, head_tile), (unsigned)rows);
         batch_decode_kernels::prefill::flash_attention<kPrefillKvTile><<<
             flash_grid, kPrefillThreads,
-            (size_t)kPrefillKvTile * KVD * sizeof(float), g.stream>>>(
+            (size_t)kPrefillKvTile * KVD * sizeof(bf16_t), g.stream>>>(
                 g.prefill_clat, g.prefill_qabs, g.prefill_qrope,
                 layer_cache, row_batches, row_positions, slot_base, rows, NH,
                 g.kv_capacity, KVD, KVL, QKR, c.softmax_scale);
@@ -898,7 +898,7 @@ static void run_step(const int *device_tokens, int *generated,
             launch_batch_dual_gemv(
                 g.q, d.q_proj, QD, g.comp, d.kv_a_proj, KVD, g.xn, H, batch);
         }
-        float *layer_cache = g.kv_cache +
+        bf16_t *layer_cache = g.kv_cache +
             (size_t)l * g_max_batch * g.kv_capacity * KVD;
         batch_decode_kernels::decode::kv_norm_rope<<<batch,
             kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
@@ -940,7 +940,7 @@ static void run_step(const int *device_tokens, int *generated,
                 batch_decode_kernels::decode::flash_attention<
                     kFlashLargeBatchKvTile><<<
                         flash_grid, kFlashLargeBatchThreads,
-                        (size_t)kFlashLargeBatchKvTile * KVD * sizeof(float),
+                        (size_t)kFlashLargeBatchKvTile * KVD * sizeof(bf16_t),
                         g.stream>>>(
                             g.clat, g.qabs, g.qrope, layer_cache, positions,
                             batch, NH, g.kv_capacity, KVD, KVL, QKR,
@@ -953,7 +953,7 @@ static void run_step(const int *device_tokens, int *generated,
                 batch_decode_kernels::decode::flash_attention<
                     kFlashSmallBatchKvTile><<<
                         flash_grid, kFlashSmallBatchThreads,
-                        (size_t)kFlashSmallBatchKvTile * KVD * sizeof(float),
+                        (size_t)kFlashSmallBatchKvTile * KVD * sizeof(bf16_t),
                         g.stream>>>(
                             g.clat, g.qabs, g.qrope, layer_cache, positions,
                             batch, NH, g.kv_capacity, KVD, KVL, QKR,
@@ -1092,7 +1092,7 @@ extern "C" void warm_up(Transformer *t) {
     g_flash_threshold = configured_threshold(
         "GETP_FLASH_THRESHOLD", kDefaultFlashThreshold);
     g_prompt_token_cap = configured_positive_int(
-        "GETP_PROMPT_TOKEN_CAP", 160, c.max_seq_len);
+        "GETP_PROMPT_TOKEN_CAP", 120, c.max_seq_len);
     g_prefill_large_m =
         std::getenv("GETP_DISABLE_PREFILL_LARGE_M") == nullptr;
     int device = 0;
@@ -1207,7 +1207,7 @@ extern "C" void warm_up(Transformer *t) {
         + (size_t)std::max(1, c.n_experts_per_tok) + c.vocab_size
         + (size_t)c.n_heads * warm_capacity;
     size_t per_batch_bytes = per_batch_floats * sizeof(float)
-        + (size_t)c.n_layers * warm_capacity * KVD * sizeof(float)
+        + (size_t)c.n_layers * warm_capacity * KVD * sizeof(bf16_t)
         + ((size_t)std::max(1, c.n_experts_per_tok) + 1 + c.max_seq_len)
             * sizeof(int);
     constexpr size_t vram_reserve = kVramReserve;
@@ -1310,7 +1310,7 @@ extern "C" void warm_up(Transformer *t) {
         HIP_CHECK(hipStreamSynchronize(g.stream));
     }
 
-    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv=fp32 prefill_tokens=%d decode_tokens=%d prompt_cap=%d warm_kv=%d prefill_rows=%d prefill_m=%d mfma_at=%d flash_at=%d graphs=%d\n",
+    std::fprintf(stderr, "[getp HIP] device=%s vram=%.2f GiB weights=%.2f GiB mode=resident kv=bf16-rne prefill_tokens=%d decode_tokens=%d prompt_cap=%d warm_kv=%d prefill_rows=%d prefill_m=%d mfma_at=%d flash_at=%d graphs=%d\n",
                  prop.name, (double)total_bytes / (double)(1ULL << 30),
                  (double)(global_bytes + layer_total) / (double)(1ULL << 30),
                  g_prefill_token_budget, g_decode_token_budget,

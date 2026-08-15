@@ -791,7 +791,7 @@ __global__ void gate_up_swiglu(float *y, const float *x, const bf16_t *gate,
 
 namespace decode {
 
-__global__ void kv_norm_rope(float *cache, const float *comp, const bf16_t *norm,
+__global__ void kv_norm_rope(bf16_t *cache, const float *comp, const bf16_t *norm,
                              const int *positions, int batch, int capacity, int kv_rank,
                              int kv_dim, int rope_dim, const float *inv_freq,
                              int interleaved, float eps) {
@@ -800,7 +800,7 @@ __global__ void kv_norm_rope(float *cache, const float *comp, const bf16_t *norm
     if (b >= batch) return;
     const int pos = positions[b];
     const float *src = comp + (size_t)b * kv_dim;
-    float *dst = cache + ((size_t)b * capacity + pos) * kv_dim;
+    bf16_t *dst = cache + ((size_t)b * capacity + pos) * kv_dim;
     float ss = 0.0f;
     for (int i = (int)threadIdx.x; i < kv_rank; i += THREADS) ss += src[i] * src[i];
     scratch[threadIdx.x] = ss;
@@ -811,21 +811,21 @@ __global__ void kv_norm_rope(float *cache, const float *comp, const bf16_t *norm
     }
     float inv = rsqrtf(scratch[0] / (float)kv_rank + eps);
     for (int i = (int)threadIdx.x; i < kv_rank; i += THREADS)
-        dst[i] = src[i] * inv * gpu_bf16_to_f32(norm[i]);
+        dst[i] = gpu_f32_to_bf16(src[i] * inv * gpu_bf16_to_f32(norm[i]));
     int j = (int)threadIdx.x;
     if (j < rope_dim / 2) {
         const float *v = src + kv_rank;
-        float *o = dst + kv_rank;
+        bf16_t *o = dst + kv_rank;
         float angle = (float)pos * inv_freq[j];
         float co = cosf(angle), si = sinf(angle);
         float even = v[2 * j], odd = v[2 * j + 1];
         if (!interleaved) {
-            o[2*j] = even*co - odd*si;
-            o[2*j+1] = even*si + odd*co;
+            o[2*j] = gpu_f32_to_bf16(even*co - odd*si);
+            o[2*j+1] = gpu_f32_to_bf16(even*si + odd*co);
         } else {
             int half=rope_dim/2;
-            o[j]=even*co-odd*si;
-            o[half+j]=odd*co+even*si;
+            o[j]=gpu_f32_to_bf16(even*co-odd*si);
+            o[half+j]=gpu_f32_to_bf16(odd*co+even*si);
         }
     }
 }
@@ -898,7 +898,7 @@ namespace prefill {
  * local sequence and absolute position, so heterogeneous prompts share one
  * projection/MoE batch without padding or length sorting. */
 __global__ void kv_norm_rope(
-    float *cache, const float *comp, const bf16_t *norm,
+    bf16_t *cache, const float *comp, const bf16_t *norm,
     const int *row_batches, const int *row_positions, int slot_base, int rows,
     int capacity, int kv_rank, int kv_dim, int rope_dim,
     const float *inv_freq, int interleaved, float eps) {
@@ -908,7 +908,7 @@ __global__ void kv_norm_rope(
     const int b = slot_base + row_batches[row];
     const int pos = row_positions[row];
     const float *src = comp + (size_t)row * kv_dim;
-    float *dst = cache + ((size_t)b * capacity + pos) * kv_dim;
+    bf16_t *dst = cache + ((size_t)b * capacity + pos) * kv_dim;
     float ss = 0.0f;
     for (int i = (int)threadIdx.x; i < kv_rank; i += THREADS)
         ss += src[i] * src[i];
@@ -921,22 +921,22 @@ __global__ void kv_norm_rope(
     }
     const float inv = rsqrtf(scratch[0] / (float)kv_rank + eps);
     for (int i = (int)threadIdx.x; i < kv_rank; i += THREADS)
-        dst[i] = src[i] * inv * gpu_bf16_to_f32(norm[i]);
+        dst[i] = gpu_f32_to_bf16(src[i] * inv * gpu_bf16_to_f32(norm[i]));
 
     const int j = (int)threadIdx.x;
     if (j < rope_dim / 2) {
         const float *v = src + kv_rank;
-        float *o = dst + kv_rank;
+        bf16_t *o = dst + kv_rank;
         const float angle = (float)pos * inv_freq[j];
         const float co = cosf(angle), si = sinf(angle);
         const float even = v[2 * j], odd = v[2 * j + 1];
         if (!interleaved) {
-            o[2 * j] = even * co - odd * si;
-            o[2 * j + 1] = even * si + odd * co;
+            o[2 * j] = gpu_f32_to_bf16(even * co - odd * si);
+            o[2 * j + 1] = gpu_f32_to_bf16(even * si + odd * co);
         } else {
             const int half = rope_dim / 2;
-            o[j] = even * co - odd * si;
-            o[half + j] = odd * co + even * si;
+            o[j] = gpu_f32_to_bf16(even * co - odd * si);
+            o[half + j] = gpu_f32_to_bf16(odd * co + even * si);
         }
     }
 }
@@ -973,11 +973,11 @@ __global__ void q_rope(
 template <int KV_TILE>
 __global__ void flash_attention(
     float *__restrict__ clat, const float *__restrict__ qabs,
-    const float *__restrict__ qrope, const float *__restrict__ cache,
+    const float *__restrict__ qrope, const bf16_t *__restrict__ cache,
     const int *__restrict__ row_batches,
     const int *__restrict__ row_positions, int slot_base, int rows, int heads,
     int capacity, int kv_dim, int kv_rank, int rope_dim, float scale) {
-    extern __shared__ float shared_cache[];
+    extern __shared__ bf16_t shared_cache[];
     const int wave = (int)threadIdx.x / HIP_WAVE;
     const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
     const int waves = (int)blockDim.x / HIP_WAVE;
@@ -989,7 +989,7 @@ __global__ void flash_attention(
     const size_t qh = (size_t)row * heads + h;
     const float *qa = active ? qabs + qh * kv_rank : nullptr;
     const float *qp = active ? qrope + qh * rope_dim : nullptr;
-    const float *cache_b = cache + (size_t)b * capacity * kv_dim;
+    const bf16_t *cache_b = cache + (size_t)b * capacity * kv_dim;
     const int last_query = qpos + 1;
     constexpr int VALUES_PER_LANE = 8;
     float acc[VALUES_PER_LANE] = {};
@@ -1009,15 +1009,15 @@ __global__ void flash_attention(
             const int key = k0 + t;
             const bool valid = active && t < tile && key <= qpos;
             float score_nope = 0.0f;
-            const float *ckv = shared_cache + t * kv_dim;
+            const bf16_t *ckv = shared_cache + t * kv_dim;
 #pragma unroll
             for (int q = 0; q < VALUES_PER_LANE; ++q) {
                 const int r = lane + q * HIP_WAVE;
                 if (valid && r < kv_rank)
-                    score_nope += qa[r] * ckv[r];
+                    score_nope += qa[r] * gpu_bf16_to_f32(ckv[r]);
             }
             float score_rope = valid && lane < rope_dim
-                ? qp[lane] * ckv[kv_rank + lane] : 0.0f;
+                ? qp[lane] * gpu_bf16_to_f32(ckv[kv_rank + lane]) : 0.0f;
             score_nope = wave_sum(score_nope);
             score_rope = wave_sum(score_rope);
             scores[t] = valid
@@ -1042,12 +1042,12 @@ __global__ void flash_attention(
             const float weight = key <= qpos
                 ? expf(scores[t] - next_max) : 0.0f;
             denominator += weight;
-            const float *ckv = shared_cache + t * kv_dim;
+            const bf16_t *ckv = shared_cache + t * kv_dim;
 #pragma unroll
             for (int q = 0; q < VALUES_PER_LANE; ++q) {
                 const int r = lane + q * HIP_WAVE;
                 if (active && r < kv_rank)
-                    acc[q] += ckv[r] * weight;
+                    acc[q] += gpu_bf16_to_f32(ckv[r]) * weight;
             }
         }
         running_max = next_max;
@@ -1065,7 +1065,7 @@ __global__ void flash_attention(
 }
 
 template __global__ void flash_attention<8>(
-    float *, const float *, const float *, const float *, const int *,
+    float *, const float *, const float *, const bf16_t *, const int *,
     const int *, int, int, int, int, int, int, int, float);
 
 __global__ void gather_last_hidden(float *dst, const float *src,
@@ -1083,7 +1083,7 @@ __global__ void gather_last_hidden(float *dst, const float *src,
 namespace decode {
 
 __global__ void attention_score(float *scores, const float *qabs,
-                                const float *qrope, const float *cache,
+                                const float *qrope, const bf16_t *cache,
                                 const int *positions, int batch, int heads,
                                 int max_kv_len, int capacity,
                                 int kv_dim, int kv_rank, int rope_dim, float scale) {
@@ -1095,10 +1095,10 @@ __global__ void attention_score(float *scores, const float *qabs,
     if(k>=kv_len){if(lane==0)scores[((size_t)b*heads+h)*capacity+k]=-INFINITY;return;}
     const float *qa=qabs+((size_t)b*heads+h)*kv_rank;
     const float *qp=qrope+((size_t)b*heads+h)*rope_dim;
-    const float *ckv=cache+((size_t)b*capacity+k)*kv_dim;
+    const bf16_t *ckv=cache+((size_t)b*capacity+k)*kv_dim;
     float sn=0.0f,sp=0.0f;
-    for(int r=lane;r<kv_rank;r+=HIP_WAVE)sn+=qa[r]*ckv[r];
-    for(int d=lane;d<rope_dim;d+=HIP_WAVE)sp+=qp[d]*ckv[kv_rank+d];
+    for(int r=lane;r<kv_rank;r+=HIP_WAVE)sn+=qa[r]*gpu_bf16_to_f32(ckv[r]);
+    for(int d=lane;d<rope_dim;d+=HIP_WAVE)sp+=qp[d]*gpu_bf16_to_f32(ckv[kv_rank+d]);
     sn=wave_sum(sn);sp=wave_sum(sp);
     if(lane==0)scores[((size_t)b*heads+h)*capacity+k]=(sn+sp)*scale;
 }
@@ -1111,11 +1111,11 @@ template <int KV_TILE>
 __global__ void flash_attention(float *__restrict__ clat,
                              const float *__restrict__ qabs,
                              const float *__restrict__ qrope,
-                             const float *__restrict__ cache,
+                             const bf16_t *__restrict__ cache,
                              const int *__restrict__ positions,
                              int batch, int heads, int capacity,
                              int kv_dim, int kv_rank, int rope_dim, float scale) {
-    extern __shared__ float shared_cache[];
+    extern __shared__ bf16_t shared_cache[];
     const int wave = (int)threadIdx.x / HIP_WAVE;
     const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
     const int waves = (int)blockDim.x / HIP_WAVE;
@@ -1127,7 +1127,7 @@ __global__ void flash_attention(float *__restrict__ clat,
         ? qabs + ((size_t)b * heads + h) * kv_rank : nullptr;
     const float *qp = active
         ? qrope + ((size_t)b * heads + h) * rope_dim : nullptr;
-    const float *cache_b = cache + (size_t)b * capacity * kv_dim;
+    const bf16_t *cache_b = cache + (size_t)b * capacity * kv_dim;
     constexpr int VALUES_PER_LANE = 8;
     float acc[VALUES_PER_LANE] = {};
     float running_max = -INFINITY;
@@ -1143,15 +1143,15 @@ __global__ void flash_attention(float *__restrict__ clat,
         float scores[KV_TILE];
         for (int t = 0; t < KV_TILE; ++t) {
             float score_nope = 0.0f;
-            const float *ckv = shared_cache + t * kv_dim;
+            const bf16_t *ckv = shared_cache + t * kv_dim;
 #pragma unroll
             for (int q = 0; q < VALUES_PER_LANE; ++q) {
                 const int r = lane + q * HIP_WAVE;
                 if (active && t < tile && r < kv_rank)
-                    score_nope += qa[r] * ckv[r];
+                    score_nope += qa[r] * gpu_bf16_to_f32(ckv[r]);
             }
             float score_rope = active && t < tile && lane < rope_dim
-                ? qp[lane] * ckv[kv_rank + lane] : 0.0f;
+                ? qp[lane] * gpu_bf16_to_f32(ckv[kv_rank + lane]) : 0.0f;
             score_nope = wave_sum(score_nope);
             score_rope = wave_sum(score_rope);
             scores[t] = t < tile
@@ -1172,12 +1172,12 @@ __global__ void flash_attention(float *__restrict__ clat,
             if (t >= tile) break;
             const float weight = expf(scores[t] - next_max);
             denominator += weight;
-            const float *ckv = shared_cache + t * kv_dim;
+            const bf16_t *ckv = shared_cache + t * kv_dim;
 #pragma unroll
             for (int q = 0; q < VALUES_PER_LANE; ++q) {
                 const int r = lane + q * HIP_WAVE;
                 if (active && r < kv_rank)
-                    acc[q] += ckv[r] * weight;
+                    acc[q] += gpu_bf16_to_f32(ckv[r]) * weight;
             }
         }
         running_max = next_max;
@@ -1196,13 +1196,13 @@ __global__ void flash_attention(float *__restrict__ clat,
 }
 
 template __global__ void flash_attention<8>(
-    float *, const float *, const float *, const float *, const int *, int,
+    float *, const float *, const float *, const bf16_t *, const int *, int,
     int, int, int, int, int, float);
 template __global__ void flash_attention<16>(
-    float *, const float *, const float *, const float *, const int *, int,
+    float *, const float *, const float *, const bf16_t *, const int *, int,
     int, int, int, int, int, float);
 
-__global__ void latent_context(float *clat, const float *scores, const float *cache,
+__global__ void latent_context(float *clat, const float *scores, const bf16_t *cache,
                                const int *positions, int batch, int heads,
                                int max_kv_len, int capacity,
                                int kv_dim, int kv_rank) {
@@ -1213,10 +1213,10 @@ __global__ void latent_context(float *clat, const float *scores, const float *ca
     int h=row/kv_rank,r=row-h*kv_rank;
     const int kv_len=positions[b]+1;
     const float *a=scores+((size_t)b*heads+h)*capacity;
-    const float *cb=cache+(size_t)b*capacity*kv_dim;
+    const bf16_t *cb=cache+(size_t)b*capacity*kv_dim;
     float sum=0.0f;
     for(int k=lane;k<kv_len;k+=HIP_WAVE)
-        sum+=a[k]*cb[(size_t)k*kv_dim+r];
+        sum+=a[k]*gpu_bf16_to_f32(cb[(size_t)k*kv_dim+r]);
     sum=wave_sum(sum);
     if(lane==0)clat[((size_t)b*heads+h)*kv_rank+r]=sum;
 }

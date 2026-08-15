@@ -70,7 +70,7 @@ struct GpuContext {
     float *qrope = nullptr, *qabs = nullptr, *scores = nullptr, *clat = nullptr;
     float *ctx = nullptr, *hb = nullptr, *router = nullptr;
     float *logits = nullptr;
-    float *kv_cache = nullptr;
+    bf16_t *kv_cache = nullptr;
     int *topk = nullptr, *next_token = nullptr, *generated = nullptr;
     int *decode_positions = nullptr;
     float *topk_weights = nullptr;
