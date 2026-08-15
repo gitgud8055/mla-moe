@@ -20,7 +20,8 @@
 #include "kernels/getp_state.h"
 
 using namespace std;
-namespace batch_decode_kernels {
+
+namespace prefill_kernels {
     __global__ void embedding(float *, const bf16_t *, const int *, int *,
                               int, int, int, int);
     __global__ void rmsnorm(float *, const float *, const bf16_t *, int, int, float);
@@ -29,43 +30,18 @@ namespace batch_decode_kernels {
                               int, const float *, int, int);
     __global__ void gate_up_swiglu(float *, const float *, const bf16_t *,
                                    const bf16_t *, int, int, int);
-    namespace decode {
-        __global__ void kv_norm_rope(
-            bf16_t *, const float *, const bf16_t *, const int *, int, int,
-            int, int, int, const float *, int, float);
-        __global__ void q_absorb_rope(
-            float *, float *, const float *, const bf16_t *, const int *, int,
-            int, int, int, int, int, const float *, int);
-        __global__ void attention_score(
-            float *, const float *, const float *, const bf16_t *, const int *,
-            int, int, int, int, int, int, int, float);
-        __global__ void latent_context(
-            float *, const float *, const bf16_t *, const int *, int, int, int,
-            int, int, int);
-        template <int KV_TILE>
-        __global__ void flash_attention(
-            float *, const float *, const float *, const bf16_t *, const int *,
-            int, int, int, int, int, int, float);
-        __global__ void q_rope(
-            float *, const float *, const int *, int, int, int, int, int,
-            const float *, int);
-        __global__ void value_up(
-            float *, const float *, const bf16_t *, int, int, int, int, size_t);
-    }
-    namespace prefill {
-        __global__ void kv_norm_rope(
-            bf16_t *, const float *, const bf16_t *, const int *, const int *,
-            int, int, int, int, int, int, const float *, int, float);
-        __global__ void q_rope(
-            float *, const float *, const int *, int, int, int, int,
-            const float *, int);
-        template <int KV_TILE>
-        __global__ void flash_attention(
-            float *, const float *, const float *, const bf16_t *, const int *,
-            const int *, int, int, int, int, int, int, int, float);
-        __global__ void gather_last_hidden(
-            float *, const float *, const int *, int, int, int);
-    }
+    __global__ void kv_norm_rope(
+        bf16_t *, const float *, const bf16_t *, const int *, const int *,
+        int, int, int, int, int, int, const float *, int, float);
+    __global__ void q_rope(
+        float *, const float *, const int *, int, int, int, int,
+        const float *, int);
+    template <int KV_TILE>
+    __global__ void flash_attention(
+        float *, const float *, const float *, const bf16_t *, const int *,
+        const int *, int, int, int, int, int, int, int, float);
+    __global__ void gather_last_hidden(
+        float *, const float *, const int *, int, int, int);
     __global__ void routed_shared_gate_up(float *, float *, const float *,
                                           const char *, const size_t *, const size_t *,
                                           const int *, const bf16_t *, const bf16_t *,
@@ -87,7 +63,6 @@ namespace batch_decode_kernels {
     template <int M_TILES>
     __global__ void mfma_gate_up_swiglu_rows(
         float *, const float *, const bf16_t *, const bf16_t *, int, int, int);
-    __global__ void swiglu(float *, const float *, const float *, int);
     __global__ void align_routes(const int *, int, int, int, int *, int *, int *);
     template <int BLOCK_M, int M_TILES>
     __global__ void grouped_expert_gate_up(
@@ -99,6 +74,80 @@ namespace batch_decode_kernels {
         const int *, const int *, float *, int, int, int, int);
     __global__ void reduce_routes_add(float *, const float *, const float *,
                                       int, int, int);
+    template <int THREADS>
+    __global__ void router_topk_kernel(
+        float *, const float *, int *, float *, int, int, int, int, int, float);
+    template <int THREADS>
+    __global__ void router_topk_wave64_kernel(
+        float *, const float *, int *, float *, int, int, int, int, int, float);
+}
+
+namespace batch_decode_kernels {
+    namespace decode {
+        __global__ void embedding(float *, const bf16_t *, const int *, int *,
+                                  int, int, int, int);
+        __global__ void rmsnorm(float *, const float *, const bf16_t *, int, int, float);
+        __global__ void gemv(float *, const float *, const bf16_t *, int, int, int, int);
+        __global__ void dual_gemv(float *, const bf16_t *, int, float *, const bf16_t *,
+                                  int, const float *, int, int);
+        __global__ void gate_up_swiglu(float *, const float *, const bf16_t *,
+                                       const bf16_t *, int, int, int);
+        __global__ void kv_norm_rope(
+            bf16_t *, const float *, const bf16_t *, const int *, int, int,
+            int, int, int, const float *, int, float);
+        __global__ void q_absorb_rope(
+            float *, float *, const float *, const bf16_t *, const int *, int,
+            int, int, int, int, int, const float *, int);
+        __global__ void attention_score(
+            float *, const float *, const float *, const bf16_t *, const int *,
+            int, int, int, int, int, int, int, float);
+        __global__ void latent_context(
+            float *, const float *, const bf16_t *, const int *, int, int, int,
+            int, int, int);
+        template <int KV_TILE>
+        __global__ void flash_attention(
+            float *, const float *, const float *, const bf16_t *, const int *,
+            int, int, int, int, int, int, float);
+        __global__ void q_rope(
+            float *, const float *, const int *, int, int, int, int, int,
+            const float *, int);
+        __global__ void value_up(
+            float *, const float *, const bf16_t *, int, int, int, int, size_t);
+        __global__ void mfma_gemm(
+            float *, const float *, const bf16_t *, int, int, int, int);
+        __global__ void mfma_head_gemm(float *, const float *, const bf16_t *,
+                                       int, int, int, int, int, int, size_t);
+        __global__ void mfma_gate_up_swiglu(float *, const float *, const bf16_t *,
+                                            const bf16_t *, int, int, int);
+        __global__ void align_routes(const int *, int, int, int, int *, int *, int *);
+        template <int BLOCK_M, int M_TILES>
+        __global__ void grouped_expert_gate_up(
+            const float *, const char *, const size_t *, const size_t *,
+            const int *, const int *, float *, bf16_t *, int, int, int, int, int);
+        template <int BLOCK_M, int M_TILES>
+        __global__ void grouped_expert_down(
+            const float *, const bf16_t *, const char *, const size_t *,
+            const int *, const int *, float *, int, int, int, int);
+        __global__ void reduce_routes_add(float *, const float *, const float *,
+                                          int, int, int);
+        __global__ void routed_shared_gate_up(float *, float *, const float *,
+                                              const char *, const size_t *, const size_t *,
+                                              const int *, const bf16_t *, const bf16_t *,
+                                              int, int, int, int, int);
+        __global__ void routed_shared_down(float *, const float *, const float *,
+                                           const char *, const size_t *, const int *,
+                                           const float *, const bf16_t *, int, int, int,
+                                           int, int);
+        template <int THREADS>
+        __global__ void softmax_rows(float *, int, int, int, int);
+        __global__ void argmax(const float *, int, int *, int);
+        template <int THREADS>
+        __global__ void router_topk_kernel(
+            float *, const float *, int *, float *, int, int, int, int, int, float);
+        template <int THREADS>
+        __global__ void router_topk_wave64_kernel(
+            float *, const float *, int *, float *, int, int, int, int, int, float);
+    }
 }
 
 namespace {
@@ -489,7 +538,9 @@ static void allocate_prefill_workspace(const Config &c, int target_rows) {
 
 
 
-static dim3 batch_projection_grid(int rows, int batch)
+namespace prefill {
+
+static dim3 projection_grid(int rows, int batch)
 {
     constexpr int rows_per_block = kernel_tuning::GEMV_THREADS / HIP_WAVE;
     constexpr int batch_tile = 2;
@@ -497,47 +548,48 @@ static dim3 batch_projection_grid(int rows, int batch)
                 (unsigned)div_up(batch, batch_tile));
 }
 
-static void launch_batch_gemv(float *y, const float *x, const bf16_t *w,
+static void launch_gemv(float *y, const float *x, const bf16_t *w,
                               int out, int in, int batch, bool add = false)
 {
+    /* Prefill GEMM launcher.  Decode has its own launch_gemv. */
     if (batch >= g_mfma_threshold) {
         dim3 grid((unsigned)div_up(out, kMmaTileSize),
                   (unsigned)div_up(
                       batch, g_prefill_large_m && batch >= kPrefillMmaThreshold
                           ? kPrefillMmaRows : kMmaBatchTile));
         if (g_prefill_large_m && batch >= kPrefillMmaThreshold)
-            batch_decode_kernels::mfma_gemm_rows<kPrefillMmaRowTiles><<<
+            prefill_kernels::mfma_gemm_rows<kPrefillMmaRowTiles><<<
                 grid, 256, 0, g.stream>>>(
                     y, x, w, batch, out, in, add ? 1 : 0);
         else
-            batch_decode_kernels::mfma_gemm<<<grid, 256, 0, g.stream>>>(
+            prefill_kernels::mfma_gemm<<<grid, 256, 0, g.stream>>>(
                 y, x, w, batch, out, in, add ? 1 : 0);
         HIP_LAUNCH_CHECK();
         return;
     }
-    batch_decode_kernels::gemv<<<batch_projection_grid(out, batch),
+    prefill_kernels::gemv<<<projection_grid(out, batch),
         kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             y, x, w, out, in, batch, add ? 1 : 0);
     HIP_LAUNCH_CHECK();
 }
 
-static void launch_batch_dual_gemv(
+static void launch_dual_gemv(
     float *y0, const bf16_t *w0, int out0,
     float *y1, const bf16_t *w1, int out1,
     const float *x, int in, int batch)
 {
     if (batch >= g_mfma_threshold) {
-        launch_batch_gemv(y0, x, w0, out0, in, batch);
-        launch_batch_gemv(y1, x, w1, out1, in, batch);
+        launch_gemv(y0, x, w0, out0, in, batch);
+        launch_gemv(y1, x, w1, out1, in, batch);
         return;
     }
-    batch_decode_kernels::dual_gemv<<<batch_projection_grid(out0 + out1, batch),
+    prefill_kernels::dual_gemv<<<projection_grid(out0 + out1, batch),
         kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             y0, w0, out0, y1, w1, out1, x, in, batch);
     HIP_LAUNCH_CHECK();
 }
 
-static void launch_batch_gate_up_swiglu(float *y, const float *x,
+static void launch_gate_up_swiglu(float *y, const float *x,
                                         const bf16_t *gate, const bf16_t *up,
                                         int out, int in, int batch)
 {
@@ -547,17 +599,17 @@ static void launch_batch_gate_up_swiglu(float *y, const float *x,
                       batch, g_prefill_large_m && batch >= kPrefillMmaThreshold
                           ? kPrefillMmaRows : kMmaBatchTile));
         if (g_prefill_large_m && batch >= kPrefillMmaThreshold)
-            batch_decode_kernels::mfma_gate_up_swiglu_rows<
+            prefill_kernels::mfma_gate_up_swiglu_rows<
                 kPrefillMmaRowTiles><<<grid, 256, 0, g.stream>>>(
                     y, x, gate, up, batch, out, in);
         else
-            batch_decode_kernels::mfma_gate_up_swiglu<<<
+            prefill_kernels::mfma_gate_up_swiglu<<<
                 grid, 256, 0, g.stream>>>(
                     y, x, gate, up, batch, out, in);
         HIP_LAUNCH_CHECK();
         return;
     }
-    batch_decode_kernels::gate_up_swiglu<<<batch_projection_grid(out, batch),
+    prefill_kernels::gate_up_swiglu<<<projection_grid(out, batch),
         kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
             y, x, gate, up, out, in, batch);
     HIP_LAUNCH_CHECK();
@@ -568,12 +620,12 @@ static void launch_router_topk(float *scores, const float *bias,
                                int experts, int k, int use_sigmoid,
                                int norm_topk, float routed_scale) {
     if (experts <= HIP_WAVE) {
-        moe_kernels::router_topk_wave64_kernel<kernel_tuning::ROUTER_WAVE_THREADS><<<
+        prefill_kernels::router_topk_wave64_kernel<kernel_tuning::ROUTER_WAVE_THREADS><<<
             rows, kernel_tuning::ROUTER_WAVE_THREADS, 0, g.stream>>>(
             scores, bias, indices, weights, rows, experts, k, use_sigmoid,
             norm_topk, routed_scale);
     } else {
-        moe_kernels::router_topk_kernel<kernel_tuning::ROUTER_THREADS><<<
+        prefill_kernels::router_topk_kernel<kernel_tuning::ROUTER_THREADS><<<
             rows, kernel_tuning::ROUTER_THREADS, 0, g.stream>>>(
             scores, bias, indices, weights, rows, experts, k, use_sigmoid,
             norm_topk, routed_scale);
@@ -581,34 +633,36 @@ static void launch_router_topk(float *scores, const float *bias,
     HIP_LAUNCH_CHECK();
 }
 
-static void launch_batch_rmsnorm(float *y, const float *x, const bf16_t *w,
+static void launch_rmsnorm(float *y, const float *x, const bf16_t *w,
                                  int n, int batch, float eps)
 {
-    batch_decode_kernels::rmsnorm<<<batch, kernel_tuning::ELEMENTWISE_THREADS,
+    prefill_kernels::rmsnorm<<<batch, kernel_tuning::ELEMENTWISE_THREADS,
         0, g.stream>>>(y, x, w, n, batch, eps);
     HIP_LAUNCH_CHECK();
 }
 
-static void gpu_ffn_rows(
+static void gpu_ffn(
     const Config &c, const DeviceLayer &d, int l, int rows,
     float *x, float *xn, float *hb, float *router, int *topk,
     float *topk_weights, int *sorted_ids, int *expert_ids,
     int *num_post_pad, float *routed_hidden,
     bf16_t *routed_hidden_bf16, float *route_out)
 {
+    /* Prefill FFN.  Decode uses decode::gpu_ffn so expert/GEMM changes there
+     * cannot alter this path. */
     const int H = c.hidden_size;
     if (l < c.first_k_dense) {
         int inter = c.dense_inter_size;
-        launch_batch_gate_up_swiglu(hb, xn, d.dense_gate, d.dense_up,
+        launch_gate_up_swiglu(hb, xn, d.dense_gate, d.dense_up,
                                     inter, H, rows);
-        launch_batch_gemv(x, hb, d.dense_down, H, inter, rows, true);
+        launch_gemv(x, hb, d.dense_down, H, inter, rows, true);
         return;
     }
 
     const int E = c.n_routed_experts;
     const int K = c.n_experts_per_tok;
     const int inter = c.moe_inter_size;
-    launch_batch_gemv(router, xn, d.moe_gate, E, H, rows);
+    launch_gemv(router, xn, d.moe_gate, E, H, rows);
     launch_router_topk(router, d.moe_bias, topk, topk_weights,
                        rows, E, K, c.router_sigmoid, c.norm_topk,
                        c.routed_scaling);
@@ -622,13 +676,13 @@ static void gpu_ffn_rows(
         const int routes = rows * K;
         const int max_padded = routes + E * (block_m - 1);
         max_blocks = div_up(max_padded, block_m);
-        batch_decode_kernels::align_routes<<<
+        prefill_kernels::align_routes<<<
             1, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
             topk, routes, E, block_m, sorted_ids, expert_ids,
             num_post_pad);
         HIP_LAUNCH_CHECK();
         const int up_tiles = div_up(inter, kMmaTileSize);
-        batch_decode_kernels::grouped_expert_gate_up<16, 1><<<
+        prefill_kernels::grouped_expert_gate_up<16, 1><<<
             max_blocks * up_tiles, 256, 0, g.stream>>>(
                 xn, d.pool, d.expert_gate_offsets, d.expert_up_offsets,
                 sorted_ids, expert_ids, routed_hidden, routed_hidden_bf16,
@@ -637,51 +691,41 @@ static void gpu_ffn_rows(
     } else {
         dim3 gate_grid((unsigned)div_up(output_rows, rows_per_block),
                        (unsigned)rows);
-        batch_decode_kernels::routed_shared_gate_up<<<gate_grid,
+        prefill_kernels::routed_shared_gate_up<<<gate_grid,
             kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 routed_hidden, hb, xn, d.pool,
                 d.expert_gate_offsets, d.expert_up_offsets, topk,
                 d.shared_gate, d.shared_up, rows, K, inter, 0, H);
         HIP_LAUNCH_CHECK();
     }
-    launch_batch_gate_up_swiglu(hb, xn, d.shared_gate, d.shared_up,
+    launch_gate_up_swiglu(hb, xn, d.shared_gate, d.shared_up,
                                 shared, H, rows);
     if (grouped_mfma) {
         const int routes = rows * K;
         const int down_tiles = div_up(H, kMmaTileSize);
-        batch_decode_kernels::grouped_expert_down<16, 1><<<
+        prefill_kernels::grouped_expert_down<16, 1><<<
             max_blocks * down_tiles, 256, 0, g.stream>>>(
                 routed_hidden, routed_hidden_bf16, d.pool,
                 d.expert_down_offsets,
                 sorted_ids, expert_ids, route_out,
                 routes, H, inter, down_tiles);
         HIP_LAUNCH_CHECK();
-        batch_decode_kernels::reduce_routes_add<<<
+        prefill_kernels::reduce_routes_add<<<
             rows, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
                 x, route_out, topk_weights, rows, H, K);
         HIP_LAUNCH_CHECK();
     } else {
         dim3 down_grid((unsigned)div_up(H, rows_per_block),
                        (unsigned)rows);
-        batch_decode_kernels::routed_shared_down<<<down_grid,
+        prefill_kernels::routed_shared_down<<<down_grid,
             kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
                 x, routed_hidden, hb, d.pool, d.expert_down_offsets,
                 topk, topk_weights, d.shared_down, rows, K, H, inter, 0);
         HIP_LAUNCH_CHECK();
     }
-    launch_batch_gemv(x, hb, d.shared_down, H, shared, rows, true);
+    launch_gemv(x, hb, d.shared_down, H, shared, rows, true);
 }
 
-static void gpu_ffn_batch(const Config &c, const DeviceLayer &d, int l,
-                          int batch)
-{
-    gpu_ffn_rows(c, d, l, batch, g.x, g.xn, g.hb, g.router, g.topk,
-                 g.topk_weights, g.prefill_topk, g.prefill_expert_counts,
-                 g.prefill_expert_buckets, g.routed_hidden, nullptr,
-                 g.prefill_ffn);
-}
-
-namespace prefill {
 
 /* Process packed prompts layer-major.  `rows` is the number of real input
  * tokens, not batch*max_length; row metadata gives each token's sequence and
@@ -712,7 +756,7 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
 
     dim3 embed_grid((unsigned)div_up(H, kernel_tuning::ELEMENTWISE_THREADS),
                     (unsigned)rows);
-    batch_decode_kernels::embedding<<<embed_grid,
+    prefill_kernels::embedding<<<embed_grid,
         kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
             g.prefill_x, g.embed, device_tokens, nullptr, 0, 0, H, rows);
     HIP_LAUNCH_CHECK();
@@ -739,19 +783,19 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
     for (int l = 0; l < c.n_layers; ++l) {
         const DeviceLayer &d = g.layers[l];
         phase_begin();
-        launch_batch_rmsnorm(g.prefill_xn, g.prefill_x, d.input_norm,
+        launch_rmsnorm(g.prefill_xn, g.prefill_x, d.input_norm,
                              H, rows, c.rms_eps);
         if (c.q_lora_rank > 0) {
-            launch_batch_dual_gemv(
+            launch_dual_gemv(
                 g.prefill_q_a, d.q_a_proj, c.q_lora_rank,
                 g.prefill_comp, d.kv_a_proj, KVD,
                 g.prefill_xn, H, rows);
-            launch_batch_rmsnorm(g.prefill_q_a, g.prefill_q_a, d.q_a_norm,
+            launch_rmsnorm(g.prefill_q_a, g.prefill_q_a, d.q_a_norm,
                                  c.q_lora_rank, rows, c.mla_norm_eps);
-            launch_batch_gemv(g.prefill_q, g.prefill_q_a, d.q_b_proj,
+            launch_gemv(g.prefill_q, g.prefill_q_a, d.q_b_proj,
                               QD, c.q_lora_rank, rows);
         } else {
-            launch_batch_dual_gemv(
+            launch_dual_gemv(
                 g.prefill_q, d.q_proj, QD,
                 g.prefill_comp, d.kv_a_proj, KVD,
                 g.prefill_xn, H, rows);
@@ -759,7 +803,7 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
 
         bf16_t *layer_cache = g.kv_cache
             + (size_t)l * g_max_batch * g.kv_capacity * KVD;
-        batch_decode_kernels::prefill::kv_norm_rope<<<
+        prefill_kernels::kv_norm_rope<<<
             rows, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
                 layer_cache, g.prefill_comp, d.kv_a_norm, row_batches,
                 row_positions, slot_base, rows, g.kv_capacity, KVL, KVD,
@@ -770,12 +814,12 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
         dim3 qabs_grid((unsigned)div_up(KVL, kMmaTileSize),
                        (unsigned)div_up(rows, kMmaBatchTile),
                        (unsigned)NH);
-        batch_decode_kernels::mfma_head_gemm<<<
+        prefill_kernels::mfma_head_gemm<<<
             qabs_grid, 256, 0, g.stream>>>(
                 g.prefill_qabs, g.prefill_q, d.W_UK_T, rows, NH, KVL,
                 QKN, QHD, KVL, (size_t)KVL * QKN);
         HIP_LAUNCH_CHECK();
-        batch_decode_kernels::prefill::q_rope<<<
+        prefill_kernels::q_rope<<<
             div_up(rows * NH, kernel_tuning::ATTENTION_THREADS / HIP_WAVE),
             kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
                 g.prefill_qrope, g.prefill_q, row_positions, rows, NH, QHD, QKN,
@@ -786,7 +830,7 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
         phase_begin();
         constexpr int head_tile = kPrefillThreads / HIP_WAVE;
         dim3 flash_grid((unsigned)div_up(NH, head_tile), (unsigned)rows);
-        batch_decode_kernels::prefill::flash_attention<kPrefillKvTile><<<
+        prefill_kernels::flash_attention<kPrefillKvTile><<<
             flash_grid, kPrefillThreads,
             (size_t)kPrefillKvTile * KVD * sizeof(bf16_t), g.stream>>>(
                 g.prefill_clat, g.prefill_qabs, g.prefill_qrope,
@@ -799,19 +843,19 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
         dim3 value_grid((unsigned)div_up(VHD, kMmaTileSize),
                         (unsigned)div_up(rows, kMmaBatchTile),
                         (unsigned)NH);
-        batch_decode_kernels::mfma_head_gemm<<<
+        prefill_kernels::mfma_head_gemm<<<
             value_grid, 256, 0, g.stream>>>(
                 g.prefill_ctx, g.prefill_clat, d.W_UV, rows, NH, VHD,
                 KVL, KVL, VHD, head_stride);
         HIP_LAUNCH_CHECK();
-        launch_batch_gemv(g.prefill_x, g.prefill_ctx, d.o_proj,
+        launch_gemv(g.prefill_x, g.prefill_ctx, d.o_proj,
                           H, NH * VHD, rows, true);
         phase_end(output_ms);
 
         phase_begin();
-        launch_batch_rmsnorm(g.prefill_xn, g.prefill_x, d.post_norm,
+        launch_rmsnorm(g.prefill_xn, g.prefill_x, d.post_norm,
                              H, rows, c.rms_eps);
-        gpu_ffn_rows(
+        gpu_ffn(
             c, d, l, rows, g.prefill_x, g.prefill_xn, g.prefill_hb,
             g.prefill_router, g.prefill_route_ids, g.prefill_topk_weights,
             g.prefill_topk, g.prefill_expert_counts,
@@ -822,17 +866,17 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
 
     dim3 gather_grid((unsigned)div_up(H, kernel_tuning::ELEMENTWISE_THREADS),
                      (unsigned)batch);
-    batch_decode_kernels::prefill::gather_last_hidden<<<
+    prefill_kernels::gather_last_hidden<<<
         gather_grid, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
             g.x, g.prefill_x, offsets, batch, slot_base, H);
     HIP_LAUNCH_CHECK();
-    launch_batch_rmsnorm(g.xn + (size_t)slot_base * H,
+    launch_rmsnorm(g.xn + (size_t)slot_base * H,
                          g.x + (size_t)slot_base * H,
                          g.final_norm, H, batch, c.rms_eps);
-    launch_batch_gemv(g.logits + (size_t)slot_base * c.vocab_size,
+    launch_gemv(g.logits + (size_t)slot_base * c.vocab_size,
                       g.xn + (size_t)slot_base * H, g.lm_head,
                       c.vocab_size, H, batch);
-    batch_decode_kernels::argmax<<<
+    prefill_kernels::argmax<<<
         batch, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
             g.logits + (size_t)slot_base * c.vocab_size, c.vocab_size,
             g.next_token + slot_base, batch);
@@ -850,6 +894,171 @@ static void run_chunk(const int *device_tokens, const int *row_batches,
 } // namespace prefill
 
 namespace decode {
+
+static dim3 projection_grid(int rows, int batch)
+{
+    constexpr int rows_per_block = kernel_tuning::GEMV_THREADS / HIP_WAVE;
+    constexpr int batch_tile = 2;
+    return dim3((unsigned)div_up(rows, rows_per_block),
+                (unsigned)div_up(batch, batch_tile));
+}
+
+static void launch_rmsnorm(float *y, const float *x, const bf16_t *w,
+                           int n, int batch, float eps)
+{
+    batch_decode_kernels::decode::rmsnorm<<<batch, kernel_tuning::ELEMENTWISE_THREADS,
+        0, g.stream>>>(y, x, w, n, batch, eps);
+    HIP_LAUNCH_CHECK();
+}
+
+static void launch_router_topk(float *scores, const float *bias,
+                               int *indices, float *weights, int rows,
+                               int experts, int k, int use_sigmoid,
+                               int norm_topk, float routed_scale) {
+    if (experts <= HIP_WAVE) {
+        batch_decode_kernels::decode::router_topk_wave64_kernel<kernel_tuning::ROUTER_WAVE_THREADS><<<
+            rows, kernel_tuning::ROUTER_WAVE_THREADS, 0, g.stream>>>(
+            scores, bias, indices, weights, rows, experts, k, use_sigmoid,
+            norm_topk, routed_scale);
+    } else {
+        batch_decode_kernels::decode::router_topk_kernel<kernel_tuning::ROUTER_THREADS><<<
+            rows, kernel_tuning::ROUTER_THREADS, 0, g.stream>>>(
+            scores, bias, indices, weights, rows, experts, k, use_sigmoid,
+            norm_topk, routed_scale);
+    }
+    HIP_LAUNCH_CHECK();
+}
+
+
+static void launch_gemv(float *y, const float *x, const bf16_t *w,
+                        int out, int in, int batch, bool add = false)
+{
+    if (batch >= g_mfma_threshold) {
+        dim3 grid((unsigned)div_up(out, kMmaTileSize),
+                  (unsigned)div_up(batch, kMmaBatchTile));
+        batch_decode_kernels::decode::mfma_gemm<<<grid, 256, 0, g.stream>>>(
+            y, x, w, batch, out, in, add ? 1 : 0);
+        HIP_LAUNCH_CHECK();
+        return;
+    }
+    batch_decode_kernels::decode::gemv<<<projection_grid(out, batch),
+        kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
+            y, x, w, out, in, batch, add ? 1 : 0);
+    HIP_LAUNCH_CHECK();
+}
+
+static void launch_dual_gemv(
+    float *y0, const bf16_t *w0, int out0,
+    float *y1, const bf16_t *w1, int out1,
+    const float *x, int in, int batch)
+{
+    if (batch >= g_mfma_threshold) {
+        launch_gemv(y0, x, w0, out0, in, batch);
+        launch_gemv(y1, x, w1, out1, in, batch);
+        return;
+    }
+    batch_decode_kernels::decode::dual_gemv<<<projection_grid(out0 + out1, batch),
+        kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
+            y0, w0, out0, y1, w1, out1, x, in, batch);
+    HIP_LAUNCH_CHECK();
+}
+
+static void launch_gate_up_swiglu(float *y, const float *x,
+                                  const bf16_t *gate, const bf16_t *up,
+                                  int out, int in, int batch)
+{
+    if (batch >= g_mfma_threshold) {
+        dim3 grid((unsigned)div_up(out, kMmaTileSize),
+                  (unsigned)div_up(batch, kMmaBatchTile));
+        batch_decode_kernels::decode::mfma_gate_up_swiglu<<<
+            grid, 256, 0, g.stream>>>(
+                y, x, gate, up, batch, out, in);
+        HIP_LAUNCH_CHECK();
+        return;
+    }
+    batch_decode_kernels::decode::gate_up_swiglu<<<projection_grid(out, batch),
+        kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
+            y, x, gate, up, out, in, batch);
+    HIP_LAUNCH_CHECK();
+}
+
+static void gpu_ffn(const Config &c, const DeviceLayer &d, int l, int batch)
+{
+    const int H = c.hidden_size;
+    if (l < c.first_k_dense) {
+        int inter = c.dense_inter_size;
+        launch_gate_up_swiglu(g.hb, g.xn, d.dense_gate, d.dense_up,
+                              inter, H, batch);
+        launch_gemv(g.x, g.hb, d.dense_down, H, inter, batch, true);
+        return;
+    }
+
+    const int E = c.n_routed_experts;
+    const int K = c.n_experts_per_tok;
+    const int inter = c.moe_inter_size;
+    launch_gemv(g.router, g.xn, d.moe_gate, E, H, batch);
+    launch_router_topk(g.router, d.moe_bias, g.topk, g.topk_weights,
+                       batch, E, K, c.router_sigmoid, c.norm_topk,
+                       c.routed_scaling);
+    const int shared = c.n_shared_experts * inter;
+    const bool grouped_mfma = batch >= g_mfma_threshold;
+    const int output_rows = K * inter;
+    constexpr int rows_per_block = kernel_tuning::GEMV_THREADS / HIP_WAVE;
+    int max_blocks = 0;
+    if (grouped_mfma) {
+        constexpr int block_m = kGroupedRouteTile;
+        const int routes = batch * K;
+        const int max_padded = routes + E * (block_m - 1);
+        max_blocks = div_up(max_padded, block_m);
+        batch_decode_kernels::decode::align_routes<<<
+            1, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+            g.topk, routes, E, block_m, g.prefill_topk,
+            g.prefill_expert_counts, g.prefill_expert_buckets);
+        HIP_LAUNCH_CHECK();
+        const int up_tiles = div_up(inter, kMmaTileSize);
+        batch_decode_kernels::decode::grouped_expert_gate_up<16, 1><<<
+            max_blocks * up_tiles, 256, 0, g.stream>>>(
+                g.xn, d.pool, d.expert_gate_offsets, d.expert_up_offsets,
+                g.prefill_topk, g.prefill_expert_counts, g.routed_hidden,
+                g.prefill_routed_hidden, routes, H, inter, K, up_tiles);
+        HIP_LAUNCH_CHECK();
+    } else {
+        dim3 gate_grid((unsigned)div_up(output_rows, rows_per_block),
+                       (unsigned)batch);
+        batch_decode_kernels::decode::routed_shared_gate_up<<<gate_grid,
+            kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
+                g.routed_hidden, g.hb, g.xn, d.pool,
+                d.expert_gate_offsets, d.expert_up_offsets, g.topk,
+                d.shared_gate, d.shared_up, batch, K, inter, 0, H);
+        HIP_LAUNCH_CHECK();
+    }
+    launch_gate_up_swiglu(g.hb, g.xn, d.shared_gate, d.shared_up,
+                          shared, H, batch);
+    if (grouped_mfma) {
+        const int routes = batch * K;
+        const int down_tiles = div_up(H, kMmaTileSize);
+        batch_decode_kernels::decode::grouped_expert_down<16, 1><<<
+            max_blocks * down_tiles, 256, 0, g.stream>>>(
+                g.routed_hidden, g.prefill_routed_hidden, d.pool,
+                d.expert_down_offsets, g.prefill_topk,
+                g.prefill_expert_counts, g.prefill_ffn,
+                routes, H, inter, down_tiles);
+        HIP_LAUNCH_CHECK();
+        batch_decode_kernels::decode::reduce_routes_add<<<
+            batch, kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                g.x, g.prefill_ffn, g.topk_weights, batch, H, K);
+        HIP_LAUNCH_CHECK();
+    } else {
+        dim3 down_grid((unsigned)div_up(H, rows_per_block),
+                       (unsigned)batch);
+        batch_decode_kernels::decode::routed_shared_down<<<down_grid,
+            kernel_tuning::GEMV_THREADS, 0, g.stream>>>(
+                g.x, g.routed_hidden, g.hb, d.pool, d.expert_down_offsets,
+                g.topk, g.topk_weights, d.shared_down, batch, K, H, inter, 0);
+        HIP_LAUNCH_CHECK();
+    }
+    launch_gemv(g.x, g.hb, d.shared_down, H, shared, batch, true);
+}
 
 /* One token per active sequence.  `positions[b]` is independent for every
  * sequence, so prompts of different lengths remain in the same decode batch. */
@@ -877,7 +1086,7 @@ static void run_step(const int *device_tokens, int *generated,
     }
     dim3 embed_grid((unsigned)div_up(H, kernel_tuning::ELEMENTWISE_THREADS),
                     (unsigned)batch);
-    batch_decode_kernels::embedding<<<embed_grid,
+    batch_decode_kernels::decode::embedding<<<embed_grid,
         kernel_tuning::ELEMENTWISE_THREADS, 0, g.stream>>>(
             g.x, g.embed, device_tokens, generated, generated_stride,
             output_index, H, batch);
@@ -885,17 +1094,17 @@ static void run_step(const int *device_tokens, int *generated,
 
     for (int l = 0; l < c.n_layers; ++l) {
         const DeviceLayer &d = g.layers[l];
-        launch_batch_rmsnorm(g.xn, g.x, d.input_norm, H, batch, c.rms_eps);
+        launch_rmsnorm(g.xn, g.x, d.input_norm, H, batch, c.rms_eps);
         if (c.q_lora_rank > 0) {
-            launch_batch_dual_gemv(
+            launch_dual_gemv(
                 g.q_a, d.q_a_proj, c.q_lora_rank,
                 g.comp, d.kv_a_proj, KVD, g.xn, H, batch);
-            launch_batch_rmsnorm(g.q_a, g.q_a, d.q_a_norm,
+            launch_rmsnorm(g.q_a, g.q_a, d.q_a_norm,
                                  c.q_lora_rank, batch, c.mla_norm_eps);
-            launch_batch_gemv(g.q, g.q_a, d.q_b_proj, QD,
-                              c.q_lora_rank, batch);
+            launch_gemv(g.q, g.q_a, d.q_b_proj, QD,
+                        c.q_lora_rank, batch);
         } else {
-            launch_batch_dual_gemv(
+            launch_dual_gemv(
                 g.q, d.q_proj, QD, g.comp, d.kv_a_proj, KVD, g.xn, H, batch);
         }
         bf16_t *layer_cache = g.kv_cache +
@@ -912,7 +1121,7 @@ static void run_step(const int *device_tokens, int *generated,
             dim3 qabs_grid((unsigned)div_up(KVL, kMmaTileSize),
                            (unsigned)div_up(batch, kMmaBatchTile),
                            (unsigned)NH);
-            batch_decode_kernels::mfma_head_gemm<<<
+            batch_decode_kernels::decode::mfma_head_gemm<<<
                 qabs_grid, 256, 0, g.stream>>>(
                     g.qabs, g.q, d.W_UK_T, batch, NH, KVL, QKN, QHD, KVL,
                     (size_t)KVL * QKN);
@@ -925,7 +1134,7 @@ static void run_step(const int *device_tokens, int *generated,
                     g.rope_inv_freq, c.rope_interleaved);
         } else {
             batch_decode_kernels::decode::q_absorb_rope<<<
-                batch_projection_grid(qabs_rows, batch),
+                projection_grid(qabs_rows, batch),
                 kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
                     g.qabs, g.qrope, g.q, d.W_UK_T, positions, batch, NH,
                     QHD, QKN, QKR, KVL, g.rope_inv_freq, c.rope_interleaved);
@@ -972,7 +1181,7 @@ static void run_step(const int *device_tokens, int *generated,
                     NH, max_kv_len, g.kv_capacity, KVD, KVL, QKR,
                     c.softmax_scale);
             HIP_LAUNCH_CHECK();
-            attention_kernels::softmax_rows_kernel<
+            batch_decode_kernels::decode::softmax_rows<
                 kernel_tuning::ATTENTION_THREADS><<<
                     batch * NH, kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
                         g.scores, batch * NH, max_kv_len, g.kv_capacity, 0);
@@ -990,27 +1199,27 @@ static void run_step(const int *device_tokens, int *generated,
             dim3 value_grid((unsigned)div_up(VHD, kMmaTileSize),
                             (unsigned)div_up(batch, kMmaBatchTile),
                             (unsigned)NH);
-            batch_decode_kernels::mfma_head_gemm<<<
+            batch_decode_kernels::decode::mfma_head_gemm<<<
                 value_grid, 256, 0, g.stream>>>(
                     g.ctx, g.clat, d.W_UV, batch, NH, VHD, KVL, KVL, VHD,
                     head_stride);
         } else {
             batch_decode_kernels::decode::value_up<<<
-                batch_projection_grid(value_rows, batch),
+                projection_grid(value_rows, batch),
                 kernel_tuning::ATTENTION_THREADS, 0, g.stream>>>(
                     g.ctx, g.clat, d.W_UV, batch, NH, VHD, KVL, head_stride);
         }
         HIP_LAUNCH_CHECK();
-        launch_batch_gemv(g.x, g.ctx, d.o_proj, H, NH * VHD, batch, true);
+        launch_gemv(g.x, g.ctx, d.o_proj, H, NH * VHD, batch, true);
 
-        launch_batch_rmsnorm(g.xn, g.x, d.post_norm, H, batch, c.rms_eps);
-        gpu_ffn_batch(c, d, l, batch);
+        launch_rmsnorm(g.xn, g.x, d.post_norm, H, batch, c.rms_eps);
+        gpu_ffn(c, d, l, batch);
     }
 
     if (!produce_token) return;
-    launch_batch_rmsnorm(g.xn, g.x, g.final_norm, H, batch, c.rms_eps);
-    launch_batch_gemv(g.logits, g.xn, g.lm_head, c.vocab_size, H, batch);
-    batch_decode_kernels::argmax<<<batch, kernel_tuning::ELEMENTWISE_THREADS,
+    launch_rmsnorm(g.xn, g.x, g.final_norm, H, batch, c.rms_eps);
+    launch_gemv(g.logits, g.xn, g.lm_head, c.vocab_size, H, batch);
+    batch_decode_kernels::decode::argmax<<<batch, kernel_tuning::ELEMENTWISE_THREADS,
         0, g.stream>>>(g.logits, c.vocab_size, g.next_token, batch);
     HIP_LAUNCH_CHECK();
 }
