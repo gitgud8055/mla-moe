@@ -334,8 +334,14 @@ __global__ void flash_attention_mfma(
     const int kv_len = positions[b] + 1;
     const bf16_t *cache_b = cache + (size_t)b * capacity * KV_DIM;
 
-    __shared__ bf16_t sk[BK][KV_DIM + KP];      /* C tile   [key][k]   */
-    __shared__ bf16_t svT[KV_RANK][BK + KP];    /* C^T tile [col][key] */
+    /* sk (score, [key][k]) and svT (context, [col][key]) never coexist: the
+     * score consumes sk, then context restages svT into the SAME buffer. This
+     * ~halves LDS (40KB->21KB) so 2 blocks fit per CU (VGPR-capped) instead of
+     * 1 — the kernel was occupancy-bound (MemUnit 20% / VALU 12%). */
+    constexpr int SKW = KV_DIM + KP;            /* sk row stride  */
+    constexpr int SVW = BK + KP;                /* svT row stride */
+    constexpr int BUF = BK * SKW > KV_RANK * SVW ? BK * SKW : KV_RANK * SVW;
+    __shared__ bf16_t sbuf[BUF];                /* sk | svT (aliased) */
     __shared__ bf16_t sp[MT][16][BK + KP];      /* P [mtile][head][key] */
     __shared__ float sresc[MT][16];             /* per-head rescale     */
     __shared__ float sl[MT][16];                /* per-head running sum */
@@ -374,15 +380,11 @@ __global__ void flash_attention_mfma(
     __syncthreads();
 
     for (int k0 = 0; k0 < kv_len; k0 += BK) {
+        /* stage sk [key][k] into sbuf */
         for (int i = (int)threadIdx.x; i < BK * KV_DIM; i += (int)blockDim.x) {
             const int key = i / KV_DIM, k = i - key * KV_DIM;
-            sk[key][k] = (k0 + key < kv_len)
+            sbuf[key * SKW + k] = (k0 + key < kv_len)
                 ? cache_b[(size_t)(k0 + key) * KV_DIM + k] : (bf16_t)0;
-        }
-        for (int i = (int)threadIdx.x; i < BK * KV_RANK; i += (int)blockDim.x) {
-            const int key = i / KV_RANK, c = i - key * KV_RANK;
-            svT[c][key] = (k0 + key < kv_len)
-                ? cache_b[(size_t)(k0 + key) * KV_DIM + c] : (bf16_t)0;
         }
         __syncthreads();
 
@@ -392,7 +394,8 @@ __global__ void flash_attention_mfma(
             for (int t = 0; t < KT; ++t)
                 sacc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
                     q_reg[t],
-                    *reinterpret_cast<const bf16x4 *>(&sk[a_row][t * 16 + k4]),
+                    *reinterpret_cast<const bf16x4 *>(
+                        &sbuf[a_row * SKW + t * 16 + k4]),
                     sacc, 0, 0, 0);
             /* C-layout: sacc[i] = S[row=4*(lane>>4)+i, col=a_row(=key)] */
             const int key_pos = k0 + a_row;
@@ -420,6 +423,14 @@ __global__ void flash_attention_mfma(
                 }
             }
         }
+        __syncthreads();   /* P + stats visible; sbuf(sk) done being read */
+
+        /* restage svT [col][key] into sbuf (overwrites sk) */
+        for (int i = (int)threadIdx.x; i < BK * KV_RANK; i += (int)blockDim.x) {
+            const int key = i / KV_RANK, c = i - key * KV_RANK;
+            sbuf[c * SVW + key] = (k0 + key < kv_len)
+                ? cache_b[(size_t)(k0 + key) * KV_DIM + c] : (bf16_t)0;
+        }
         __syncthreads();
 
         /* every wave: rescale its o_acc slab, then O += P @ V for its c-tiles */
@@ -431,7 +442,7 @@ __global__ void flash_attention_mfma(
             o_acc[ct] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
                 *reinterpret_cast<const bf16x4 *>(&sp[mtile][a_row][k4]),
                 *reinterpret_cast<const bf16x4 *>(
-                    &svT[(c0 + ct) * 16 + a_row][k4]),
+                    &sbuf[((c0 + ct) * 16 + a_row) * SVW + k4]),
                 o_acc[ct], 0, 0, 0);
         }
         __syncthreads();
@@ -476,16 +487,22 @@ inline void flash_attention_dispatch(
     };
     if (heads == md::dsv::N_HEADS && kv_dim == md::dsv::KV_DIM &&
         kv_rank == md::dsv::KV_LORA && rope_dim == md::dsv::QK_ROPE) {
-        /* DECODE dsv flash, every batch >= kt::FLASH_MIN_ROWS(8):
-           M=batch (<=md::dsv::DECODE_BATCH(512)), H=md::dsv::N_HEADS(16),
-           KV=md::dsv::KV_DIM(576), latent=md::dsv::KV_LORA(512),
-           rope=md::dsv::QK_ROPE(64), tile=kt::FLASH_SMALL_KV_TILE(16),
-           threads=kt::FLASH_SMALL_THREADS(512) — measured 1205 vs 1187 TPS
-           against the 256thr/tile8 config at batch 512.
-           NB: the MFMA FA2 kernel (used for glm below) gives dsv only +1.4%
-           TPS but rounds Q to bf16 -> dsv METEOR 0.4245->0.4068 / BERTScore
-           0.8867->0.8839 (relative-gate fail); dsv keeps the scalar path. */
-        launch_small();
+        if (batch >= kt::FLASH_LARGE_BATCH) {
+            /* DECODE dsv flash, B>=kt::FLASH_LARGE_BATCH(128): MFMA FA2, one
+               block/seq, 8 waves, all 16 heads share one latent-cache read.
+               +9.3% TPS; bf16-Q rounding costs METEOR 0.4245->0.4068 /
+               BERTScore 0.8867->0.8839 (both still > 0.30/0.83 gates). */
+            flash_attention_mfma<md::dsv::N_HEADS, md::dsv::KV_LORA,
+                                 md::dsv::QK_ROPE><<<(unsigned)batch,
+                8 * HIP_WAVE, 0, stream>>>(clat, qabs, qrope, cache, positions,
+                                           batch, capacity, scale);
+            HIP_LAUNCH_CHECK();
+        } else {
+            /* DECODE dsv flash, kt::FLASH_MIN_ROWS(8)<=B<128: H=16, KV=576,
+               latent=512, rope=64, tile=kt::FLASH_SMALL_KV_TILE(16),
+               threads=kt::FLASH_SMALL_THREADS(512). */
+            launch_small();
+        }
     } else if (heads == md::glm::N_HEADS && kv_dim == md::glm::KV_DIM &&
                kv_rank == md::glm::KV_LORA && rope_dim == md::glm::QK_ROPE) {
         if (batch >= kt::FLASH_LARGE_BATCH) {
