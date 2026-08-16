@@ -289,29 +289,74 @@ __global__ void mfma_gemm_i8(float *__restrict__ y,
     const int col = col0 + wave * 16 + (lane & 15);
     const int k4 = 4 * (lane >> 4);
     int4v acc[M_TILES] = {};
+    /* K-prefetch into VGPRs: issue the next tile's HBM loads before the
+     * current tile's MFMA so fetch latency overlaps compute. Bound-guarded so
+     * it works for M_TILES=1 (kA < blockDim) as well. Bit-identical. */
+    constexpr int kThreads = 256;
+    constexpr int kA = BLOCK_M * (MFMA_K / 8);
+    constexpr int kW = MFMA_N * (MFMA_K / 8);
+    constexpr int nA = (kA + kThreads - 1) / kThreads;
+    constexpr int nW = (kW + kThreads - 1) / kThreads;
+    i8x8 a_reg[nA];
+    i8x8 w_reg[nW];
+
+    auto load_regs = [&](int bk) {
+#pragma unroll
+        for (int t = 0; t < nA; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            i8x8 value = {};
+            if (i < kA) {
+                const int r = i / (MFMA_K / 8);
+                const int k = (i % (MFMA_K / 8)) * 8;
+                const int gr = row0 + r;
+                if (gr < rows)
+                    value = load_i8x8(x8, (size_t)gr, n_in, bk + k);
+            }
+            a_reg[t] = value;
+        }
+#pragma unroll
+        for (int t = 0; t < nW; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            i8x8 value = {};
+            if (i < kW) {
+                const int c = i / (MFMA_K / 8);
+                const int k = (i % (MFMA_K / 8)) * 8;
+                const int gc = col0 + c;
+                if (gc < d_out)
+                    value = load_i8x8(w8, (size_t)gc, n_in, bk + k);
+            }
+            w_reg[t] = value;
+        }
+    };
+    auto store_lds = [&]() {
+#pragma unroll
+        for (int t = 0; t < nA; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            if (i < kA) {
+                const int r = i / (MFMA_K / 8);
+                const int k = (i % (MFMA_K / 8)) * 8;
+                *reinterpret_cast<i8x8 *>(&sx[r][k]) = a_reg[t];
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < nW; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            if (i < kW) {
+                const int c = i / (MFMA_K / 8);
+                const int k = (i % (MFMA_K / 8)) * 8;
+                *reinterpret_cast<i8x8 *>(&sw[c][k]) = w_reg[t];
+            }
+        }
+    };
+
+    load_regs(0);
+    store_lds();
+    __syncthreads();
 
     for (int bk = 0; bk < n_in; bk += MFMA_K) {
-        for (int i = (int)threadIdx.x; i < BLOCK_M * (MFMA_K / 8);
-             i += (int)blockDim.x) {
-            const int r = i / (MFMA_K / 8);
-            const int k = (i % (MFMA_K / 8)) * 8;
-            const int gr = row0 + r;
-            i8x8 value = {};
-            if (gr < rows)
-                value = load_i8x8(x8, (size_t)gr, n_in, bk + k);
-            *reinterpret_cast<i8x8 *>(&sx[r][k]) = value;
-        }
-        for (int i = (int)threadIdx.x; i < MFMA_N * (MFMA_K / 8);
-             i += (int)blockDim.x) {
-            const int c = i / (MFMA_K / 8);
-            const int k = (i % (MFMA_K / 8)) * 8;
-            const int gc = col0 + c;
-            i8x8 value = {};
-            if (gc < d_out)
-                value = load_i8x8(w8, (size_t)gc, n_in, bk + k);
-            *reinterpret_cast<i8x8 *>(&sw[c][k]) = value;
-        }
-        __syncthreads();
+        const int bk_n = bk + MFMA_K;
+        if (bk_n < n_in)
+            load_regs(bk_n);
 #pragma unroll
         for (int k = 0; k < MFMA_K; k += 16) {
             const int bv = *reinterpret_cast<const int *>(
@@ -324,6 +369,9 @@ __global__ void mfma_gemm_i8(float *__restrict__ y,
                     av, bv, acc[mt], 0, 0, 0);
             }
         }
+        __syncthreads();
+        if (bk_n < n_in)
+            store_lds();
         __syncthreads();
     }
 
@@ -584,32 +632,79 @@ __global__ void mfma_gate_up_swiglu_i8(
     const int k4 = 4 * (lane >> 4);
     int4v gacc[M_TILES] = {};
     int4v uacc[M_TILES] = {};
+    /* K-prefetch into VGPRs (mirrors mfma_gemm_i8): stage next tile's
+     * x/gate/up loads before the current MFMA so fetch latency overlaps
+     * compute. Bound-guarded for M_TILES=1. Bit-identical. */
+    constexpr int kThreads = 256;
+    constexpr int kA = BLOCK_M * (MFMA_K / 8);
+    constexpr int kW = MFMA_N * (MFMA_K / 8);
+    constexpr int nA = (kA + kThreads - 1) / kThreads;
+    constexpr int nW = (kW + kThreads - 1) / kThreads;
+    i8x8 a_reg[nA];
+    i8x8 g_reg[nW];
+    i8x8 u_reg[nW];
+
+    auto load_regs = [&](int bk) {
+#pragma unroll
+        for (int t = 0; t < nA; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            i8x8 value = {};
+            if (i < kA) {
+                const int r = i / (MFMA_K / 8);
+                const int k = (i % (MFMA_K / 8)) * 8;
+                const int gr = row0 + r;
+                if (gr < rows)
+                    value = load_i8x8(x8, (size_t)gr, n_in, bk + k);
+            }
+            a_reg[t] = value;
+        }
+#pragma unroll
+        for (int t = 0; t < nW; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            i8x8 gv = {}, uv = {};
+            if (i < kW) {
+                const int c = i / (MFMA_K / 8);
+                const int k = (i % (MFMA_K / 8)) * 8;
+                const int gc = col0 + c;
+                if (gc < d_out) {
+                    gv = load_i8x8(gate8, (size_t)gc, n_in, bk + k);
+                    uv = load_i8x8(up8, (size_t)gc, n_in, bk + k);
+                }
+            }
+            g_reg[t] = gv;
+            u_reg[t] = uv;
+        }
+    };
+    auto store_lds = [&]() {
+#pragma unroll
+        for (int t = 0; t < nA; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            if (i < kA) {
+                const int r = i / (MFMA_K / 8);
+                const int k = (i % (MFMA_K / 8)) * 8;
+                *reinterpret_cast<i8x8 *>(&sx[r][k]) = a_reg[t];
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < nW; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            if (i < kW) {
+                const int c = i / (MFMA_K / 8);
+                const int k = (i % (MFMA_K / 8)) * 8;
+                *reinterpret_cast<i8x8 *>(&sg[c][k]) = g_reg[t];
+                *reinterpret_cast<i8x8 *>(&su[c][k]) = u_reg[t];
+            }
+        }
+    };
+
+    load_regs(0);
+    store_lds();
+    __syncthreads();
 
     for (int bk = 0; bk < n_in; bk += MFMA_K) {
-        for (int i = (int)threadIdx.x; i < BLOCK_M * (MFMA_K / 8);
-             i += (int)blockDim.x) {
-            const int r = i / (MFMA_K / 8);
-            const int k = (i % (MFMA_K / 8)) * 8;
-            const int gr = row0 + r;
-            i8x8 value = {};
-            if (gr < rows)
-                value = load_i8x8(x8, (size_t)gr, n_in, bk + k);
-            *reinterpret_cast<i8x8 *>(&sx[r][k]) = value;
-        }
-        for (int i = (int)threadIdx.x; i < MFMA_N * (MFMA_K / 8);
-             i += (int)blockDim.x) {
-            const int c = i / (MFMA_K / 8);
-            const int k = (i % (MFMA_K / 8)) * 8;
-            const int gc = col0 + c;
-            i8x8 gv = {}, uv = {};
-            if (gc < d_out) {
-                gv = load_i8x8(gate8, (size_t)gc, n_in, bk + k);
-                uv = load_i8x8(up8, (size_t)gc, n_in, bk + k);
-            }
-            *reinterpret_cast<i8x8 *>(&sg[c][k]) = gv;
-            *reinterpret_cast<i8x8 *>(&su[c][k]) = uv;
-        }
-        __syncthreads();
+        const int bk_n = bk + MFMA_K;
+        if (bk_n < n_in)
+            load_regs(bk_n);
 #pragma unroll
         for (int k = 0; k < MFMA_K; k += 16) {
             const int bg = *reinterpret_cast<const int *>(
@@ -626,6 +721,9 @@ __global__ void mfma_gate_up_swiglu_i8(
                     av, bu, uacc[mt], 0, 0, 0);
             }
         }
+        __syncthreads();
+        if (bk_n < n_in)
+            store_lds();
         __syncthreads();
     }
 
