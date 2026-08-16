@@ -843,6 +843,37 @@ __global__ void align_routes(const int *__restrict__ topk_ids, int routes,
             sorted_ids[dst] = routes;
 }
 
+/* Gather scattered route rows into expert-block order so down GEMM
+ * loads consecutive M-rows (stride = inter_dim) instead of a random
+ * gather. One CTA per super-block; 256 threads copy 64 rows. */
+__global__ void pack_sorted_rows_i8(
+    const char *__restrict__ src, const int *__restrict__ sorted_ids,
+    const int *__restrict__ expert_ids, char *__restrict__ dst, int routes,
+    int cols, int rows_per_block) {
+    const int mblock = (int)blockIdx.x;
+    if (expert_ids[mblock] < 0) return;
+#pragma unroll 1
+    for (int r = 0; r < rows_per_block; ++r) {
+        const int src_r = sorted_ids[mblock * rows_per_block + r];
+        char *d = dst + ((size_t)mblock * rows_per_block + r) * cols;
+        if (src_r >= routes) {
+            for (int i = (int)threadIdx.x; i < cols; i += (int)blockDim.x)
+                d[i] = 0;
+            continue;
+        }
+        for (int i = (int)threadIdx.x * 8; i < cols;
+             i += (int)blockDim.x * 8) {
+            const i8x8 v = load_i8x8(src, (size_t)src_r, cols, i);
+            if (i + 8 <= cols)
+                *reinterpret_cast<i8x8 *>(d + i) = v;
+            else
+#pragma unroll
+                for (int q = 0; q < 8; ++q)
+                    if (i + q < cols) d[i + q] = v[q];
+        }
+    }
+}
+
 template <int BLOCK_M, int M_TILES>
 __global__ void grouped_expert_gate_up_i8_prefill(
     const char *__restrict__ x8, const float *__restrict__ x_s,
@@ -1209,9 +1240,10 @@ __global__ void grouped_expert_down(
     }
 }
 
-/* w8a8 grouped expert down (DSV). */
+/* w8a8 grouped expert down (DSV). A is packed into expert-block row
+ * order (pack_sorted_rows_i8). Same VGPR K-prefetch as gate_up KEEP. */
 template <int BLOCK_M, int M_TILES>
-__global__ void grouped_expert_down_i8(
+__global__ void grouped_expert_down_i8_prefill(
     const char *__restrict__ inter8, const float *__restrict__ inter_s,
     const char *__restrict__ pool,
     const size_t *__restrict__ down_offsets,
@@ -1220,6 +1252,10 @@ __global__ void grouped_expert_down_i8(
     const int *__restrict__ expert_ids,
     float *__restrict__ route_out, int routes, int hidden, int inter_dim,
     int n_tiles) {
+    constexpr int kThreads = 256;
+    constexpr int kA = BLOCK_M * M_TILES * (MFMA_K / 8);
+    constexpr int kW = MFMA_N * (MFMA_K / 8);
+    static_assert(kA % kThreads == 0 && kW % kThreads == 0);
     __shared__ char sa[BLOCK_M * M_TILES][I8_LDS_K];
     __shared__ char sw[MFMA_N][I8_LDS_K];
     const int mblock = (int)blockIdx.x / n_tiles;
@@ -1234,29 +1270,55 @@ __global__ void grouped_expert_down_i8(
     const float *dws =
         reinterpret_cast<const float *>(pool + down_scale_offsets[expert]);
     int4v acc[M_TILES] = {};
+    i8x8 a_reg[kA / kThreads];
+    i8x8 w_reg[kW / kThreads];
 
-    for (int bk = 0; bk < inter_dim; bk += MFMA_K) {
-        for (int i = (int)threadIdx.x; i < BLOCK_M * M_TILES * (MFMA_K / 8);
-             i += (int)blockDim.x) {
+    auto load_regs = [&](int bk) {
+#pragma unroll
+        for (int t = 0; t < kA / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
             const int r = i / (MFMA_K / 8);
             const int k = (i % (MFMA_K / 8)) * 8;
-            const int route = sorted_ids[mblock * BLOCK_M * M_TILES + r];
-            i8x8 value = {};
-            if (route < routes)
-                value = load_i8x8(inter8, (size_t)route, inter_dim, bk + k);
-            *reinterpret_cast<i8x8 *>(&sa[r][k]) = value;
+            const int packed_r = mblock * BLOCK_M * M_TILES + r;
+            a_reg[t] = load_i8x8(inter8, (size_t)packed_r, inter_dim, bk + k);
         }
-        for (int i = (int)threadIdx.x; i < MFMA_N * (MFMA_K / 8);
-             i += (int)blockDim.x) {
+#pragma unroll
+        for (int t = 0; t < kW / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
             const int c = i / (MFMA_K / 8);
             const int k = (i % (MFMA_K / 8)) * 8;
             const int gc = ntile * MFMA_N + c;
             i8x8 value = {};
             if (gc < hidden)
                 value = load_i8x8(wd8, (size_t)gc, inter_dim, bk + k);
-            *reinterpret_cast<i8x8 *>(&sw[c][k]) = value;
+            w_reg[t] = value;
         }
-        __syncthreads();
+    };
+    auto store_lds = [&]() {
+#pragma unroll
+        for (int t = 0; t < kA / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            const int r = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            *reinterpret_cast<i8x8 *>(&sa[r][k]) = a_reg[t];
+        }
+#pragma unroll
+        for (int t = 0; t < kW / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            const int c = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            *reinterpret_cast<i8x8 *>(&sw[c][k]) = w_reg[t];
+        }
+    };
+
+    load_regs(0);
+    store_lds();
+    __syncthreads();
+
+    for (int bk = 0; bk < inter_dim; bk += MFMA_K) {
+        const int bk_n = bk + MFMA_K;
+        if (bk_n < inter_dim)
+            load_regs(bk_n);
 #pragma unroll
         for (int k = 0; k < MFMA_K; k += 16) {
             const int bv = *reinterpret_cast<const int *>(
@@ -1269,6 +1331,122 @@ __global__ void grouped_expert_down_i8(
                     av, bv, acc[mt], 0, 0, 0);
             }
         }
+        __syncthreads();
+        if (bk_n < inter_dim)
+            store_lds();
+        __syncthreads();
+    }
+
+    if (col < hidden) {
+        const float wscale = dws[col];
+#pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            const int r0 = mt * 16 + 4 * (lane >> 4);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int route =
+                    sorted_ids[mblock * BLOCK_M * M_TILES + r0 + q];
+                if (route < routes)
+                    route_out[(size_t)route * hidden + col] =
+                        (float)acc[mt][q] * inter_s[route] * wscale;
+            }
+        }
+    }
+}
+
+template <int BLOCK_M, int M_TILES>
+__global__ void grouped_expert_down_i8_decode(
+    const char *__restrict__ inter8, const float *__restrict__ inter_s,
+    const char *__restrict__ pool,
+    const size_t *__restrict__ down_offsets,
+    const size_t *__restrict__ down_scale_offsets,
+    const int *__restrict__ sorted_ids,
+    const int *__restrict__ expert_ids,
+    float *__restrict__ route_out, int routes, int hidden, int inter_dim,
+    int n_tiles) {
+    /* Same VGPR K-prefetch as _prefill (no extra LDS). */
+    constexpr int kThreads = 256;
+    constexpr int kA = BLOCK_M * M_TILES * (MFMA_K / 8);
+    constexpr int kW = MFMA_N * (MFMA_K / 8);
+    static_assert(kA % kThreads == 0 && kW % kThreads == 0);
+    __shared__ char sa[BLOCK_M * M_TILES][I8_LDS_K];
+    __shared__ char sw[MFMA_N][I8_LDS_K];
+    const int mblock = (int)blockIdx.x / n_tiles;
+    const int ntile = (int)blockIdx.x - mblock * n_tiles;
+    const int expert = expert_ids[mblock];
+    if (expert < 0) return;
+    const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    const int wave = (int)threadIdx.x / HIP_WAVE;
+    const int k4 = 4 * (lane >> 4);
+    const int col = ntile * MFMA_N + wave * 16 + (lane & 15);
+    const char *wd8 = pool + down_offsets[expert];
+    const float *dws =
+        reinterpret_cast<const float *>(pool + down_scale_offsets[expert]);
+    int4v acc[M_TILES] = {};
+    i8x8 a_reg[kA / kThreads];
+    i8x8 w_reg[kW / kThreads];
+
+    auto load_regs = [&](int bk) {
+#pragma unroll
+        for (int t = 0; t < kA / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            const int r = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            const int packed_r = mblock * BLOCK_M * M_TILES + r;
+            a_reg[t] = load_i8x8(inter8, (size_t)packed_r, inter_dim, bk + k);
+        }
+#pragma unroll
+        for (int t = 0; t < kW / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            const int c = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            const int gc = ntile * MFMA_N + c;
+            i8x8 value = {};
+            if (gc < hidden)
+                value = load_i8x8(wd8, (size_t)gc, inter_dim, bk + k);
+            w_reg[t] = value;
+        }
+    };
+    auto store_lds = [&]() {
+#pragma unroll
+        for (int t = 0; t < kA / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            const int r = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            *reinterpret_cast<i8x8 *>(&sa[r][k]) = a_reg[t];
+        }
+#pragma unroll
+        for (int t = 0; t < kW / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            const int c = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            *reinterpret_cast<i8x8 *>(&sw[c][k]) = w_reg[t];
+        }
+    };
+
+    load_regs(0);
+    store_lds();
+    __syncthreads();
+
+    for (int bk = 0; bk < inter_dim; bk += MFMA_K) {
+        const int bk_n = bk + MFMA_K;
+        if (bk_n < inter_dim)
+            load_regs(bk_n);
+#pragma unroll
+        for (int k = 0; k < MFMA_K; k += 16) {
+            const int bv = *reinterpret_cast<const int *>(
+                &sw[wave * 16 + (lane & 15)][k + k4]);
+#pragma unroll
+            for (int mt = 0; mt < M_TILES; ++mt) {
+                const int av = *reinterpret_cast<const int *>(
+                    &sa[mt * 16 + (lane & 15)][k + k4]);
+                acc[mt] = __builtin_amdgcn_mfma_i32_16x16x16i8(
+                    av, bv, acc[mt], 0, 0, 0);
+            }
+        }
+        __syncthreads();
+        if (bk_n < inter_dim)
+            store_lds();
         __syncthreads();
     }
 
@@ -2068,12 +2246,27 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
                     stream>>>(routed_hidden, routed_i8, routed_s,
                               routes, inter);
             HIP_LAUNCH_CHECK();
-            grouped_expert_down_i8<block_m, m_tiles><<<
-                max_blocks * down_tiles, 256, 0, stream>>>(
-                    routed_i8, routed_s, d.pool,
-                    d.expert_down_offsets, d.expert_down_scale_offsets,
-                    sorted_ids, expert_ids, route_out,
-                    routes, H, inter, down_tiles);
+            char *packed_a = routed_hidden
+                ? reinterpret_cast<char *>(routed_hidden)
+                : reinterpret_cast<char *>(routed_hidden_bf16);
+            pack_sorted_rows_i8<<<max_blocks, 256, 0, stream>>>(
+                routed_i8, sorted_ids, expert_ids, packed_a, routes, inter,
+                align_tile);
+            HIP_LAUNCH_CHECK();
+            if (prefill)
+                grouped_expert_down_i8_prefill<block_m, m_tiles><<<
+                    max_blocks * down_tiles, 256, 0, stream>>>(
+                        packed_a, routed_s, d.pool,
+                        d.expert_down_offsets, d.expert_down_scale_offsets,
+                        sorted_ids, expert_ids, route_out,
+                        routes, H, inter, down_tiles);
+            else
+                grouped_expert_down_i8_decode<block_m, m_tiles><<<
+                    max_blocks * down_tiles, 256, 0, stream>>>(
+                        packed_a, routed_s, d.pool,
+                        d.expert_down_offsets, d.expert_down_scale_offsets,
+                        sorted_ids, expert_ids, route_out,
+                        routes, H, inter, down_tiles);
         } else {
             /* glm: expert down on bf16 MFMA with in-flight w8 dequant */
             grouped_expert_down<block_m, m_tiles><<<
