@@ -145,7 +145,7 @@ __global__ void flash_attention(
     int kpe_stride,  // k_pe row stride: KV_DIM(576), both models
     float scale) {   // dsv 1/sqrt(192), glm 1/sqrt(256)
     constexpr int K_DIM = QK_NOPE + ROPE_DIM; // 192 dsv / 256 glm
-    constexpr int KP = 8;                     // LDS row padding (bf16)
+    constexpr int KP = 4;
     static_assert(K_DIM % 16 == 0 && V_HEAD % 16 == 0, "MFMA tiles");
     static_assert(BQ == 64 && BK == 16, "4 waves x 16 rows, 16-key steps");
     const int head = (int)blockIdx.x;
