@@ -131,7 +131,7 @@ namespace kernel {
     constexpr int ROUTER_WAVE_THREADS = 64;
     constexpr int MFMA_TILE_N = 64;       /* output columns per MFMA block   */
     constexpr int MFMA_BATCH_TILE = 16;   /* rows per MFMA block (1 tile)    */
-    constexpr int PREFILL_ROW_TILES = 2;  /* row tiles in the large-M GEMM   */
+    constexpr int PREFILL_ROW_TILES = 4;  /* row tiles in the large-M GEMM   */
     constexpr int PREFILL_ROWS = MFMA_BATCH_TILE * PREFILL_ROW_TILES;
     constexpr int LARGE_M_MIN_ROWS = 1024; /* ladder phase split (prefill)   */
     /* 2-row-tile MFMA blocks from 512 rows: measured decode batch 512 at
