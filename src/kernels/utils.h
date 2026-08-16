@@ -147,6 +147,14 @@ namespace kernel {
      * step. Measured (bench, dsv 60k rows): 8.1ms vs 66.8ms scalar. */
     constexpr int PREFILL_Q_TILE = 64, PREFILL_KEY_TILE = 16;
     constexpr int GROUPED_ROUTE_TILE = 16; /* MoE route alignment tile      */
+    /* Register row-blocking: each grouped-expert block stages M_TILES MFMA
+     * row-tiles against one weight-N-tile load, so a loaded weight feeds
+     * M_TILES accumulators. Lifts grouped MFMA util (~30%->~45% at prefill M)
+     * and cuts decode weight re-reads. Super-block = ROUTE_TILE*M_TILES; routes
+     * are padded to that so a super-block never spans two experts. Sweet spot 4
+     * (8 regresses: padding to 128 + VGPR/occupancy). */
+    constexpr int GROUPED_M_TILES = 4;
+    constexpr int GROUPED_ALIGN_TILE = GROUPED_ROUTE_TILE * GROUPED_M_TILES;
 }
 
 } // namespace constants

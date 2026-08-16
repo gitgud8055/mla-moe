@@ -959,7 +959,7 @@ __global__ void grouped_expert_down(
     const int *__restrict__ expert_ids,
     float *__restrict__ route_out, int routes, int hidden, int inter_dim,
     int n_tiles) {
-    __shared__ bf16_t sa[BLOCK_M][MFMA_LDS_K];
+    __shared__ bf16_t sa[BLOCK_M * M_TILES][MFMA_LDS_K];
     __shared__ bf16_t sw[MFMA_N][MFMA_LDS_K];
     const int mblock = (int)blockIdx.x / n_tiles;
     const int ntile = (int)blockIdx.x - mblock * n_tiles;
@@ -975,11 +975,11 @@ __global__ void grouped_expert_down(
     fp32v4 acc[M_TILES] = {};
 
     for (int bk = 0; bk < inter_dim; bk += MFMA_K) {
-        for (int i = (int)threadIdx.x; i < BLOCK_M * MFMA_K;
+        for (int i = (int)threadIdx.x; i < BLOCK_M * M_TILES * MFMA_K;
              i += (int)blockDim.x) {
             const int r = i / MFMA_K;
             const int k = i - r * MFMA_K;
-            const int route = sorted_ids[mblock * BLOCK_M + r];
+            const int route = sorted_ids[mblock * BLOCK_M * M_TILES + r];
             if (route < routes && bk + k < inter_dim)
                 sa[r][k] = inter_bf16
                     ? inter_bf16[(size_t)route * inter_dim + bk + k]
@@ -1020,7 +1020,8 @@ __global__ void grouped_expert_down(
             const int r0 = mt * 16 + 4 * (lane >> 4);
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
-                const int route = sorted_ids[mblock * BLOCK_M + r0 + q];
+                const int route =
+                    sorted_ids[mblock * BLOCK_M * M_TILES + r0 + q];
                 if (route < routes)
                     route_out[(size_t)route * hidden + col] = acc[mt][q];
             }
@@ -1830,11 +1831,15 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
 
     if (rows >= kt::MFMA_MIN_ROWS) {
         constexpr int block_m = kt::GROUPED_ROUTE_TILE;
+        constexpr int m_tiles = kt::GROUPED_M_TILES;
+        constexpr int align_tile = kt::GROUPED_ALIGN_TILE; /* block_m*m_tiles */
         const int routes = rows * K;
-        const int max_padded = routes + E * (block_m - 1);
-        const int max_blocks = div_up(max_padded, block_m);
+        /* Pad each expert to a full super-block so a block's block_m*m_tiles
+         * rows never straddle two experts; expert_ids is one entry per block. */
+        const int max_padded = routes + E * (align_tile - 1);
+        const int max_blocks = div_up(max_padded, align_tile);
         align_routes<<<1, kt::ELEMENTWISE_THREADS, 0, stream>>>(
-            topk, routes, E, block_m, sorted_ids, expert_ids, num_post_pad);
+            topk, routes, E, align_tile, sorted_ids, expert_ids, num_post_pad);
         HIP_LAUNCH_CHECK();
 
         /* gate/up always runs w8a8 (both models quantize expert gate/up).
@@ -1844,7 +1849,7 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
          *  DECODE M=batch (<=md::*::DECODE_BATCH(512)); PREFILL M=packed tokens. */
         quantize_act(xn, qs, rows, H, stream);
         const int up_tiles = div_up(inter, kt::MFMA_TILE_N);
-        grouped_expert_gate_up_i8<block_m, 1><<<
+        grouped_expert_gate_up_i8<block_m, m_tiles><<<
             max_blocks * up_tiles, 256, 0, stream>>>(
                 qs.act_i8, qs.act_s, d.pool,
                 d.expert_gate_offsets, d.expert_up_offsets,
@@ -1873,7 +1878,7 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
                     stream>>>(routed_hidden, routed_i8, routed_s,
                               routes, inter);
             HIP_LAUNCH_CHECK();
-            grouped_expert_down_i8<block_m, 1><<<
+            grouped_expert_down_i8<block_m, m_tiles><<<
                 max_blocks * down_tiles, 256, 0, stream>>>(
                     routed_i8, routed_s, d.pool,
                     d.expert_down_offsets, d.expert_down_scale_offsets,
@@ -1881,7 +1886,7 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
                     routes, H, inter, down_tiles);
         } else {
             /* glm: expert down on bf16 MFMA with in-flight w8 dequant */
-            grouped_expert_down<block_m, 1><<<
+            grouped_expert_down<block_m, m_tiles><<<
                 max_blocks * down_tiles, 256, 0, stream>>>(
                     routed_hidden, routed_hidden_bf16, d.pool,
                     d.expert_down_offsets, d.expert_down_scale_offsets,
