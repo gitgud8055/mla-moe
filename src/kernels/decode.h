@@ -8,6 +8,8 @@
 namespace decode {
 
 namespace kt = utils::constants::kernel;
+using utils::types::bf16x4;
+using utils::types::fp32v4;
 
 __global__ void kv_norm_rope(bf16_t *cache, const float *comp, const bf16_t *norm,
                              const int *positions, int batch, int capacity, int kv_rank,
@@ -300,6 +302,155 @@ __global__ void value_up(float *ctx, const float *clat, const bf16_t *wuv,
         ctx[((size_t)(b0+j)*heads+h)*value_dim+d]=sums[j];}
 }
 
+/* MFMA absorbed-MLA decode attention (FlashAttention-2 on matrix cores).
+ * One block per sequence handles ALL heads: the latent cache C is read once
+ * and shared, S = Q@C^T and Ctx = P@C[:,:rank] run on v_mfma_f32_16x16x16bf16
+ * instead of the scalar kernel's per-head dot-product + per-key wave_sum.
+ * WV(8) waves; heads split into MT 16-row M-tiles, each tile's lead wave
+ * computes S + online-softmax and publishes P + rescale/denominator to LDS,
+ * then every wave accumulates a disjoint CTW-wide slab of the rank-wide
+ * context (o_acc stays small). Removes the scalar kernel's cache re-read AND
+ * its VALU/latency bottleneck. Block-uniform kv_len keeps barriers
+ * convergent. Caller guarantees batch >= 1. */
+template <int HEADS, int KV_RANK, int ROPE_DIM>
+__global__ void flash_attention_mfma(
+    float *__restrict__ clat, const float *__restrict__ qabs,
+    const float *__restrict__ qrope, const bf16_t *__restrict__ cache,
+    const int *__restrict__ positions, int batch, int capacity, float scale) {
+    constexpr int KV_DIM = KV_RANK + ROPE_DIM;   /* 576 */
+    constexpr int BK = 16;                        /* keys per MFMA step */
+    constexpr int KP = 4;                         /* LDS bank pad       */
+    constexpr int KT = KV_DIM / 16;               /* 36 score k-tiles   */
+    constexpr int CT = KV_RANK / 16;              /* 32 context col-tiles */
+    constexpr int MT = (HEADS + 15) / 16;         /* M-tiles: dsv 1, glm 2 */
+    constexpr int WV = 8;                          /* waves per block     */
+    constexpr int GRP = WV / MT;                   /* waves per M-tile     */
+    constexpr int CTW = CT / GRP;                  /* context c-tiles/wave */
+    static_assert(KV_DIM % 16 == 0 && KV_RANK % 16 == 0, "MFMA tiles");
+    static_assert(WV % MT == 0 && CT % GRP == 0, "even split");
+
+    const int b = (int)blockIdx.x;
+    if (b >= batch) return;
+    const int kv_len = positions[b] + 1;
+    const bf16_t *cache_b = cache + (size_t)b * capacity * KV_DIM;
+
+    __shared__ bf16_t sk[BK][KV_DIM + KP];      /* C tile   [key][k]   */
+    __shared__ bf16_t svT[KV_RANK][BK + KP];    /* C^T tile [col][key] */
+    __shared__ bf16_t sp[MT][16][BK + KP];      /* P [mtile][head][key] */
+    __shared__ float sresc[MT][16];             /* per-head rescale     */
+    __shared__ float sl[MT][16];                /* per-head running sum */
+    __shared__ float sm[MT][16];                /* per-head running max */
+
+    const int wave = (int)threadIdx.x / HIP_WAVE;
+    const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    const int a_row = lane & 15;                 /* MFMA A-row / C-col   */
+    const int k4 = 4 * (lane >> 4);              /* MFMA A/B k offset    */
+    const int mtile = wave / GRP;                /* this wave's 16-head tile */
+    const int local = wave % GRP;                /* wave within the tile */
+    const int c0 = local * CTW;                  /* first context c-tile */
+    const bool lead = (local == 0);              /* computes score for mtile */
+    const int h_base = mtile * 16;
+
+    /* Q registers (lead wave only): Q[h_base+a_row][k], A-layout. */
+    bf16x4 q_reg[KT];
+    if (lead) {
+#pragma unroll
+        for (int t = 0; t < KT; ++t)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int k = t * 16 + k4 + j;
+                const int h = h_base + a_row;
+                float f = 0.0f;
+                if (h < HEADS)
+                    f = k < KV_RANK
+                        ? qabs[((size_t)b * HEADS + h) * KV_RANK + k]
+                        : qrope[((size_t)b * HEADS + h) * ROPE_DIM +
+                                (k - KV_RANK)];
+                q_reg[t][j] = (short)gpu_f32_to_bf16(f);
+            }
+        if (lane < 16) { sm[mtile][lane] = -INFINITY; sl[mtile][lane] = 0.0f; }
+    }
+    fp32v4 o_acc[CTW] = {};
+    __syncthreads();
+
+    for (int k0 = 0; k0 < kv_len; k0 += BK) {
+        for (int i = (int)threadIdx.x; i < BK * KV_DIM; i += (int)blockDim.x) {
+            const int key = i / KV_DIM, k = i - key * KV_DIM;
+            sk[key][k] = (k0 + key < kv_len)
+                ? cache_b[(size_t)(k0 + key) * KV_DIM + k] : (bf16_t)0;
+        }
+        for (int i = (int)threadIdx.x; i < BK * KV_RANK; i += (int)blockDim.x) {
+            const int key = i / KV_RANK, c = i - key * KV_RANK;
+            svT[c][key] = (k0 + key < kv_len)
+                ? cache_b[(size_t)(k0 + key) * KV_DIM + c] : (bf16_t)0;
+        }
+        __syncthreads();
+
+        if (lead) {
+            fp32v4 sacc = {};
+#pragma unroll
+            for (int t = 0; t < KT; ++t)
+                sacc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+                    q_reg[t],
+                    *reinterpret_cast<const bf16x4 *>(&sk[a_row][t * 16 + k4]),
+                    sacc, 0, 0, 0);
+            /* C-layout: sacc[i] = S[row=4*(lane>>4)+i, col=a_row(=key)] */
+            const int key_pos = k0 + a_row;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int row = 4 * (lane >> 4) + i;   /* head within tile */
+                float sv = sacc[i] * scale;
+                if (key_pos >= kv_len) sv = -INFINITY;
+                float mx = sv;
+                for (int d = 1; d < 16; d <<= 1)
+                    mx = fmaxf(mx, __shfl_xor(mx, d, HIP_WAVE));
+                const float m_old = sm[mtile][row];
+                const float m_new = fmaxf(m_old, mx);
+                const float resc = m_new == -INFINITY ? 1.0f
+                                                      : expf(m_old - m_new);
+                const float p = m_new == -INFINITY ? 0.0f : expf(sv - m_new);
+                float ps = p;
+                for (int d = 1; d < 16; d <<= 1)
+                    ps += __shfl_xor(ps, d, HIP_WAVE);
+                sp[mtile][row][a_row] = gpu_f32_to_bf16(p);
+                if (a_row == 0) {
+                    sm[mtile][row] = m_new;
+                    sl[mtile][row] = sl[mtile][row] * resc + ps;
+                    sresc[mtile][row] = resc;
+                }
+            }
+        }
+        __syncthreads();
+
+        /* every wave: rescale its o_acc slab, then O += P @ V for its c-tiles */
+#pragma unroll
+        for (int ct = 0; ct < CTW; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                o_acc[ct][i] *= sresc[mtile][4 * (lane >> 4) + i];
+            o_acc[ct] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+                *reinterpret_cast<const bf16x4 *>(&sp[mtile][a_row][k4]),
+                *reinterpret_cast<const bf16x4 *>(
+                    &svT[(c0 + ct) * 16 + a_row][k4]),
+                o_acc[ct], 0, 0, 0);
+        }
+        __syncthreads();
+    }
+
+    /* epilogue: divide by running sum, store (C-layout) */
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int row = 4 * (lane >> 4) + i;
+        const int h = h_base + row;
+        if (h >= HEADS) continue;
+        const float inv = sl[mtile][row] > 0.0f ? 1.0f / sl[mtile][row] : 0.0f;
+#pragma unroll
+        for (int ct = 0; ct < CTW; ++ct)
+            clat[((size_t)b * HEADS + h) * KV_RANK + (c0 + ct) * 16 + a_row] =
+                o_acc[ct][i] * inv;
+    }
+}
+
 /* Wrapper for the decode flash kernel — same convention as the ops.h
  * ladders: keyed on the FULL shape tuple (heads, kv_dim, kv_rank, rope) x
  * batch regime, one branch per real case, unlisted shapes abort. dsv and
@@ -323,17 +474,6 @@ inline void flash_attention_dispatch(
                       capacity, kv_dim, kv_rank, rope_dim, scale);
         HIP_LAUNCH_CHECK();
     };
-    const auto launch_large = [&] { /* 256 threads, KV tile 8 */
-        dim3 grid((unsigned)ops::div_up(
-                      heads, kt::FLASH_LARGE_THREADS / HIP_WAVE),
-                  (unsigned)batch);
-        flash_attention<kt::FLASH_LARGE_KV_TILE><<<
-            grid, kt::FLASH_LARGE_THREADS,
-            (size_t)kt::FLASH_LARGE_KV_TILE * kv_dim * sizeof(bf16_t),
-            stream>>>(clat, qabs, qrope, cache, positions, batch, heads,
-                      capacity, kv_dim, kv_rank, rope_dim, scale);
-        HIP_LAUNCH_CHECK();
-    };
     if (heads == md::dsv::N_HEADS && kv_dim == md::dsv::KV_DIM &&
         kv_rank == md::dsv::KV_LORA && rope_dim == md::dsv::QK_ROPE) {
         /* DECODE dsv flash, every batch >= kt::FLASH_MIN_ROWS(8):
@@ -341,18 +481,21 @@ inline void flash_attention_dispatch(
            KV=md::dsv::KV_DIM(576), latent=md::dsv::KV_LORA(512),
            rope=md::dsv::QK_ROPE(64), tile=kt::FLASH_SMALL_KV_TILE(16),
            threads=kt::FLASH_SMALL_THREADS(512) — measured 1205 vs 1187 TPS
-           against the 256thr/tile8 config at batch 512 */
+           against the 256thr/tile8 config at batch 512.
+           NB: the MFMA FA2 kernel (used for glm below) gives dsv only +1.4%
+           TPS but rounds Q to bf16 -> dsv METEOR 0.4245->0.4068 / BERTScore
+           0.8867->0.8839 (relative-gate fail); dsv keeps the scalar path. */
         launch_small();
     } else if (heads == md::glm::N_HEADS && kv_dim == md::glm::KV_DIM &&
                kv_rank == md::glm::KV_LORA && rope_dim == md::glm::QK_ROPE) {
         if (batch >= kt::FLASH_LARGE_BATCH) {
-            /* DECODE glm flash, B>=kt::FLASH_LARGE_BATCH(128):
-               M=batch (<=md::glm::DECODE_BATCH(512)), H=md::glm::N_HEADS(20),
-               KV=md::glm::KV_DIM(576), latent=md::glm::KV_LORA(512),
-               rope=md::glm::QK_ROPE(64), tile=kt::FLASH_LARGE_KV_TILE(8),
-               threads=kt::FLASH_LARGE_THREADS(256) — measured 666 vs 662
-               TPS against 512thr/tile16 at batch 512 */
-            launch_large();
+            /* DECODE glm flash, B>=kt::FLASH_LARGE_BATCH(128): MFMA FA2, one
+               block/seq, 8 waves, all 20 heads share one latent-cache read. */
+            flash_attention_mfma<md::glm::N_HEADS, md::glm::KV_LORA,
+                                 md::glm::QK_ROPE><<<(unsigned)batch,
+                8 * HIP_WAVE, 0, stream>>>(clat, qabs, qrope, cache, positions,
+                                           batch, capacity, scale);
+            HIP_LAUNCH_CHECK();
         } else {
             /* DECODE glm flash, kt::FLASH_MIN_ROWS(8)<=B<128: H=20, KV=576,
                latent=512, rope=64, tile=kt::FLASH_SMALL_KV_TILE(16),
