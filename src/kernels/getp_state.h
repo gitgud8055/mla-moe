@@ -126,9 +126,13 @@ struct GpuContext {
     int *prompt_tokens = nullptr, *prefill_route_ids = nullptr;
     int *prefill_row_batches = nullptr, *prefill_row_positions = nullptr;
     int *prefill_offsets = nullptr;
+    int *prefill_tile_q0 = nullptr;    /* FA2 q-tile -> first packed row */
+    int *prefill_tile_count = nullptr; /* single int, build_q_tiles ctr  */
     float *prefill_x = nullptr, *prefill_xn = nullptr;
     float *prefill_q = nullptr, *prefill_q_a = nullptr, *prefill_comp = nullptr;
-    float *prefill_qrope = nullptr, *prefill_qabs = nullptr, *prefill_clat = nullptr;
+    float *prefill_qrope = nullptr;
+    float *prefill_knope = nullptr; /* decompressed K_nope [rows x NH x QKN] */
+    float *prefill_value = nullptr; /* decompressed V      [rows x NH x VHD] */
     float *prefill_ctx = nullptr;
     float *prefill_router = nullptr, *prefill_topk_weights = nullptr;
     float *prefill_hb = nullptr, *routed_hidden = nullptr;

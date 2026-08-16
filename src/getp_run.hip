@@ -270,7 +270,7 @@ static size_t prefill_workspace_bytes(const Config &c, size_t rows) {
         + (size_t)std::max(1, c.q_lora_rank)
         + kvd
         + (size_t)c.n_heads * c.qk_rope_head_dim
-        + (size_t)2 * c.n_heads * c.kv_lora_rank
+        + (size_t)c.n_heads * (c.qk_nope_head_dim + c.v_head_dim)
         + (size_t)c.n_heads * c.v_head_dim
         + inter
         + (size_t)std::max(1, c.n_routed_experts)
@@ -278,7 +278,7 @@ static size_t prefill_workspace_bytes(const Config &c, size_t rows) {
         + k * c.hidden_size;
     const size_t routes = rows * k;
     const size_t max_padded = routes
-        + (size_t)c.n_routed_experts * (kt::GROUPED_ALIGN_TILE - 1);
+        + (size_t)c.n_routed_experts * (kt::GROUPED_ROUTE_TILE - 1);
     const size_t w8a8_bytes =
         rows * act_scratch_cols(c) + rows * sizeof(float)
         + (g_qp.down_a8 ? routes * (size_t)c.moe_inter_size
@@ -289,9 +289,10 @@ static size_t prefill_workspace_bytes(const Config &c, size_t rows) {
         + rows * sizeof(int)                 /* flattened prompt tokens */
         + rows * 2 * sizeof(int)             /* row batch + position    */
         + ((size_t)g_max_batch + 1) * sizeof(int)
+        + (rows / kt::PREFILL_Q_TILE + (size_t)g_max_batch + 1) * sizeof(int)
         + rows * k * sizeof(int)             /* top-k expert ids        */
         + max_padded * sizeof(int)
-        + (max_padded + kt::GROUPED_ALIGN_TILE - 1) / kt::GROUPED_ALIGN_TILE
+        + (max_padded + kt::GROUPED_ROUTE_TILE - 1) / kt::GROUPED_ROUTE_TILE
             * sizeof(int)
         + sizeof(int);
 }
@@ -328,20 +329,23 @@ static void allocate_prefill_workspace(const Config &c, int target_rows) {
     const size_t k = std::max(1, c.n_experts_per_tok);
     const size_t routes = rows * k;
     const size_t max_padded = routes
-        + (size_t)c.n_routed_experts * (kt::GROUPED_ALIGN_TILE - 1);
+        + (size_t)c.n_routed_experts * (kt::GROUPED_ROUTE_TILE - 1);
 
     device_alloc(&g.prompt_tokens, rows);
     device_alloc(&g.prefill_row_batches, rows);
     device_alloc(&g.prefill_row_positions, rows);
     device_alloc(&g.prefill_offsets, (size_t)g_max_batch + 1);
+    device_alloc(&g.prefill_tile_q0,
+                 (size_t)ops::div_up(lo, kt::PREFILL_Q_TILE) + g_max_batch);
+    device_alloc(&g.prefill_tile_count, 1);
     device_alloc(&g.prefill_x, rows * c.hidden_size);
     device_alloc(&g.prefill_xn, rows * c.hidden_size);
     device_alloc(&g.prefill_q, rows * c.n_heads * qhd);
     device_alloc(&g.prefill_q_a, rows * std::max(1, c.q_lora_rank));
     device_alloc(&g.prefill_comp, rows * kvd);
     device_alloc(&g.prefill_qrope, rows * c.n_heads * c.qk_rope_head_dim);
-    device_alloc(&g.prefill_qabs, rows * c.n_heads * c.kv_lora_rank);
-    device_alloc(&g.prefill_clat, rows * c.n_heads * c.kv_lora_rank);
+    device_alloc(&g.prefill_knope, rows * c.n_heads * c.qk_nope_head_dim);
+    device_alloc(&g.prefill_value, rows * c.n_heads * c.v_head_dim);
     device_alloc(&g.prefill_ctx, rows * c.n_heads * c.v_head_dim);
     device_alloc(&g.prefill_hb, rows * inter);
     device_alloc(&g.prefill_router, rows * std::max(1, c.n_routed_experts));
@@ -349,7 +353,7 @@ static void allocate_prefill_workspace(const Config &c, int target_rows) {
     device_alloc(&g.prefill_topk_weights, rows * k);
     device_alloc(&g.moe_sorted_ids, max_padded);
     device_alloc(&g.moe_expert_ids,
-                 ops::div_up((int)max_padded, kt::GROUPED_ALIGN_TILE));
+                 ops::div_up((int)max_padded, kt::GROUPED_ROUTE_TILE));
     device_alloc(&g.moe_num_padded, 1);
     device_alloc(&g.prefill_routed_hidden, routes * c.moe_inter_size);
     device_alloc(&g.moe_route_out, routes * c.hidden_size);
@@ -646,12 +650,13 @@ extern "C" void finish(Transformer *t) {
     device_free(g.prompt_tokens); device_free(g.prefill_route_ids);
     device_free(g.prefill_row_batches); device_free(g.prefill_row_positions);
     device_free(g.prefill_offsets);
+    device_free(g.prefill_tile_q0); device_free(g.prefill_tile_count);
     device_free(g.moe_sorted_ids);
     device_free(g.moe_expert_ids); device_free(g.moe_num_padded);
     device_free(g.prefill_x); device_free(g.prefill_xn);
     device_free(g.prefill_q); device_free(g.prefill_q_a); device_free(g.prefill_comp);
-    device_free(g.prefill_qrope); device_free(g.prefill_qabs);
-    device_free(g.prefill_clat); device_free(g.prefill_ctx);
+    device_free(g.prefill_qrope); device_free(g.prefill_knope);
+    device_free(g.prefill_value); device_free(g.prefill_ctx);
     device_free(g.moe_route_out);
     device_free(g.prefill_router); device_free(g.prefill_topk_weights);
     device_free(g.prefill_hb); device_free(g.routed_hidden);

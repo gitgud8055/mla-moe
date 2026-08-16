@@ -351,8 +351,8 @@ __global__ void mfma_head_gemm(float *__restrict__ y,
                                const float *__restrict__ x,
                                const bf16_t *__restrict__ w,
                                int rows, int heads, int d_out, int n_in,
-                               int x_head_dim, int y_head_dim,
-                               size_t weight_head_stride) {
+                               int x_row_stride, int x_head_dim,
+                               int y_head_dim, size_t weight_head_stride) {
     __shared__ bf16_t sx[MFMA_M][MFMA_LDS_K];
     __shared__ bf16_t sw[MFMA_N][MFMA_LDS_K];
 
@@ -372,8 +372,8 @@ __global__ void mfma_head_gemm(float *__restrict__ y,
             const int k = i - r * MFMA_K;
             const int gr = row0 + r;
             sx[r][k] = gr < rows && bk + k < n_in
-                ? gpu_f32_to_bf16(
-                    x[((size_t)gr * heads + head) * x_head_dim + bk + k])
+                ? gpu_f32_to_bf16(x[(size_t)gr * x_row_stride
+                                    + (size_t)head * x_head_dim + bk + k])
                 : (bf16_t)0;
         }
         for (int i = (int)threadIdx.x; i < MFMA_N * (MFMA_K / 8);
@@ -959,7 +959,7 @@ __global__ void grouped_expert_down(
     const int *__restrict__ expert_ids,
     float *__restrict__ route_out, int routes, int hidden, int inter_dim,
     int n_tiles) {
-    __shared__ bf16_t sa[BLOCK_M * M_TILES][MFMA_LDS_K];
+    __shared__ bf16_t sa[BLOCK_M][MFMA_LDS_K];
     __shared__ bf16_t sw[MFMA_N][MFMA_LDS_K];
     const int mblock = (int)blockIdx.x / n_tiles;
     const int ntile = (int)blockIdx.x - mblock * n_tiles;
@@ -975,11 +975,11 @@ __global__ void grouped_expert_down(
     fp32v4 acc[M_TILES] = {};
 
     for (int bk = 0; bk < inter_dim; bk += MFMA_K) {
-        for (int i = (int)threadIdx.x; i < BLOCK_M * M_TILES * MFMA_K;
+        for (int i = (int)threadIdx.x; i < BLOCK_M * MFMA_K;
              i += (int)blockDim.x) {
             const int r = i / MFMA_K;
             const int k = i - r * MFMA_K;
-            const int route = sorted_ids[mblock * BLOCK_M * M_TILES + r];
+            const int route = sorted_ids[mblock * BLOCK_M + r];
             if (route < routes && bk + k < inter_dim)
                 sa[r][k] = inter_bf16
                     ? inter_bf16[(size_t)route * inter_dim + bk + k]
@@ -1020,8 +1020,7 @@ __global__ void grouped_expert_down(
             const int r0 = mt * 16 + 4 * (lane >> 4);
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
-                const int route =
-                    sorted_ids[mblock * BLOCK_M * M_TILES + r0 + q];
+                const int route = sorted_ids[mblock * BLOCK_M + r0 + q];
                 if (route < routes)
                     route_out[(size_t)route * hidden + col] = acc[mt][q];
             }
@@ -1715,74 +1714,58 @@ inline void gate_up_swiglu(float *y, const float *x,
 /* Launch one per-head projection with the default configuration. */
 inline void head_gemm_mfma(float *y, const float *x, const bf16_t *w,
                            int rows, int heads, int d_out, int n_in,
-                           int x_head_dim, int y_head_dim, size_t head_stride,
-                           hipStream_t stream) {
+                           int x_row_stride, int x_head_dim, int y_head_dim,
+                           size_t head_stride, hipStream_t stream) {
     dim3 grid((unsigned)div_up(d_out, kt::MFMA_TILE_N),
               (unsigned)div_up(rows, kt::MFMA_BATCH_TILE),
               (unsigned)heads);
     mfma_head_gemm<<<grid, 256, 0, stream>>>(
-        y, x, w, rows, heads, d_out, n_in, x_head_dim, y_head_dim,
-        head_stride);
+        y, x, w, rows, heads, d_out, n_in, x_row_stride, x_head_dim,
+        y_head_dim, head_stride);
     HIP_LAUNCH_CHECK();
 }
 
-/* Per-head projection (weights row-major per head), bf16.
- * ============== shape ladder (model, tensor, phase) ==============
- * M=rows: decode = batch (<=md::*::DECODE_BATCH(512)), prefill = packed tokens. */
+/* Per-head projection, bf16 MFMA: y[row,h,:]{d_out} = w[h] @ x-slice{n_in}.
+ * x-slice = x[row*x_row_stride + h*x_head_dim : +n_in] — x_head_dim=0 means
+ * every head reads the same per-row vector (kv_b decompression).
+ * ============== shape ladder (model, tensor, phase) ============== */
 inline void head_gemm(float *y, const float *x, const bf16_t *w,
                       int rows, int heads, int d_out, int n_in,
-                      int x_head_dim, int y_head_dim, size_t head_stride,
-                      hipStream_t stream) {
+                      int x_row_stride, int x_head_dim, int y_head_dim,
+                      size_t head_stride, hipStream_t stream) {
     namespace md = utils::constants::model;
-    const bool prefill_m = rows >= kt::LARGE_M_MIN_ROWS;
     if (heads == md::dsv::N_HEADS && d_out == md::dsv::KV_LORA &&
         n_in == md::dsv::QK_NOPE) {
-        if (prefill_m) {
-            /* PREFILL dsv q-absorb: H=md::dsv::N_HEADS(16),
-               N=md::dsv::KV_LORA(512), K=md::dsv::QK_NOPE(128), bf16 */
-            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
-                           y_head_dim, head_stride, stream);
-        } else {
-            /* DECODE dsv q-absorb: M=batch, H=16, N=512, K=128, bf16 */
-            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
-                           y_head_dim, head_stride, stream);
-        }
+        /* DECODE dsv q-absorb: M=batch (<=md::dsv::DECODE_BATCH(512)),
+           H=16, N=md::dsv::KV_LORA(512), K=md::dsv::QK_NOPE(128), bf16 */
+        head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_row_stride,
+                       x_head_dim, y_head_dim, head_stride, stream);
     } else if (heads == md::glm::N_HEADS && d_out == md::glm::KV_LORA &&
                n_in == md::glm::QK_NOPE) {
-        if (prefill_m) {
-            /* PREFILL glm q-absorb: H=md::glm::N_HEADS(20),
-               N=md::glm::KV_LORA(512), K=md::glm::QK_NOPE(192), bf16 */
-            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
-                           y_head_dim, head_stride, stream);
-        } else {
-            /* DECODE glm q-absorb: M=batch, H=20, N=512, K=192, bf16 */
-            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
-                           y_head_dim, head_stride, stream);
-        }
+        /* DECODE glm q-absorb: M=batch (<=md::glm::DECODE_BATCH(512)),
+           H=20, N=md::glm::KV_LORA(512), K=md::glm::QK_NOPE(192), bf16 */
+        head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_row_stride,
+                       x_head_dim, y_head_dim, head_stride, stream);
     } else if (heads == md::dsv::N_HEADS && d_out == md::dsv::V_HEAD &&
                n_in == md::dsv::KV_LORA) {
-        if (prefill_m) {
-            /* PREFILL dsv value-up: H=16, N=md::dsv::V_HEAD(128),
-               K=md::dsv::KV_LORA(512), bf16 */
-            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
-                           y_head_dim, head_stride, stream);
-        } else {
-            /* DECODE dsv value-up: M=batch, H=16, N=128, K=512, bf16 */
-            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
-                           y_head_dim, head_stride, stream);
-        }
+        /* dsv [M,16h,128,512]: DECODE value-up (M=batch) and PREFILL kv_b
+           decompression of K_nope AND V (M=packed tokens; QK_NOPE==V_HEAD
+           ==128 so both land here), bf16 */
+        head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_row_stride,
+                       x_head_dim, y_head_dim, head_stride, stream);
+    } else if (heads == md::glm::N_HEADS && d_out == md::glm::QK_NOPE &&
+               n_in == md::glm::KV_LORA) {
+        /* PREFILL glm kv_b K_nope decompression: M=packed tokens
+           (<=md::glm::PREFILL_ROWS(32768)), H=20,
+           N=md::glm::QK_NOPE(192), K=md::glm::KV_LORA(512), bf16 */
+        head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_row_stride,
+                       x_head_dim, y_head_dim, head_stride, stream);
     } else if (heads == md::glm::N_HEADS && d_out == md::glm::V_HEAD &&
                n_in == md::glm::KV_LORA) {
-        if (prefill_m) {
-            /* PREFILL glm value-up: H=20, N=md::glm::V_HEAD(256),
-               K=md::glm::KV_LORA(512), bf16 */
-            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
-                           y_head_dim, head_stride, stream);
-        } else {
-            /* DECODE glm value-up: M=batch, H=20, N=256, K=512, bf16 */
-            head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_head_dim,
-                           y_head_dim, head_stride, stream);
-        }
+        /* glm [M,20h,256,512]: DECODE value-up (M=batch) and PREFILL kv_b
+           V decompression (M=packed tokens), bf16 */
+        head_gemm_mfma(y, x, w, rows, heads, d_out, n_in, x_row_stride,
+                       x_head_dim, y_head_dim, head_stride, stream);
     } else {
         unlisted_shape("ops::head_gemm", heads, d_out, n_in);
     }
@@ -1846,9 +1829,7 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
                 c.router_sigmoid, c.norm_topk, c.routed_scaling, stream);
 
     if (rows >= kt::MFMA_MIN_ROWS) {
-        constexpr int mfma_m = kt::GROUPED_ROUTE_TILE;   /* MFMA row tile   */
-        constexpr int m_tiles = kt::GROUPED_M_TILES;     /* tiles per block */
-        constexpr int block_m = kt::GROUPED_ALIGN_TILE;  /* align = 16*tiles*/
+        constexpr int block_m = kt::GROUPED_ROUTE_TILE;
         const int routes = rows * K;
         const int max_padded = routes + E * (block_m - 1);
         const int max_blocks = div_up(max_padded, block_m);
@@ -1863,7 +1844,7 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
          *  DECODE M=batch (<=md::*::DECODE_BATCH(512)); PREFILL M=packed tokens. */
         quantize_act(xn, qs, rows, H, stream);
         const int up_tiles = div_up(inter, kt::MFMA_TILE_N);
-        grouped_expert_gate_up_i8<mfma_m, m_tiles><<<
+        grouped_expert_gate_up_i8<block_m, 1><<<
             max_blocks * up_tiles, 256, 0, stream>>>(
                 qs.act_i8, qs.act_s, d.pool,
                 d.expert_gate_offsets, d.expert_up_offsets,
@@ -1892,7 +1873,7 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
                     stream>>>(routed_hidden, routed_i8, routed_s,
                               routes, inter);
             HIP_LAUNCH_CHECK();
-            grouped_expert_down_i8<mfma_m, m_tiles><<<
+            grouped_expert_down_i8<block_m, 1><<<
                 max_blocks * down_tiles, 256, 0, stream>>>(
                     routed_i8, routed_s, d.pool,
                     d.expert_down_offsets, d.expert_down_scale_offsets,
@@ -1900,7 +1881,7 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
                     routes, H, inter, down_tiles);
         } else {
             /* glm: expert down on bf16 MFMA with in-flight w8 dequant */
-            grouped_expert_down<mfma_m, m_tiles><<<
+            grouped_expert_down<block_m, 1><<<
                 max_blocks * down_tiles, 256, 0, stream>>>(
                     routed_hidden, routed_hidden_bf16, d.pool,
                     d.expert_down_offsets, d.expert_down_scale_offsets,
