@@ -843,9 +843,8 @@ __global__ void align_routes(const int *__restrict__ topk_ids, int routes,
             sorted_ids[dst] = routes;
 }
 
-/* w8a8 grouped expert gate/up + SwiGLU (int8 MFMA, epilogue scales). */
 template <int BLOCK_M, int M_TILES>
-__global__ void grouped_expert_gate_up_i8(
+__global__ void grouped_expert_gate_up_i8_prefill(
     const char *__restrict__ x8, const float *__restrict__ x_s,
     const char *__restrict__ pool,
     const size_t *__restrict__ gate_offsets,
@@ -856,6 +855,12 @@ __global__ void grouped_expert_gate_up_i8(
     const int *__restrict__ expert_ids,
     float *__restrict__ inter, bf16_t *__restrict__ inter_bf16,
     int routes, int hidden, int inter_dim, int top_k, int n_tiles) {
+    /* Same LDS footprint as before. Prefetch K+1 into VGPRs during MFMA of
+     * the resident tile, then overwrite LDS. Launch uses 256 threads. */
+    constexpr int kThreads = 256;
+    constexpr int kA = BLOCK_M * M_TILES * (MFMA_K / 8);
+    constexpr int kW = MFMA_N * (MFMA_K / 8);
+    static_assert(kA % kThreads == 0 && kW % kThreads == 0);
     __shared__ char sa[BLOCK_M * M_TILES][I8_LDS_K];
     __shared__ char sg[MFMA_N][I8_LDS_K];
     __shared__ char su[MFMA_N][I8_LDS_K];
@@ -875,20 +880,25 @@ __global__ void grouped_expert_gate_up_i8(
         reinterpret_cast<const float *>(pool + up_scale_offsets[expert]);
     int4v gacc[M_TILES] = {};
     int4v uacc[M_TILES] = {};
+    i8x8 a_reg[kA / kThreads];
+    i8x8 g_reg[kW / kThreads];
+    i8x8 u_reg[kW / kThreads];
 
-    for (int bk = 0; bk < hidden; bk += MFMA_K) {
-        for (int i = (int)threadIdx.x; i < BLOCK_M * M_TILES * (MFMA_K / 8);
-             i += (int)blockDim.x) {
+    auto load_regs = [&](int bk) {
+#pragma unroll
+        for (int t = 0; t < kA / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
             const int r = i / (MFMA_K / 8);
             const int k = (i % (MFMA_K / 8)) * 8;
             const int route = sorted_ids[mblock * BLOCK_M * M_TILES + r];
             i8x8 value = {};
             if (route < routes)
                 value = load_i8x8(x8, (size_t)(route / top_k), hidden, bk + k);
-            *reinterpret_cast<i8x8 *>(&sa[r][k]) = value;
+            a_reg[t] = value;
         }
-        for (int i = (int)threadIdx.x; i < MFMA_N * (MFMA_K / 8);
-             i += (int)blockDim.x) {
+#pragma unroll
+        for (int t = 0; t < kW / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
             const int c = i / (MFMA_K / 8);
             const int k = (i % (MFMA_K / 8)) * 8;
             const int gc = ntile * MFMA_N + c;
@@ -897,10 +907,36 @@ __global__ void grouped_expert_gate_up_i8(
                 gv = load_i8x8(wg8, (size_t)gc, hidden, bk + k);
                 uv = load_i8x8(wu8, (size_t)gc, hidden, bk + k);
             }
-            *reinterpret_cast<i8x8 *>(&sg[c][k]) = gv;
-            *reinterpret_cast<i8x8 *>(&su[c][k]) = uv;
+            g_reg[t] = gv;
+            u_reg[t] = uv;
         }
-        __syncthreads();
+    };
+    auto store_lds = [&]() {
+#pragma unroll
+        for (int t = 0; t < kA / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            const int r = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            *reinterpret_cast<i8x8 *>(&sa[r][k]) = a_reg[t];
+        }
+#pragma unroll
+        for (int t = 0; t < kW / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            const int c = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            *reinterpret_cast<i8x8 *>(&sg[c][k]) = g_reg[t];
+            *reinterpret_cast<i8x8 *>(&su[c][k]) = u_reg[t];
+        }
+    };
+
+    load_regs(0);
+    store_lds();
+    __syncthreads();
+
+    for (int bk = 0; bk < hidden; bk += MFMA_K) {
+        const int bk_n = bk + MFMA_K;
+        if (bk_n < hidden)
+            load_regs(bk_n);
 #pragma unroll
         for (int k = 0; k < MFMA_K; k += 16) {
             const int bg = *reinterpret_cast<const int *>(
@@ -917,6 +953,150 @@ __global__ void grouped_expert_gate_up_i8(
                     av, bu, uacc[mt], 0, 0, 0);
             }
         }
+        __syncthreads();
+        if (bk_n < hidden)
+            store_lds();
+        __syncthreads();
+    }
+
+    if (col < inter_dim) {
+        const float gscale = gws[col];
+        const float uscale = uws[col];
+#pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+            const int r0 = mt * 16 + 4 * (lane >> 4);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int route =
+                    sorted_ids[mblock * BLOCK_M * M_TILES + r0 + q];
+                if (route < routes) {
+                    const float as = x_s[route / top_k];
+                    const float gv = (float)gacc[mt][q] * as * gscale;
+                    const float uv = (float)uacc[mt][q] * as * uscale;
+                    const float value = (gv / (1.0f + expf(-gv))) * uv;
+                    if (inter_bf16)
+                        inter_bf16[(size_t)route * inter_dim + col] =
+                            gpu_f32_to_bf16(value);
+                    else
+                        inter[(size_t)route * inter_dim + col] = value;
+                }
+            }
+        }
+    }
+}
+
+template <int BLOCK_M, int M_TILES>
+__global__ void grouped_expert_gate_up_i8_decode(
+    const char *__restrict__ x8, const float *__restrict__ x_s,
+    const char *__restrict__ pool,
+    const size_t *__restrict__ gate_offsets,
+    const size_t *__restrict__ up_offsets,
+    const size_t *__restrict__ gate_scale_offsets,
+    const size_t *__restrict__ up_scale_offsets,
+    const int *__restrict__ sorted_ids,
+    const int *__restrict__ expert_ids,
+    float *__restrict__ inter, bf16_t *__restrict__ inter_bf16,
+    int routes, int hidden, int inter_dim, int top_k, int n_tiles) {
+    /* Same VGPR K-prefetch as _prefill (no extra LDS). */
+    __shared__ char sa[BLOCK_M * M_TILES][I8_LDS_K];
+    __shared__ char sg[MFMA_N][I8_LDS_K];
+    __shared__ char su[MFMA_N][I8_LDS_K];
+    const int mblock = (int)blockIdx.x / n_tiles;
+    const int ntile = (int)blockIdx.x - mblock * n_tiles;
+    const int expert = expert_ids[mblock];
+    if (expert < 0) return;
+    const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
+    const int wave = (int)threadIdx.x / HIP_WAVE;
+    const int k4 = 4 * (lane >> 4);
+    const int col = ntile * MFMA_N + wave * 16 + (lane & 15);
+    const char *wg8 = pool + gate_offsets[expert];
+    const char *wu8 = pool + up_offsets[expert];
+    const float *gws =
+        reinterpret_cast<const float *>(pool + gate_scale_offsets[expert]);
+    const float *uws =
+        reinterpret_cast<const float *>(pool + up_scale_offsets[expert]);
+    int4v gacc[M_TILES] = {};
+    int4v uacc[M_TILES] = {};
+    constexpr int kThreads = 256;
+    constexpr int kA = BLOCK_M * M_TILES * (MFMA_K / 8);
+    constexpr int kW = MFMA_N * (MFMA_K / 8);
+    static_assert(kA % kThreads == 0 && kW % kThreads == 0);
+    i8x8 a_reg[kA / kThreads];
+    i8x8 g_reg[kW / kThreads];
+    i8x8 u_reg[kW / kThreads];
+
+    auto load_regs = [&](int bk) {
+#pragma unroll
+        for (int t = 0; t < kA / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            const int r = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            const int route = sorted_ids[mblock * BLOCK_M * M_TILES + r];
+            i8x8 value = {};
+            if (route < routes)
+                value = load_i8x8(x8, (size_t)(route / top_k), hidden, bk + k);
+            a_reg[t] = value;
+        }
+#pragma unroll
+        for (int t = 0; t < kW / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            const int c = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            const int gc = ntile * MFMA_N + c;
+            i8x8 gv = {}, uv = {};
+            if (gc < inter_dim) {
+                gv = load_i8x8(wg8, (size_t)gc, hidden, bk + k);
+                uv = load_i8x8(wu8, (size_t)gc, hidden, bk + k);
+            }
+            g_reg[t] = gv;
+            u_reg[t] = uv;
+        }
+    };
+    auto store_lds = [&]() {
+#pragma unroll
+        for (int t = 0; t < kA / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            const int r = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            *reinterpret_cast<i8x8 *>(&sa[r][k]) = a_reg[t];
+        }
+#pragma unroll
+        for (int t = 0; t < kW / kThreads; ++t) {
+            const int i = (int)threadIdx.x + t * kThreads;
+            const int c = i / (MFMA_K / 8);
+            const int k = (i % (MFMA_K / 8)) * 8;
+            *reinterpret_cast<i8x8 *>(&sg[c][k]) = g_reg[t];
+            *reinterpret_cast<i8x8 *>(&su[c][k]) = u_reg[t];
+        }
+    };
+
+    load_regs(0);
+    store_lds();
+    __syncthreads();
+
+    for (int bk = 0; bk < hidden; bk += MFMA_K) {
+        const int bk_n = bk + MFMA_K;
+        if (bk_n < hidden)
+            load_regs(bk_n);
+#pragma unroll
+        for (int k = 0; k < MFMA_K; k += 16) {
+            const int bg = *reinterpret_cast<const int *>(
+                &sg[wave * 16 + (lane & 15)][k + k4]);
+            const int bu = *reinterpret_cast<const int *>(
+                &su[wave * 16 + (lane & 15)][k + k4]);
+#pragma unroll
+            for (int mt = 0; mt < M_TILES; ++mt) {
+                const int av = *reinterpret_cast<const int *>(
+                    &sa[mt * 16 + (lane & 15)][k + k4]);
+                gacc[mt] = __builtin_amdgcn_mfma_i32_16x16x16i8(
+                    av, bg, gacc[mt], 0, 0, 0);
+                uacc[mt] = __builtin_amdgcn_mfma_i32_16x16x16i8(
+                    av, bu, uacc[mt], 0, 0, 0);
+            }
+        }
+        __syncthreads();
+        if (bk_n < hidden)
+            store_lds();
         __syncthreads();
     }
 
@@ -1807,7 +1987,7 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
                     int *expert_ids, int *num_post_pad, float *routed_hidden,
                     bf16_t *routed_hidden_bf16, float *route_out,
                     const QuantScratch &qs, char *routed_i8, float *routed_s,
-                    hipStream_t stream) {
+                    bool prefill, hipStream_t stream) {
     const int H = c.hidden_size;
     const int E = c.n_routed_experts;
     const int K = c.n_experts_per_tok;
@@ -1846,16 +2026,26 @@ inline void moe_ffn(const Config &c, const DeviceLayer &d, int rows,
          * ---- shape ladder (model, phase) — same default everywhere ----
          *  dsv: routes=M*6, N=md::dsv::MOE_INTER(1408), K=HIDDEN(2048)
          *  glm: routes=M*4, N=md::glm::MOE_INTER(1536), K=HIDDEN(2048)
-         *  DECODE M=batch (<=md::*::DECODE_BATCH(512)); PREFILL M=packed tokens. */
+         *  DECODE M=batch (<=md::*::DECODE_BATCH(512)); PREFILL M=packed tokens.
+         * Prefill and decode both K-prefetch into VGPRs (same LDS). */
         quantize_act(xn, qs, rows, H, stream);
         const int up_tiles = div_up(inter, kt::MFMA_TILE_N);
-        grouped_expert_gate_up_i8<block_m, m_tiles><<<
-            max_blocks * up_tiles, 256, 0, stream>>>(
-                qs.act_i8, qs.act_s, d.pool,
-                d.expert_gate_offsets, d.expert_up_offsets,
-                d.expert_gate_scale_offsets, d.expert_up_scale_offsets,
-                sorted_ids, expert_ids, routed_hidden, routed_hidden_bf16,
-                routes, H, inter, K, up_tiles);
+        if (prefill)
+            grouped_expert_gate_up_i8_prefill<block_m, m_tiles><<<
+                max_blocks * up_tiles, 256, 0, stream>>>(
+                    qs.act_i8, qs.act_s, d.pool,
+                    d.expert_gate_offsets, d.expert_up_offsets,
+                    d.expert_gate_scale_offsets, d.expert_up_scale_offsets,
+                    sorted_ids, expert_ids, routed_hidden, routed_hidden_bf16,
+                    routes, H, inter, K, up_tiles);
+        else
+            grouped_expert_gate_up_i8_decode<block_m, m_tiles><<<
+                max_blocks * up_tiles, 256, 0, stream>>>(
+                    qs.act_i8, qs.act_s, d.pool,
+                    d.expert_gate_offsets, d.expert_up_offsets,
+                    d.expert_gate_scale_offsets, d.expert_up_scale_offsets,
+                    sorted_ids, expert_ids, routed_hidden, routed_hidden_bf16,
+                    routes, H, inter, K, up_tiles);
         HIP_LAUNCH_CHECK();
 
         if (d.shared_gate_s) /* dsv: xn is already quantized in `qs` above */

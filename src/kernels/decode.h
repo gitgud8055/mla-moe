@@ -654,7 +654,7 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
                          g.topk_weights, g.moe_sorted_ids,
                          g.moe_expert_ids, g.moe_num_padded,
                          g.routed_hidden, nullptr, g.moe_route_out,
-                         qs, g.routed_i8, g.routed_s, g.stream);
+                         qs, g.routed_i8, g.routed_s, false, g.stream);
     }
 
     ops::rmsnorm(g.xn, g.x, g.final_norm, H, batch, c.rms_eps, g.stream);
