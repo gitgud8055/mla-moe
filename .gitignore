@@ -41,3 +41,14 @@ reports/
 .rocprofv3/
 workloads/
 .claude/
+profile*
+TOKEN_BATCH_*
+output2.txt
+request511.out
+
+# Local profiler cheat-sheet + artifacts (also matched by rocprof* / profile*)
+docs/rocprof-profile-commands.sh
+profile_results/
+profile_large_rocprof_compute.sh
+docs/
+

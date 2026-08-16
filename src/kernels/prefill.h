@@ -506,7 +506,7 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
                          g.moe_expert_ids, g.moe_num_padded,
                          nullptr, g.prefill_routed_hidden, g.moe_route_out,
                          qs, g.prefill_routed_i8, g.prefill_routed_s,
-                         g.stream);
+                         true, g.stream);
     }
 
     dim3 gather_grid((unsigned)ops::div_up(H, kt::ELEMENTWISE_THREADS),
