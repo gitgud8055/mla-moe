@@ -82,6 +82,10 @@ namespace dsv {
      * full 65520-row prefill workspace (grid.y kernel limit) stays. */
     constexpr int DECODE_BATCH = 512;  /* sequences per decode step        */
     constexpr int PREFILL_ROWS = 65520;/* packed prefill workspace tokens  */
+    /* Waves per sequence in the MFMA decode attention (16 heads -> 1 M-tile,
+     * so all 8 waves split the 32 context tiles). Measured on the duplicate
+     * wave at B=2496: 4/8/16 -> 11835/11576/10781 tok/s, bit-identical. */
+    constexpr int FLASH_MFMA_WAVES = 4;
 }
 
 /* zai-org/GLM-4.7-Flash (config.json) */
@@ -118,6 +122,9 @@ namespace glm {
      * ever runs short. */
     constexpr int DECODE_BATCH = 512;  /* sequences per decode step        */
     constexpr int PREFILL_ROWS = 32768;/* packed prefill workspace tokens  */
+    /* 20 heads -> 2 M-tiles, so a wave count that suits dsv halves the
+     * context tiles per wave here; tuned separately below. */
+    constexpr int FLASH_MFMA_WAVES = 8;
 }
 
 } // namespace model
@@ -170,7 +177,11 @@ namespace dup {
      * position) budget and the per-slot buffers. The wave's real depth is
      * (longest prompt + steps); this only decides how the split is made, and
      * 256 keeps the loss under 1% across depths from 128 to 576. */
-    constexpr int SIZING_CAPACITY = 256;
+    constexpr int SIZING_CAPACITY = 512;
+    /* Token granularity of a prefix-cache key. Keys are inserted at every
+     * block boundary plus the exact prompt length, so a lookup returns the
+     * longest cached prefix. */
+    constexpr int PREFIX_BLOCK = 64;
     constexpr int CAP_ALIGN = 64;      /* kv depth granularity            */
     constexpr int SLOT_ALIGN = 64;     /* batch multiple of the MoE tile  */
     constexpr int WAVES = 4;           /* extra decode waves (env-tunable) */

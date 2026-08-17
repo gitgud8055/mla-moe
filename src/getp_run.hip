@@ -638,6 +638,11 @@ extern "C" void warm_up(Transformer *t) {
     g.h_dup_src.resize(slots);
     g.h_dup_vecs.resize(slots);
     g.h_slot_len.resize(slots);
+    g.h_clone_src.resize(slots);
+    /* Every block-aligned prefix of every staged prompt, plus its exact
+     * length, can become an entry. */
+    g.prefix.reserve((size_t)kMaxRequests *
+                     ((size_t)warm_capacity / kd::PREFIX_BLOCK + 2));
     g.h_dup_seed.resize(kMaxRequests);
     g.h_generated.resize(slots * (size_t)g.gen_stride);
     HIP_CHECK(hipStreamSynchronize(g.stream));
@@ -784,6 +789,148 @@ static void prefill_slots(const Config &c, size_t begin, int count,
     }
 }
 
+/* ---- prefix cache: insert / longest-prefix lookup ---------------------- */
+
+static const PrefixCache::Entry *prefix_find(uint64_t key, int tokens,
+                                             const int *tok, int prompt_slice) {
+    PrefixCache &pc = g.prefix;
+    size_t i = (size_t)(key ^ (key >> 32)) & pc.mask;
+    for (;;) {
+        const int idx = pc.table[i];
+        if (idx < 0) return nullptr;
+        const PrefixCache::Entry &e = pc.entries[(size_t)idx];
+        if (e.key == key && e.tokens == tokens) {
+            /* Confirm on the tokens themselves — the hash is a lookup key,
+             * never the proof of a match. */
+            const int *cached =
+                g.h_prompt_tokens.data() + (size_t)e.req * prompt_slice;
+            if (std::memcmp(cached, tok, (size_t)tokens * sizeof(int)) == 0)
+                return &e;
+        }
+        i = (i + 1) & pc.mask;
+    }
+}
+
+static void prefix_put(uint64_t key, int tokens, int slot, int req) {
+    PrefixCache &pc = g.prefix;
+    if (pc.entries.size() == pc.entries.capacity()) return;   /* cache full */
+    size_t i = (size_t)(key ^ (key >> 32)) & pc.mask;
+    while (pc.table[i] >= 0) {
+        const PrefixCache::Entry &e = pc.entries[(size_t)pc.table[i]];
+        if (e.key == key && e.tokens == tokens) return;       /* already in */
+        i = (i + 1) & pc.mask;
+    }
+    pc.table[i] = (int)pc.entries.size();
+    pc.entries.push_back({key, tokens, slot, req});
+}
+
+/* Register every block-aligned prefix of `req`'s prompt, plus its exact
+ * length, against the slot that now holds its KV. */
+static void prefix_insert_prompt(int req, int slot, int prompt_slice) {
+    const int n = g.h_prompt_len[req];
+    const int *tok = g.h_prompt_tokens.data() + (size_t)req * prompt_slice;
+    uint64_t h = PrefixCache::seed();
+    int b = 0;
+    for (; b + kd::PREFIX_BLOCK <= n; b += kd::PREFIX_BLOCK) {
+        for (int i = 0; i < kd::PREFIX_BLOCK; ++i) h = PrefixCache::mix(h, tok[b + i]);
+        prefix_put(PrefixCache::mix(h, b + kd::PREFIX_BLOCK),
+                   b + kd::PREFIX_BLOCK, slot, req);
+    }
+    if (b < n) {
+        uint64_t t = h;
+        for (int i = b; i < n; ++i) t = PrefixCache::mix(t, tok[i]);
+        prefix_put(PrefixCache::mix(t, n), n, slot, req);
+    }
+}
+
+/* Longest cached prefix of `req`'s prompt: {slot, matched tokens}. */
+static void prefix_lookup_prompt(int req, int prompt_slice, int *out_slot,
+                                 int *out_tokens) {
+    const int n = g.h_prompt_len[req];
+    const int *tok = g.h_prompt_tokens.data() + (size_t)req * prompt_slice;
+    *out_slot = -1; *out_tokens = 0;
+    uint64_t h = PrefixCache::seed();
+    int b = 0;
+    for (; b + kd::PREFIX_BLOCK <= n; b += kd::PREFIX_BLOCK) {
+        for (int i = 0; i < kd::PREFIX_BLOCK; ++i) h = PrefixCache::mix(h, tok[b + i]);
+        const PrefixCache::Entry *e = prefix_find(
+            PrefixCache::mix(h, b + kd::PREFIX_BLOCK), b + kd::PREFIX_BLOCK,
+            tok, prompt_slice);
+        if (!e) break;                 /* prefixes are stored in order */
+        *out_slot = e->slot; *out_tokens = e->tokens;
+    }
+    if (b == n - (n % kd::PREFIX_BLOCK) && n % kd::PREFIX_BLOCK) {
+        uint64_t t = h;
+        for (int i = b; i < n; ++i) t = PrefixCache::mix(t, tok[i]);
+        if (const PrefixCache::Entry *e = prefix_find(
+                PrefixCache::mix(t, n), n, tok, prompt_slice)) {
+            *out_slot = e->slot; *out_tokens = n;
+        }
+    }
+}
+
+/* Fill slots [dst_base, dst_base+n) from the cache. h_dup_src / h_dup_vecs
+ * must already hold each destination's source slot and copy length. The
+ * source's first decode token is copied too, so a cloned slot resumes exactly
+ * where a prefill of the same prompt would have left it. */
+static void clone_cached_slots(const Config &c, int dst_base, int n,
+                               int max_vecs) {
+    if (n < 1) return;
+    const int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
+    HIP_CHECK(hipMemcpyAsync(g.dup_src, g.h_dup_src.data(),
+                             (size_t)n * sizeof(int), hipMemcpyHostToDevice,
+                             g.stream));
+    HIP_CHECK(hipMemcpyAsync(g.dup_vecs, g.h_dup_vecs.data(),
+                             (size_t)n * sizeof(int), hipMemcpyHostToDevice,
+                             g.stream));
+    ops::clone_prompt_kv_slots(g.kv_cache, g.kv_layer_stride, g.kv_capacity,
+                               KVD, c.n_layers, g.dup_src, g.dup_vecs,
+                               dst_base, n, max_vecs, g.stream);
+    ops::gather_slot_i32<<<ops::div_up(n, kt::ELEMENTWISE_THREADS),
+        kt::ELEMENTWISE_THREADS, 0, g.stream>>>(
+            g.next_token, g.next_token, g.dup_src, dst_base, n);
+    HIP_LAUNCH_CHECK();
+}
+
+/* Prefill a group of requests, consulting the cache first.
+ *
+ * g.h_active[begin, begin+count) is permuted so that first occurrences come
+ * first: those are prefilled into slots [0, n_prefill), their prompts are
+ * registered, and any request whose prompt the cache already covers end to end
+ * is then cloned into the slots behind them. The permutation is invisible to
+ * the caller — every later step reads the request id back out of h_active. */
+static void prefill_group_cached(const Config &c, size_t begin, int count,
+                                 int prompt_slice, int max_batch) {
+    static std::vector<int> order, clone_req;
+    order.clear(); clone_req.clear();
+    int n_prefill = 0, n_clone = 0, max_vecs = 0;
+    const int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
+    for (int b = 0; b < count; ++b) {
+        const int r = g.h_active[begin + b];
+        int slot = -1, matched = 0;
+        prefix_lookup_prompt(r, prompt_slice, &slot, &matched);
+        if (slot >= 0 && matched == g.h_prompt_len[r]) {
+            clone_req.push_back(r);
+            g.h_dup_src[n_clone] = slot;
+            const int vecs = g.h_prompt_len[r] * KVD / 8;
+            g.h_dup_vecs[n_clone] = vecs;
+            max_vecs = std::max(max_vecs, vecs);
+            ++n_clone;
+            ++g.prefix.hits;
+        } else {
+            order.push_back(r);
+            prefix_insert_prompt(r, n_prefill, prompt_slice);
+            ++n_prefill;
+            ++g.prefix.misses;
+        }
+    }
+    for (int r : clone_req) order.push_back(r);
+    for (int b = 0; b < count; ++b) g.h_active[begin + b] = order[(size_t)b];
+
+    prefill_slots(c, begin, n_prefill, prompt_slice, max_batch);
+    clone_cached_slots(c, n_prefill, n_clone, max_vecs);
+}
+
 /* Cache depth a duplicate wave needs: every prompt has to fit, plus the tokens
  * it will generate. 0 when there is nothing to duplicate. */
 static int duplicate_wave_capacity(const Config &c, Requests *reqs) {
@@ -852,7 +999,8 @@ static long long run_duplicate_waves(Transformer *t, Requests *reqs, int eos,
      * at this exact depth, or they need one prefill pass of their own. */
     g.kv_capacity = capacity;
     if (!templates_ready) {
-        prefill_slots(c, 0, n_tpl, prompt_slice, slots);
+        g.prefix.clear();
+        prefill_group_cached(c, 0, n_tpl, prompt_slice, slots);
         HIP_CHECK(hipMemcpyAsync(g.h_dup_seed.data(), g.next_token,
                                  (size_t)n_tpl * sizeof(int),
                                  hipMemcpyDeviceToHost, g.stream));
@@ -864,6 +1012,24 @@ static long long run_duplicate_waves(Transformer *t, Requests *reqs, int eos,
      * position; slot b < n_tpl is request h_active[b]. */
     for (int b = 0; b < n_tpl; ++b)
         g.h_slot_len[b] = g.h_prompt_len[g.h_active[b]];
+
+    /* Resolve each request against the prefix cache. A duplicate is only
+     * cloneable when the cache covers its prompt end to end — prefill cannot
+     * attend to cached positions, so a partial prefix would still have to be
+     * recomputed in full. */
+    int n_usable = 0;
+    for (int b = 0; b < n_tpl; ++b) {
+        const int r = g.h_active[b];
+        int slot = -1, matched = 0;
+        prefix_lookup_prompt(r, prompt_slice, &slot, &matched);
+        const bool full = slot >= 0 && matched == g.h_prompt_len[r];
+        g.h_clone_src[b] = full ? slot : -1;
+        if (full) ++n_usable; else ++g.prefix.misses;
+    }
+    if (n_usable < 1) return 0;
+    std::fprintf(stderr,
+        "[getp HIP] prefix cache: %zu entries, %d/%d prompts fully cached\n",
+        g.prefix.entries.size(), n_usable, n_tpl);
 
     std::fprintf(stderr,
         "[getp HIP] duplicate waves: %d x %d slots over %d requests "
@@ -881,29 +1047,24 @@ static long long run_duplicate_waves(Transformer *t, Requests *reqs, int eos,
         const int rot = (int)(((long long)w * n_dup) % n_tpl);
         int max_vecs = 0;
         for (int j = 0; j < n_dup; ++j) {
-            const int src = (rot + j) % n_tpl;
+            /* Round-robin over the requests, skipping any the cache does not
+             * cover; the clone source comes from the cache, not from an
+             * assumed template layout. */
+            int b = (rot + j) % n_tpl;
+            while (g.h_clone_src[b] < 0) b = (b + 1) % n_tpl;
+            const int src = g.h_clone_src[b];
             g.h_dup_src[j] = src;
-            const int vecs = g.h_slot_len[src] * KVD / 8;
+            const int len = g.h_prompt_len[g.h_active[b]];
+            const int vecs = len * KVD / 8;
             g.h_dup_vecs[j] = vecs;
             max_vecs = std::max(max_vecs, vecs);
-            g.h_slot_len[n_tpl + j] = g.h_slot_len[src];
+            g.h_slot_len[n_tpl + j] = len;
+            ++g.prefix.hits;
         }
-        HIP_CHECK(hipMemcpyAsync(g.dup_src, g.h_dup_src.data(),
-                                 (size_t)n_dup * sizeof(int),
-                                 hipMemcpyHostToDevice, g.stream));
-        HIP_CHECK(hipMemcpyAsync(g.dup_vecs, g.h_dup_vecs.data(),
-                                 (size_t)n_dup * sizeof(int),
-                                 hipMemcpyHostToDevice, g.stream));
         HIP_CHECK(hipMemcpyAsync(g.next_token, seed.data(),
                                  (size_t)n_tpl * sizeof(int),
                                  hipMemcpyHostToDevice, g.stream));
-        ops::clone_prompt_kv_slots(g.kv_cache, g.kv_layer_stride, capacity,
-                                   KVD, c.n_layers, g.dup_src, g.dup_vecs,
-                                   n_tpl, n_dup, max_vecs, g.stream);
-        ops::gather_slot_i32<<<ops::div_up(n_dup, kt::ELEMENTWISE_THREADS),
-            kt::ELEMENTWISE_THREADS, 0, g.stream>>>(
-                g.next_token, g.next_token, g.dup_src, n_tpl, n_dup);
-        HIP_LAUNCH_CHECK();
+        clone_cached_slots(c, n_tpl, n_dup, max_vecs);
 
         for (int step = 0; step < steps; ++step) {
             for (int b = 0; b < slots; ++b)
@@ -1021,8 +1182,12 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
         }
         const int batch = (int)(group_end - group_begin);
 
-        /* --- prefill: pack prompts into chunks that fit the workspace --- */
-        prefill_slots(c, group_begin, batch, prompt_slice, g_max_batch);
+        /* --- prefill: pack prompts into chunks that fit the workspace,
+         * reusing any prompt the cache already holds --- */
+        /* Each group reuses slots 0..batch, so the previous group's cache
+         * entries no longer describe what is in the cache. */
+        g.prefix.clear();
+        prefill_group_cached(c, group_begin, batch, prompt_slice, g_max_batch);
 
         /* Snapshot the first decode token of each slot before decode
          * overwrites it — the duplicate waves replay from exactly here. */

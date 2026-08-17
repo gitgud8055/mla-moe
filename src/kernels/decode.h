@@ -313,7 +313,7 @@ __global__ void value_up(float *ctx, const float *clat, const bf16_t *wuv,
  * context (o_acc stays small). Removes the scalar kernel's cache re-read AND
  * its VALU/latency bottleneck. Block-uniform kv_len keeps barriers
  * convergent. Caller guarantees batch >= 1. */
-template <int HEADS, int KV_RANK, int ROPE_DIM>
+template <int HEADS, int KV_RANK, int ROPE_DIM, int WV>
 __global__ void flash_attention_mfma(
     float *__restrict__ clat, const float *__restrict__ qabs,
     const float *__restrict__ qrope, const bf16_t *__restrict__ cache,
@@ -324,7 +324,8 @@ __global__ void flash_attention_mfma(
     constexpr int KT = KV_DIM / 16;               /* 36 score k-tiles   */
     constexpr int CT = KV_RANK / 16;              /* 32 context col-tiles */
     constexpr int MT = (HEADS + 15) / 16;         /* M-tiles: dsv 1, glm 2 */
-    constexpr int WV = 8;                          /* waves per block     */
+    /* WV is the launch's wave count — the two must agree or the tiles this
+     * partition assigns to the missing waves are simply never computed. */
     constexpr int GRP = WV / MT;                   /* waves per M-tile     */
     constexpr int CTW = CT / GRP;                  /* context c-tiles/wave */
     /* Score k-range split across SPL waves per M-tile. Holding all KT=36 Q
@@ -532,8 +533,10 @@ inline void flash_attention_dispatch(
                +9.3% TPS; bf16-Q rounding costs METEOR 0.4245->0.4068 /
                BERTScore 0.8867->0.8839 (both still > 0.30/0.83 gates). */
             flash_attention_mfma<md::dsv::N_HEADS, md::dsv::KV_LORA,
-                                 md::dsv::QK_ROPE><<<(unsigned)batch,
-                8 * HIP_WAVE, 0, stream>>>(clat, qabs, qrope, cache, positions,
+                                 md::dsv::QK_ROPE,
+                                 md::dsv::FLASH_MFMA_WAVES><<<(unsigned)batch,
+                md::dsv::FLASH_MFMA_WAVES * HIP_WAVE, 0, stream>>>(
+                                           clat, qabs, qrope, cache, positions,
                                            batch, capacity, scale);
             HIP_LAUNCH_CHECK();
         } else {
@@ -548,8 +551,10 @@ inline void flash_attention_dispatch(
             /* DECODE glm flash, B>=kt::FLASH_LARGE_BATCH(128): MFMA FA2, one
                block/seq, 8 waves, all 20 heads share one latent-cache read. */
             flash_attention_mfma<md::glm::N_HEADS, md::glm::KV_LORA,
-                                 md::glm::QK_ROPE><<<(unsigned)batch,
-                8 * HIP_WAVE, 0, stream>>>(clat, qabs, qrope, cache, positions,
+                                 md::glm::QK_ROPE,
+                                 md::glm::FLASH_MFMA_WAVES><<<(unsigned)batch,
+                md::glm::FLASH_MFMA_WAVES * HIP_WAVE, 0, stream>>>(
+                                           clat, qabs, qrope, cache, positions,
                                            batch, capacity, scale);
             HIP_LAUNCH_CHECK();
         } else {

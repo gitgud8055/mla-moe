@@ -6,7 +6,9 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
@@ -79,6 +81,50 @@ struct DeviceLayer
     const size_t *expert_gate_scale_offsets = nullptr;
     const size_t *expert_up_scale_offsets = nullptr;
     const size_t *expert_down_scale_offsets = nullptr;
+};
+
+/* Content-keyed KV prefix cache.
+ *
+ * A prompt's latent cache at position i is a deterministic function of tokens
+ * [0, i] alone, so two requests sharing a token prefix share that prefix's KV
+ * exactly. Entries are keyed by a hash of the token prefix (block-aligned,
+ * plus the exact full length) and name the slot whose cache already holds it.
+ * The hash is only a lookup key — a candidate is confirmed by comparing the
+ * tokens themselves, so a collision cannot return the wrong KV.
+ *
+ * Invariant that keeps an entry valid: decode only ever writes cache positions
+ * >= prompt_len, so a slot that has generated tokens still holds an intact
+ * prompt region and stays a usable cache entry. */
+struct PrefixCache {
+    struct Entry {
+        uint64_t key;
+        int tokens;   /* prefix length this entry represents */
+        int slot;     /* cache slot holding it               */
+        int req;      /* request whose staged tokens back it */
+    };
+    std::vector<Entry> entries;
+    std::vector<int> table;      /* open addressing, -1 = empty */
+    size_t mask = 0;
+    long long hits = 0, misses = 0;
+
+    /* warm_up only: this is the one place that allocates. */
+    void reserve(size_t max_entries) {
+        entries.reserve(max_entries);
+        size_t n = 16;
+        while (n < max_entries * 4) n <<= 1;
+        table.assign(n, -1);
+        mask = n - 1;
+    }
+    void clear() {
+        entries.clear();
+        std::fill(table.begin(), table.end(), -1);
+        hits = misses = 0;
+    }
+    static uint64_t mix(uint64_t h, int v) {
+        h ^= (uint64_t)(uint32_t)v;
+        return h * 1099511628211ULL;
+    }
+    static uint64_t seed() { return 1469598103934665603ULL; }
 };
 
 struct GpuContext {
@@ -160,6 +206,8 @@ struct GpuContext {
     std::vector<int> h_dup_vecs;        /* clone length per duplicate slot   */
     std::vector<int> h_dup_seed;        /* templates' first decode token     */
     std::vector<int> h_slot_len;        /* prompt length per wave slot       */
+    std::vector<int> h_clone_src;       /* request -> cache slot, -1 = miss  */
+    PrefixCache prefix;                 /* content-keyed KV reuse            */
     int *dup_src = nullptr;             /* device copy of h_dup_src          */
     int *dup_vecs = nullptr;            /* device copy of h_dup_vecs         */
     int max_requests = 0;
