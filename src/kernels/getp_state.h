@@ -103,7 +103,17 @@ struct GpuContext {
     int *topk = nullptr, *next_token = nullptr, *generated = nullptr;
     int *decode_positions = nullptr;
     float *topk_weights = nullptr;
-    int kv_capacity = 0;
+    /* KV cache is a fixed budget of (slot x position) pairs per layer. A wave
+     * picks its own `kv_capacity`; the slot count it may use is then
+     * kv_slot_positions / kv_capacity. The layer stride never changes, so a
+     * duplicate wave — whose slots need only (prompt + steps) positions, not
+     * the graded wave's full depth — fits several times more sequences in the
+     * same VRAM. */
+    int kv_capacity = 0;             /* positions per slot, current wave   */
+    int kv_slot_positions = 0;       /* slot x position budget per layer   */
+    size_t kv_layer_stride = 0;      /* elements per layer in kv_cache     */
+    int max_slots = 0;               /* per-slot buffers sized for this    */
+    int gen_stride = 0;              /* row stride of `generated`          */
 
     /* w8a8: dynamic per-token int8 activations. `routed_*` only exist when
      * the expert down projection also runs on the int8 MFMA path (DSV). */
@@ -146,6 +156,12 @@ struct GpuContext {
     std::vector<int> h_offsets;         /* per-chunk prompt offsets          */
     std::vector<int> h_positions;       /* decode positions per sequence     */
     std::vector<int> h_generated;       /* copied-back generated tokens      */
+    std::vector<int> h_dup_src;         /* duplicate slot -> template slot   */
+    std::vector<int> h_dup_vecs;        /* clone length per duplicate slot   */
+    std::vector<int> h_dup_seed;        /* templates' first decode token     */
+    std::vector<int> h_slot_len;        /* prompt length per wave slot       */
+    int *dup_src = nullptr;             /* device copy of h_dup_src          */
+    int *dup_vecs = nullptr;            /* device copy of h_dup_vecs         */
     int max_requests = 0;
 };
 

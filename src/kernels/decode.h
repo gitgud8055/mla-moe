@@ -621,8 +621,7 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
                            g.comp, d.kv_a_proj, d.kv_a_proj_s, KVD,
                            g.xn, H, batch, qs, g.stream);
         }
-        bf16_t *layer_cache = g.kv_cache +
-            (size_t)l * max_batch * g.kv_capacity * KVD;
+        bf16_t *layer_cache = g.kv_cache + (size_t)l * g.kv_layer_stride;
         kv_norm_rope<<<batch, kt::ATTENTION_THREADS, 0, g.stream>>>(
             layer_cache, g.comp, d.kv_a_norm, positions, batch,
             g.kv_capacity, KVL, KVD, QKR, g.rope_inv_freq,

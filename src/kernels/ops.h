@@ -2414,6 +2414,55 @@ inline void dense_ffn(const Config &c, const DeviceLayer &d, int rows,
          stream);
 }
 
+/* ---- duplicate waves: prompt-KV clone ---------------------------------- */
+
+/* Copy the prompt region of a template slot's latent cache into a duplicate
+ * slot, for every layer. The duplicate then decodes from `prompt_len` with a
+ * cache identical to what its own prefill would have produced, so the wave
+ * costs one strided copy instead of a second prefill pass.
+ * Positions >= prompt_len are written by decode itself, which is why a
+ * template slot stays a valid template after it has generated tokens. */
+__global__ void __launch_bounds__(256) clone_prompt_kv(
+    bf16_t *__restrict__ cache, size_t layer_stride, size_t slot_stride,
+    const int *__restrict__ src_slot, const int *__restrict__ src_vecs,
+    int dst_base) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int d = blockIdx.y;
+    if (i >= src_vecs[d]) return;   /* prompts differ in length per slot */
+    bf16_t *base = cache + (size_t)blockIdx.z * layer_stride;
+    const utils::types::bf16x8 *src =
+        reinterpret_cast<const utils::types::bf16x8 *>(
+            base + (size_t)src_slot[d] * slot_stride);
+    utils::types::bf16x8 *dst = reinterpret_cast<utils::types::bf16x8 *>(
+        base + (size_t)(dst_base + d) * slot_stride);
+    dst[i] = src[i];
+}
+
+/* dst[base + i] = src[idx[i]] — seeds each duplicate slot with the first
+ * decode token its template produced. */
+__global__ void gather_slot_i32(int *__restrict__ dst, const int *__restrict__ src,
+                                const int *__restrict__ idx, int base, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[base + i] = src[idx[i]];
+}
+
+/* `src_vecs[d]` is the copy length of destination d in 8-element vectors, i.e.
+ * prompt_len * kv_dim / 8 (kv_dim is 576 on both models, so any prompt length
+ * divides evenly). `max_vecs` bounds the grid. */
+inline void clone_prompt_kv_slots(bf16_t *cache, size_t layer_stride,
+                                  int capacity, int kv_dim, int n_layers,
+                                  const int *src_slot, const int *src_vecs,
+                                  int dst_base, int n_dst, int max_vecs,
+                                  hipStream_t stream) {
+    if (n_dst < 1 || max_vecs < 1) return;
+    dim3 grid((unsigned)div_up(max_vecs, kt::ELEMENTWISE_THREADS),
+              (unsigned)n_dst, (unsigned)n_layers);
+    clone_prompt_kv<<<grid, kt::ELEMENTWISE_THREADS, 0, stream>>>(
+        cache, layer_stride, (size_t)capacity * kv_dim, src_slot, src_vecs,
+        dst_base);
+    HIP_LAUNCH_CHECK();
+}
+
 } // namespace ops
 
 #endif /* MLA_OPS_H */

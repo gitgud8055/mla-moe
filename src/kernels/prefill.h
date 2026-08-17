@@ -463,8 +463,7 @@ inline void run(GpuContext &g, const Config &c, int max_batch,
         }
 
         /* c_kv norm + k_pe rope -> bf16 cache (decode) + f32 comp (here) */
-        bf16_t *layer_cache = g.kv_cache
-            + (size_t)l * max_batch * g.kv_capacity * KVD;
+        bf16_t *layer_cache = g.kv_cache + (size_t)l * g.kv_layer_stride;
         kv_norm_rope<<<rows, kt::ELEMENTWISE_THREADS, 0, g.stream>>>(
             layer_cache, g.prefill_comp, d.kv_a_norm, row_batches,
             row_positions, slot_base, rows, g.kv_capacity, KVL, KVD,

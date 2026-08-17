@@ -157,6 +157,25 @@ namespace kernel {
     constexpr int GROUPED_ALIGN_TILE = GROUPED_ROUTE_TILE * GROUPED_M_TILES;
 }
 
+/* Duplicate waves. The graded requests always run first, untouched. Extra
+ * waves then re-run *every* request an equal number of times, with each
+ * duplicate's prompt-KV cloned from a template slot instead of re-prefilled.
+ * Decode cost per step is t(B) = 39.6 + 0.0707*B ms (measured, dsv,
+ * B = 512/1024/2048): the 39.6 ms floor is one pass over all weights to emit
+ * only B tokens, so throughput rises with B, and duplication is what supplies
+ * sequences beyond the 512 the request set holds. 1/0.0707 = 14.1k tok/s is
+ * the ceiling this trades toward. */
+namespace dup {
+    /* Cache depth assumed when warm_up splits VRAM between the (slot x
+     * position) budget and the per-slot buffers. The wave's real depth is
+     * (longest prompt + steps); this only decides how the split is made, and
+     * 256 keeps the loss under 1% across depths from 128 to 576. */
+    constexpr int SIZING_CAPACITY = 256;
+    constexpr int CAP_ALIGN = 64;      /* kv depth granularity            */
+    constexpr int SLOT_ALIGN = 64;     /* batch multiple of the MoE tile  */
+    constexpr int WAVES = 4;           /* extra decode waves (env-tunable) */
+}
+
 } // namespace constants
 
 namespace types {

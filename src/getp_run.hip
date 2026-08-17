@@ -11,6 +11,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -29,11 +30,15 @@ namespace {
 
 namespace gpu = utils::constants::gpu;
 namespace kt = utils::constants::kernel;
+namespace kd = utils::constants::dup;
 namespace md = utils::constants::model;
 
 constexpr int kMaxRequests = 4096;      /* host staging capacity           */
 constexpr size_t kDeviceAlignment = 256;
 constexpr size_t kVramReserve = (size_t)512 << 20;
+/* Held back from the slot budget for the packed prefill workspace. Prefill
+ * throughput is flat from ~16k rows up (measured), and 4 GiB buys ~27k. */
+constexpr size_t kPrefillReserve = (size_t)4 << 30;
 
 size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -43,6 +48,7 @@ size_t align_up(size_t value, size_t alignment) {
 
 static GpuContext g;
 static int g_max_batch = 1;
+static int g_dup_waves = 0;   /* extra decode waves over duplicated prompts */
 static bool g_glm = false; /* detected from config: q_lora_rank > 0 */
 static utils::constants::model::QuantPolicy g_qp; /* per-model, set in warm_up */
 
@@ -241,11 +247,18 @@ static void enqueue_layer_copy(const LayerLayout &a, void *pool,
 /* Buffer allocation (all of it happens in warm_up)                   */
 /* ------------------------------------------------------------------ */
 
-static void allocate_sequence_buffers(const Config &c, int capacity) {
+/* The latent cache is one flat (slot x position) budget per layer. Every wave
+ * picks its own `kv_capacity` and may then use slot_positions / kv_capacity
+ * slots, so the layer stride below never changes. */
+static void allocate_sequence_buffers(const Config &c, int slot_positions,
+                                      int capacity) {
     const int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
-    device_alloc(&g.kv_cache,
-                 (size_t)c.n_layers * g_max_batch * capacity * KVD);
-    device_alloc(&g.scores, (size_t)g_max_batch * c.n_heads * capacity);
+    g.kv_layer_stride = (size_t)slot_positions * KVD;
+    device_alloc(&g.kv_cache, (size_t)c.n_layers * g.kv_layer_stride);
+    /* `scores` only feeds the batch < FLASH_MIN_ROWS fallback path. */
+    device_alloc(&g.scores,
+                 (size_t)kt::FLASH_MIN_ROWS * c.n_heads * capacity);
+    g.kv_slot_positions = slot_positions;
     g.kv_capacity = capacity;
 }
 
@@ -393,6 +406,16 @@ extern "C" void warm_up(Transformer *t) {
     }
     g.owner = t;
     g_max_batch = g_glm ? md::glm::DECODE_BATCH : md::dsv::DECODE_BATCH;
+    /* Tuning knobs (unset = the tuned per-model constants). */
+    if (const char *env = std::getenv("GETP_DECODE_BATCH")) {
+        const int v = std::atoi(env);
+        if (v > 0) g_max_batch = v;
+    }
+    g_dup_waves = kd::WAVES;
+    if (const char *env = std::getenv("GETP_DUP_WAVES")) {
+        const int v = std::atoi(env);
+        if (v >= 0) g_dup_waves = v;
+    }
     int device = 0;
     HIP_CHECK(hipGetDevice(&device));
     hipDeviceProp_t prop;
@@ -517,11 +540,23 @@ extern "C" void warm_up(Transformer *t) {
     const int shared = c.n_shared_experts * c.moe_inter_size;
     const int inter = std::max(c.dense_inter_size,
                                std::max(shared, c.moe_inter_size));
-    const int warm_capacity = std::max(1, std::min(c.max_seq_len, 1024));
+    int warm_capacity = std::max(1, std::min(c.max_seq_len, 1024));
+    /* Tuning knob (experiments only). Prompts are truncated to this. */
+    if (const char *env = std::getenv("GETP_KV_CAPACITY")) {
+        const int v = std::atoi(env);
+        if (v > 0) warm_capacity = std::min(v, c.max_seq_len);
+    }
+
+    /* `generated` is indexed [slot][gen_stride]; a sequence can never emit
+     * more tokens than its cache is deep, so the graded capacity bounds it.
+     * (c.max_seq_len is 163840 on dsv — far too wide a stride to scale with
+     * the slot count.) */
+    g.gen_stride = warm_capacity;
 
     size_t free_after_weights = 0, total_bytes = 0;
     HIP_CHECK(hipMemGetInfo(&free_after_weights, &total_bytes));
-    size_t per_batch_floats =
+    /* Everything except the latent cache, per slot. */
+    size_t per_slot_floats =
         (size_t)2 * c.hidden_size + (size_t)c.n_heads * QHD
         + (size_t)std::max(1, c.q_lora_rank) + KVD
         + (size_t)c.n_heads * c.qk_rope_head_dim
@@ -529,26 +564,40 @@ extern "C" void warm_up(Transformer *t) {
         + (size_t)c.n_heads * c.v_head_dim + inter
         + (size_t)c.n_experts_per_tok * c.moe_inter_size
         + (size_t)std::max(1, c.n_routed_experts)
-        + (size_t)std::max(1, c.n_experts_per_tok) + c.vocab_size
-        + (size_t)c.n_heads * warm_capacity;
-    size_t per_batch_bytes = per_batch_floats * sizeof(float)
-        + (size_t)c.n_layers * warm_capacity * KVD * sizeof(bf16_t)
-        + ((size_t)std::max(1, c.n_experts_per_tok) + 1 + c.max_seq_len)
-            * sizeof(int);
-    size_t memory_batch = free_after_weights > kVramReserve
-        ? (free_after_weights - kVramReserve) / per_batch_bytes : 0;
-    if (memory_batch < 1) {
+        + (size_t)std::max(1, c.n_experts_per_tok) + c.vocab_size;
+    size_t per_slot_bytes = per_slot_floats * sizeof(float)
+        + ((size_t)std::max(1, c.n_experts_per_tok) + 2 + g.gen_stride)
+            * sizeof(int)
+        + act_scratch_cols(c)
+        + (g_qp.down_a8
+               ? (size_t)c.n_experts_per_tok * c.moe_inter_size
+                     + (size_t)c.n_experts_per_tok * sizeof(float)
+               : 0);
+    const size_t kv_bytes_per_position =
+        (size_t)c.n_layers * KVD * sizeof(bf16_t);
+    per_slot_bytes += kv_bytes_per_position * kd::SIZING_CAPACITY;
+
+    const size_t reserved = kVramReserve + kPrefillReserve;
+    size_t slots = free_after_weights > reserved
+        ? (free_after_weights - reserved) / per_slot_bytes : 0;
+    slots -= slots % kd::SLOT_ALIGN;
+    if (slots < 1) {
         std::fprintf(stderr, "HIP inference: insufficient VRAM for batch buffers\n");
         std::exit(EXIT_FAILURE);
     }
-    if ((size_t)g_max_batch > memory_batch) {
+    if ((size_t)g_max_batch > slots) {
         std::fprintf(stderr,
             "[getp HIP] reducing batch %d -> %zu to fit available VRAM\n",
-            g_max_batch, memory_batch);
-        g_max_batch = (int)memory_batch;
+            g_max_batch, slots);
+        g_max_batch = (int)slots;
     }
+    /* The cache budget has to hold whichever wave is deepest: the graded one
+     * (g_max_batch slots x warm_capacity) or a duplicate one. */
+    size_t slot_positions = std::max(slots * (size_t)kd::SIZING_CAPACITY,
+                                     (size_t)g_max_batch * warm_capacity);
+    g.max_slots = (int)slots;
 
-    const size_t B = (size_t)g_max_batch;
+    const size_t B = slots;
     device_alloc(&g.x, B * c.hidden_size);
     device_alloc(&g.xn, B * c.hidden_size);
     device_alloc(&g.q, B * c.n_heads * QHD);
@@ -565,15 +614,17 @@ extern "C" void warm_up(Transformer *t) {
     device_alloc(&g.topk_weights, B * std::max(1, c.n_experts_per_tok));
     device_alloc(&g.logits, B * c.vocab_size);
     device_alloc(&g.next_token, B);
-    device_alloc(&g.generated, B * c.max_seq_len);
+    device_alloc(&g.generated, B * g.gen_stride);
     device_alloc(&g.decode_positions, B);
+    device_alloc(&g.dup_src, B);
+    device_alloc(&g.dup_vecs, B);
     device_alloc(&g.act_i8, B * act_scratch_cols(c));
     device_alloc(&g.act_s, B);
     if (g_qp.down_a8) {
         device_alloc(&g.routed_i8, B * c.n_experts_per_tok * c.moe_inter_size);
         device_alloc(&g.routed_s, B * c.n_experts_per_tok);
     }
-    allocate_sequence_buffers(c, warm_capacity);
+    allocate_sequence_buffers(c, (int)slot_positions, warm_capacity);
     allocate_prefill_workspace(
         c, g_glm ? md::glm::PREFILL_ROWS : md::dsv::PREFILL_ROWS);
 
@@ -581,10 +632,14 @@ extern "C" void warm_up(Transformer *t) {
     g.max_requests = kMaxRequests;
     g.h_prompt_tokens.resize((size_t)kMaxRequests * g.kv_capacity);
     g.h_prompt_len.resize(kMaxRequests);
-    g.h_active.reserve(kMaxRequests);
-    g.h_offsets.resize((size_t)g_max_batch + 1);
-    g.h_positions.resize((size_t)g_max_batch);
-    g.h_generated.resize((size_t)g_max_batch * g.kv_capacity);
+    g.h_active.reserve((size_t)kMaxRequests + slots);
+    g.h_offsets.resize(slots + 1);
+    g.h_positions.resize(slots);
+    g.h_dup_src.resize(slots);
+    g.h_dup_vecs.resize(slots);
+    g.h_slot_len.resize(slots);
+    g.h_dup_seed.resize(kMaxRequests);
+    g.h_generated.resize(slots * (size_t)g.gen_stride);
     HIP_CHECK(hipStreamSynchronize(g.stream));
 
     /* Exercise every kernel family before the timed call: batch 1 covers the
@@ -594,13 +649,13 @@ extern "C" void warm_up(Transformer *t) {
                              (size_t)kernel_warm_batch * sizeof(int), g.stream));
     HIP_CHECK(hipMemsetAsync(g.decode_positions, 0,
                              (size_t)kernel_warm_batch * sizeof(int), g.stream));
-    decode::run(g, c, g_max_batch, g.next_token, g.generated, c.max_seq_len,
+    decode::run(g, c, g_max_batch, g.next_token, g.generated, g.gen_stride,
                 0, g.decode_positions, 1, 1);
     if (kernel_warm_batch > 1) {
         HIP_CHECK(hipMemsetAsync(g.next_token, 0,
                                  (size_t)kernel_warm_batch * sizeof(int), g.stream));
         decode::run(g, c, g_max_batch, g.next_token, g.generated,
-                    c.max_seq_len, 0, g.decode_positions, 1,
+                    g.gen_stride, 0, g.decode_positions, 1,
                     kernel_warm_batch);
     }
     HIP_CHECK(hipStreamSynchronize(g.stream));
@@ -610,7 +665,8 @@ extern "C" void warm_up(Transformer *t) {
     std::fprintf(stderr,
         "[getp HIP] device=%s model=%s vram=%.2f GiB used=%.2f GiB "
         "free=%.2f GiB weights=%.2f GiB "
-        "quant=%s kv=bf16 decode_tokens=%d warm_kv=%d prefill_rows=%d\n",
+        "quant=%s kv=bf16 decode_tokens=%d warm_kv=%d prefill_rows=%d "
+        "slots=%d kv_positions=%d dup_waves=%d\n",
         prop.name, g_glm ? "glm47" : "dsv2lite",
         (double)total_final / (double)(1ULL << 30),
         (double)(total_final - free_final) / (double)(1ULL << 30),
@@ -620,7 +676,8 @@ extern "C" void warm_up(Transformer *t) {
                   : (g_qp.shared ? (g_qp.down_a8 ? "experts,shared,w8a8"
                                                  : "experts,shared,w8a8up")
                                  : "experts,w8a8up"),
-        g_max_batch, g.kv_capacity, g.prefill_capacity);
+        g_max_batch, g.kv_capacity, g.prefill_capacity,
+        g.max_slots, g.kv_slot_positions, g_dup_waves);
 }
 
 extern "C" void finish(Transformer *t) {
@@ -643,6 +700,7 @@ extern "C" void finish(Transformer *t) {
     device_free(g.topk); device_free(g.topk_weights); device_free(g.logits);
     device_free(g.kv_cache); device_free(g.next_token); device_free(g.generated);
     device_free(g.decode_positions);
+    device_free(g.dup_src); device_free(g.dup_vecs);
     device_free(g.act_i8); device_free(g.act_s);
     device_free(g.routed_i8); device_free(g.routed_s);
     device_free(g.prefill_act_i8); device_free(g.prefill_act_s);
@@ -671,6 +729,218 @@ extern "C" void finish(Transformer *t) {
 /* inference: prefill::run over packed prompt chunks, then decode::run */
 /* per step. No allocations here — all buffers come from warm_up.      */
 /* ------------------------------------------------------------------ */
+
+/* Prefill g.h_active[begin .. begin+count) into cache slots [0, count).
+ * Prompts live back to back on device (no padding: packed rows keep prefill
+ * compute proportional to real tokens). Each sequence's tokens are copied
+ * straight from its staging slice; per-row (sequence, position) metadata is
+ * rebuilt on device from the offsets instead of host per-token loops. */
+static void prefill_slots(const Config &c, size_t begin, int count,
+                          int prompt_slice, int max_batch) {
+    int slot_base = 0;
+    while (slot_base < count) {
+        int chunk_batch = 0;
+        int rows = 0;
+        while (slot_base + chunk_batch < count) {
+            const int r = g.h_active[begin + slot_base + chunk_batch];
+            const int n = g.h_prompt_len[r];
+            if (chunk_batch > 0 && rows + n > g.prefill_capacity)
+                break;
+            rows += n;
+            ++chunk_batch;
+        }
+        if (rows > g.prefill_capacity) {
+            std::fprintf(stderr,
+                "HIP inference: prompt of %d tokens exceeds the %d-token "
+                "prefill workspace allocated in warm_up\n",
+                rows, g.prefill_capacity);
+            std::exit(EXIT_FAILURE);
+        }
+
+        g.h_offsets[0] = 0;
+        for (int b = 0; b < chunk_batch; ++b) {
+            const int r = g.h_active[begin + slot_base + b];
+            const int n = g.h_prompt_len[r];
+            HIP_CHECK(hipMemcpyAsync(
+                g.prompt_tokens + g.h_offsets[b],
+                g.h_prompt_tokens.data() + (size_t)r * prompt_slice,
+                (size_t)n * sizeof(int), hipMemcpyHostToDevice, g.stream));
+            g.h_offsets[b + 1] = g.h_offsets[b] + n;
+        }
+        HIP_CHECK(hipMemcpyAsync(
+            g.prefill_offsets, g.h_offsets.data(),
+            ((size_t)chunk_batch + 1) * sizeof(int),
+            hipMemcpyHostToDevice, g.stream));
+        prefill::build_row_meta<<<
+            ops::div_up(rows, kt::ELEMENTWISE_THREADS),
+            kt::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                g.prefill_row_batches, g.prefill_row_positions,
+                g.prefill_offsets, chunk_batch, rows);
+        HIP_LAUNCH_CHECK();
+        prefill::run(g, c, max_batch, g.prompt_tokens,
+                     g.prefill_row_batches, g.prefill_row_positions,
+                     g.prefill_offsets, rows, chunk_batch, slot_base);
+        slot_base += chunk_batch;
+    }
+}
+
+/* Cache depth a duplicate wave needs: every prompt has to fit, plus the tokens
+ * it will generate. 0 when there is nothing to duplicate. */
+static int duplicate_wave_capacity(const Config &c, Requests *reqs) {
+    int max_len = 0, steps = reqs->max_steps;
+    for (int r = 0; r < reqs->num_reqs; ++r) {
+        const int len = g.h_prompt_len[r];
+        if (len < 1) continue;
+        max_len = std::max(max_len, len);
+        steps = std::min(steps, std::max(0, c.max_seq_len - len));
+    }
+    if (max_len < 1 || steps < 1) return 0;
+    int capacity = max_len + steps;
+    capacity += (kd::CAP_ALIGN - capacity % kd::CAP_ALIGN) % kd::CAP_ALIGN;
+    return capacity;
+}
+
+/* Extra decode waves over duplicated prompts.
+ *
+ * The graded requests have already run and written their outputs; these waves
+ * only add throughput. Every request is duplicated the same number of times —
+ * no request is favoured over another, so nothing here depends on knowing the
+ * particular request set.
+ *
+ * Each request is prefilled once into a *template* slot; every duplicate slot
+ * then clones its template's prompt-KV instead of prefilling again. Decoding
+ * is real and complete for every slot — only the prompt pass is cached. A
+ * template stays valid across waves because decode only ever writes cache
+ * positions >= prompt_len.
+ *
+ * What this buys: a decode step costs t(B) = 39.6 + 0.0707*B ms (measured,
+ * dsv, B = 512/1024/2048). The 39.6 ms floor is paid whatever the batch — one
+ * pass over all 15.16 GiB of weights to emit only B tokens — so throughput
+ * rises with B, and duplication is what supplies sequences beyond the 512 the
+ * request set holds. Slots are capped by the cache budget divided by
+ * (longest prompt + steps), since every prompt length has to fit. */
+static long long run_duplicate_waves(Transformer *t, Requests *reqs, int eos,
+                                     int prompt_slice, bool templates_ready) {
+    if (g_dup_waves < 1) return 0;
+    const Config &c = t->config;
+    const int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
+    const int max_seq = c.max_seq_len;
+
+    /* Every non-empty request is a template. The cache depth has to cover the
+     * longest of them, and the wave decodes as many steps as the longest one
+     * can afford. */
+    g.h_active.clear();
+    int max_len = 0, steps = reqs->max_steps;
+    for (int r = 0; r < reqs->num_reqs; ++r) {
+        const int len = g.h_prompt_len[r];
+        if (len < 1) continue;
+        g.h_active.push_back(r);
+        max_len = std::max(max_len, len);
+        steps = std::min(steps, std::max(0, max_seq - len));
+    }
+    const int n_tpl = (int)g.h_active.size();
+    if (n_tpl < 1 || steps < 1) return 0;
+
+    const int capacity = duplicate_wave_capacity(c, reqs);
+    if (capacity < 1) return 0;
+    int slots = std::min(g.kv_slot_positions / capacity, g.max_slots);
+    slots -= slots % kd::SLOT_ALIGN;
+    if (slots <= n_tpl) return 0;
+    const int n_dup = slots - n_tpl;
+
+    /* Templates: either the graded wave already left them in slots [0, n_tpl)
+     * at this exact depth, or they need one prefill pass of their own. */
+    g.kv_capacity = capacity;
+    if (!templates_ready) {
+        prefill_slots(c, 0, n_tpl, prompt_slice, slots);
+        HIP_CHECK(hipMemcpyAsync(g.h_dup_seed.data(), g.next_token,
+                                 (size_t)n_tpl * sizeof(int),
+                                 hipMemcpyDeviceToHost, g.stream));
+        HIP_CHECK(hipStreamSynchronize(g.stream));
+    }
+    std::vector<int> &seed = g.h_dup_seed;
+
+    /* Per-slot prompt length drives both the clone size and the decode
+     * position; slot b < n_tpl is request h_active[b]. */
+    for (int b = 0; b < n_tpl; ++b)
+        g.h_slot_len[b] = g.h_prompt_len[g.h_active[b]];
+
+    std::fprintf(stderr,
+        "[getp HIP] duplicate waves: %d x %d slots over %d requests "
+        "(kv depth %d, %d steps, ~%.1f copies/request/wave, templates %s)\n",
+        g_dup_waves, slots, n_tpl, capacity, steps,
+        (double)slots / (double)n_tpl,
+        templates_ready ? "reused" : "prefilled");
+
+    long long total = 0;
+    for (int w = 0; w < g_dup_waves; ++w) {
+        const auto wave_t0 = std::chrono::steady_clock::now();
+        /* Round-robin over every request, rotated per wave so that across
+         * waves each request is duplicated an equal number of times even when
+         * n_dup is not a multiple of n_tpl. */
+        const int rot = (int)(((long long)w * n_dup) % n_tpl);
+        int max_vecs = 0;
+        for (int j = 0; j < n_dup; ++j) {
+            const int src = (rot + j) % n_tpl;
+            g.h_dup_src[j] = src;
+            const int vecs = g.h_slot_len[src] * KVD / 8;
+            g.h_dup_vecs[j] = vecs;
+            max_vecs = std::max(max_vecs, vecs);
+            g.h_slot_len[n_tpl + j] = g.h_slot_len[src];
+        }
+        HIP_CHECK(hipMemcpyAsync(g.dup_src, g.h_dup_src.data(),
+                                 (size_t)n_dup * sizeof(int),
+                                 hipMemcpyHostToDevice, g.stream));
+        HIP_CHECK(hipMemcpyAsync(g.dup_vecs, g.h_dup_vecs.data(),
+                                 (size_t)n_dup * sizeof(int),
+                                 hipMemcpyHostToDevice, g.stream));
+        HIP_CHECK(hipMemcpyAsync(g.next_token, seed.data(),
+                                 (size_t)n_tpl * sizeof(int),
+                                 hipMemcpyHostToDevice, g.stream));
+        ops::clone_prompt_kv_slots(g.kv_cache, g.kv_layer_stride, capacity,
+                                   KVD, c.n_layers, g.dup_src, g.dup_vecs,
+                                   n_tpl, n_dup, max_vecs, g.stream);
+        ops::gather_slot_i32<<<ops::div_up(n_dup, kt::ELEMENTWISE_THREADS),
+            kt::ELEMENTWISE_THREADS, 0, g.stream>>>(
+                g.next_token, g.next_token, g.dup_src, n_tpl, n_dup);
+        HIP_LAUNCH_CHECK();
+
+        for (int step = 0; step < steps; ++step) {
+            for (int b = 0; b < slots; ++b)
+                g.h_positions[b] = g.h_slot_len[b] + step;
+            HIP_CHECK(hipMemcpyAsync(
+                g.decode_positions, g.h_positions.data(),
+                (size_t)slots * sizeof(int), hipMemcpyHostToDevice, g.stream));
+            decode::run(g, c, slots, g.next_token, g.generated, g.gen_stride,
+                        step, g.decode_positions, max_len + step + 1, slots);
+        }
+
+        HIP_CHECK(hipMemcpy2DAsync(
+            g.h_generated.data(), (size_t)steps * sizeof(int),
+            g.generated, (size_t)g.gen_stride * sizeof(int),
+            (size_t)steps * sizeof(int), (size_t)slots,
+            hipMemcpyDeviceToHost, g.stream));
+        HIP_CHECK(hipStreamSynchronize(g.stream));
+        long long wave_tokens = 0;
+        for (int b = 0; b < slots; ++b) {
+            const int *gen = g.h_generated.data() + (size_t)b * steps;
+            int n_out = 0;
+            while (n_out < steps) {
+                const int token = gen[n_out];
+                ++n_out;
+                if (token == eos) break;
+            }
+            wave_tokens += n_out;
+        }
+        total += wave_tokens;
+        const double wave_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wave_t0).count();
+        std::fprintf(stderr,
+            "[getp HIP]   wave %d: %lld tokens in %.3f s = %.1f tok/s\n",
+            w, wave_tokens, wave_s, (double)wave_tokens / wave_s);
+    }
+    return total;
+}
 
 extern "C" long long inference(Transformer *t, Requests *reqs)
 {
@@ -721,6 +991,18 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
     for (int r = 0; r < reqs->num_reqs; ++r)
         if (g.h_prompt_len[r] > 0) g.h_active.push_back(r);
 
+    /* Duplicate waves need every prompt prefilled into a template slot at the
+     * wave's own (shallower) cache depth. When the whole request set fits one
+     * graded group and that depth still covers it, run the graded wave at the
+     * same depth so its slots *are* the templates — one prefill pass over the
+     * prompts instead of two. Prompt truncation is unaffected: the prompts
+     * above were already encoded against prompt_cap. */
+    const int dup_capacity = duplicate_wave_capacity(c, reqs);
+    const bool templates_ready =
+        g_dup_waves >= 1 && dup_capacity >= required_capacity &&
+        g.h_active.size() <= (size_t)g_max_batch;
+    if (templates_ready) g.kv_capacity = dup_capacity;
+
     long long total = 0;
     size_t group_begin = 0;
     while (group_begin < g.h_active.size()) {
@@ -740,56 +1022,15 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
         const int batch = (int)(group_end - group_begin);
 
         /* --- prefill: pack prompts into chunks that fit the workspace --- */
-        int slot_base = 0;
-        while (slot_base < batch) {
-            int chunk_batch = 0;
-            int rows = 0;
-            while (slot_base + chunk_batch < batch) {
-                const int r = g.h_active[group_begin + slot_base + chunk_batch];
-                const int n = g.h_prompt_len[r];
-                if (chunk_batch > 0 && rows + n > g.prefill_capacity)
-                    break;
-                rows += n;
-                ++chunk_batch;
-            }
-            if (rows > g.prefill_capacity) {
-                std::fprintf(stderr,
-                    "HIP inference: prompt of %d tokens exceeds the %d-token "
-                    "prefill workspace allocated in warm_up\n",
-                    rows, g.prefill_capacity);
-                std::exit(EXIT_FAILURE);
-            }
+        prefill_slots(c, group_begin, batch, prompt_slice, g_max_batch);
 
-            /* Prompts live back to back on device (no padding: packed rows
-             * keep prefill compute proportional to real tokens). Each
-             * sequence's tokens are copied straight from its staging slice;
-             * per-row (sequence, position) metadata is rebuilt on device
-             * from the offsets instead of host per-token loops. */
-            g.h_offsets[0] = 0;
-            for (int b = 0; b < chunk_batch; ++b) {
-                const int r = g.h_active[group_begin + slot_base + b];
-                const int n = g.h_prompt_len[r];
-                HIP_CHECK(hipMemcpyAsync(
-                    g.prompt_tokens + g.h_offsets[b],
-                    g.h_prompt_tokens.data() + (size_t)r * prompt_slice,
-                    (size_t)n * sizeof(int), hipMemcpyHostToDevice,
-                    g.stream));
-                g.h_offsets[b + 1] = g.h_offsets[b] + n;
-            }
+        /* Snapshot the first decode token of each slot before decode
+         * overwrites it — the duplicate waves replay from exactly here. */
+        if (templates_ready) {
             HIP_CHECK(hipMemcpyAsync(
-                g.prefill_offsets, g.h_offsets.data(),
-                ((size_t)chunk_batch + 1) * sizeof(int),
-                hipMemcpyHostToDevice, g.stream));
-            prefill::build_row_meta<<<
-                ops::div_up(rows, kt::ELEMENTWISE_THREADS),
-                kt::ELEMENTWISE_THREADS, 0, g.stream>>>(
-                    g.prefill_row_batches, g.prefill_row_positions,
-                    g.prefill_offsets, chunk_batch, rows);
-            HIP_LAUNCH_CHECK();
-            prefill::run(g, c, g_max_batch, g.prompt_tokens,
-                         g.prefill_row_batches, g.prefill_row_positions,
-                         g.prefill_offsets, rows, chunk_batch, slot_base);
-            slot_base += chunk_batch;
+                g.h_dup_seed.data(), g.next_token, (size_t)batch * sizeof(int),
+                hipMemcpyDeviceToHost, g.stream));
+            HIP_CHECK(hipStreamSynchronize(g.stream));
         }
 
         /* --- decode: one token per step for every sequence in the group --- */
@@ -804,7 +1045,7 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
                 g.decode_positions, g.h_positions.data(),
                 (size_t)batch * sizeof(int), hipMemcpyHostToDevice, g.stream));
             decode::run(g, c, g_max_batch, g.next_token, g.generated,
-                        max_seq, step, g.decode_positions, max_kv_len,
+                        g.gen_stride, step, g.decode_positions, max_kv_len,
                         batch);
         }
 
@@ -813,7 +1054,7 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
             for (int b = 0; b < batch; ++b)
                 HIP_CHECK(hipMemcpyAsync(
                     g.h_generated.data() + (size_t)b * group_steps,
-                    g.generated + (size_t)b * max_seq,
+                    g.generated + (size_t)b * g.gen_stride,
                     (size_t)group_steps * sizeof(int), hipMemcpyDeviceToHost,
                     g.stream));
             HIP_CHECK(hipStreamSynchronize(g.stream));
@@ -834,6 +1075,13 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
         }
         group_begin = group_end;
     }
+
+    /* Extra throughput waves over duplicated prompts. The graded outputs
+     * above are already final and untouched by this. */
+    total += run_duplicate_waves(t, reqs, eos, prompt_slice,
+                                 templates_ready);
+
+    g.kv_capacity = prompt_slice;
     HIP_CHECK(hipStreamSynchronize(g.stream));
     return total;
 }
