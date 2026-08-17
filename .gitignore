@@ -52,3 +52,6 @@ profile_results/
 profile_large_rocprof_compute.sh
 docs/
 AGENTS.md
+
+data_dup/
+score_completions.py
