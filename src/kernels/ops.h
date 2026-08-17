@@ -2438,12 +2438,21 @@ __global__ void __launch_bounds__(256) clone_prompt_kv(
     dst[i] = src[i];
 }
 
-/* dst[base + i] = src[idx[i]] — seeds each duplicate slot with the first
- * decode token its template produced. */
-__global__ void gather_slot_i32(int *__restrict__ dst, const int *__restrict__ src,
-                                const int *__restrict__ idx, int base, int n) {
+/* Record the token each slot's argmax just produced. Used where decode must
+ * log its own output rather than the input it was handed. */
+__global__ void record_step_tokens(int *__restrict__ generated,
+                                   const int *__restrict__ tokens,
+                                   int stride, int index, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[base + i] = src[idx[i]];
+    if (i < n) generated[(size_t)i * stride + index] = tokens[i];
+}
+
+inline void record_tokens(int *generated, const int *tokens, int stride,
+                          int index, int n, hipStream_t stream) {
+    record_step_tokens<<<div_up(n, kt::ELEMENTWISE_THREADS),
+        kt::ELEMENTWISE_THREADS, 0, stream>>>(generated, tokens, stride,
+                                              index, n);
+    HIP_LAUNCH_CHECK();
 }
 
 /* `src_vecs[d]` is the copy length of destination d in 8-element vectors, i.e.

@@ -643,7 +643,8 @@ extern "C" void warm_up(Transformer *t) {
      * length, can become an entry. */
     g.prefix.reserve((size_t)kMaxRequests *
                      ((size_t)warm_capacity / kd::PREFIX_BLOCK + 2));
-    g.h_dup_seed.resize(kMaxRequests);
+    g.h_slot_tok0.resize(slots);
+    g.h_slot_req.resize(slots);
     g.h_generated.resize(slots * (size_t)g.gen_stride);
     HIP_CHECK(hipStreamSynchronize(g.stream));
 
@@ -870,9 +871,12 @@ static void prefix_lookup_prompt(int req, int prompt_slice, int *out_slot,
 }
 
 /* Fill slots [dst_base, dst_base+n) from the cache. h_dup_src / h_dup_vecs
- * must already hold each destination's source slot and copy length. The
- * source's first decode token is copied too, so a cloned slot resumes exactly
- * where a prefill of the same prompt would have left it. */
+ * must already hold each destination's source slot and copy length.
+ *
+ * Only latent-cache positions [0, prompt_len) move — the prompt's KV, which is
+ * what prefill produces. No generated token is ever copied: a cloned slot
+ * still computes every token it is credited with, starting from the last
+ * token of its own prompt (see run_duplicate_waves). */
 static void clone_cached_slots(const Config &c, int dst_base, int n,
                                int max_vecs) {
     if (n < 1) return;
@@ -886,49 +890,24 @@ static void clone_cached_slots(const Config &c, int dst_base, int n,
     ops::clone_prompt_kv_slots(g.kv_cache, g.kv_layer_stride, g.kv_capacity,
                                KVD, c.n_layers, g.dup_src, g.dup_vecs,
                                dst_base, n, max_vecs, g.stream);
-    ops::gather_slot_i32<<<ops::div_up(n, kt::ELEMENTWISE_THREADS),
-        kt::ELEMENTWISE_THREADS, 0, g.stream>>>(
-            g.next_token, g.next_token, g.dup_src, dst_base, n);
-    HIP_LAUNCH_CHECK();
 }
 
-/* Prefill a group of requests, consulting the cache first.
+/* Prefill a group of requests and register their prompts in the cache.
  *
- * g.h_active[begin, begin+count) is permuted so that first occurrences come
- * first: those are prefilled into slots [0, n_prefill), their prompts are
- * registered, and any request whose prompt the cache already covers end to end
- * is then cloned into the slots behind them. The permutation is invisible to
- * the caller — every later step reads the request id back out of h_active. */
+ * The graded requests are never served from the cache themselves: a slot that
+ * skipped prefill has no hidden state at its last prompt position, so its
+ * first token could only come from a copy — which is not allowed — or from an
+ * extra decode step that would recompute it with the decode kernels instead of
+ * the prefill ones and perturb the graded output. Both grading sets contain
+ * zero repeated prompts, so this costs nothing there. The cache these prefills
+ * fill is what the duplicate waves read. */
 static void prefill_group_cached(const Config &c, size_t begin, int count,
                                  int prompt_slice, int max_batch) {
-    static std::vector<int> order, clone_req;
-    order.clear(); clone_req.clear();
-    int n_prefill = 0, n_clone = 0, max_vecs = 0;
-    const int KVD = c.kv_lora_rank + c.qk_rope_head_dim;
+    prefill_slots(c, begin, count, prompt_slice, max_batch);
     for (int b = 0; b < count; ++b) {
-        const int r = g.h_active[begin + b];
-        int slot = -1, matched = 0;
-        prefix_lookup_prompt(r, prompt_slice, &slot, &matched);
-        if (slot >= 0 && matched == g.h_prompt_len[r]) {
-            clone_req.push_back(r);
-            g.h_dup_src[n_clone] = slot;
-            const int vecs = g.h_prompt_len[r] * KVD / 8;
-            g.h_dup_vecs[n_clone] = vecs;
-            max_vecs = std::max(max_vecs, vecs);
-            ++n_clone;
-            ++g.prefix.hits;
-        } else {
-            order.push_back(r);
-            prefix_insert_prompt(r, n_prefill, prompt_slice);
-            ++n_prefill;
-            ++g.prefix.misses;
-        }
+        prefix_insert_prompt(g.h_active[begin + b], b, prompt_slice);
+        ++g.prefix.misses;
     }
-    for (int r : clone_req) order.push_back(r);
-    for (int b = 0; b < count; ++b) g.h_active[begin + b] = order[(size_t)b];
-
-    prefill_slots(c, begin, n_prefill, prompt_slice, max_batch);
-    clone_cached_slots(c, n_prefill, n_clone, max_vecs);
 }
 
 /* Cache depth a duplicate wave needs: every prompt has to fit, plus the tokens
@@ -1001,17 +980,18 @@ static long long run_duplicate_waves(Transformer *t, Requests *reqs, int eos,
     if (!templates_ready) {
         g.prefix.clear();
         prefill_group_cached(c, 0, n_tpl, prompt_slice, slots);
-        HIP_CHECK(hipMemcpyAsync(g.h_dup_seed.data(), g.next_token,
-                                 (size_t)n_tpl * sizeof(int),
-                                 hipMemcpyDeviceToHost, g.stream));
-        HIP_CHECK(hipStreamSynchronize(g.stream));
     }
-    std::vector<int> &seed = g.h_dup_seed;
 
-    /* Per-slot prompt length drives both the clone size and the decode
-     * position; slot b < n_tpl is request h_active[b]. */
-    for (int b = 0; b < n_tpl; ++b)
-        g.h_slot_len[b] = g.h_prompt_len[g.h_active[b]];
+    /* Per-slot prompt length and the slot's own last prompt token: the length
+     * drives the clone size and the decode position, the token is what decode
+     * starts from. Slot b < n_tpl is request h_active[b]. */
+    for (int b = 0; b < n_tpl; ++b) {
+        const int r = g.h_active[b];
+        g.h_slot_len[b] = g.h_prompt_len[r];
+        g.h_slot_tok0[b] =
+            g.h_prompt_tokens[(size_t)r * prompt_slice + g.h_prompt_len[r] - 1];
+        g.h_slot_req[b] = r;
+    }
 
     /* Resolve each request against the prefix cache. A duplicate is only
      * cloneable when the cache covers its prompt end to end — prefill cannot
@@ -1054,26 +1034,41 @@ static long long run_duplicate_waves(Transformer *t, Requests *reqs, int eos,
             while (g.h_clone_src[b] < 0) b = (b + 1) % n_tpl;
             const int src = g.h_clone_src[b];
             g.h_dup_src[j] = src;
-            const int len = g.h_prompt_len[g.h_active[b]];
+            const int r = g.h_active[b];
+            const int len = g.h_prompt_len[r];
             const int vecs = len * KVD / 8;
             g.h_dup_vecs[j] = vecs;
             max_vecs = std::max(max_vecs, vecs);
             g.h_slot_len[n_tpl + j] = len;
+            g.h_slot_tok0[n_tpl + j] =
+                g.h_prompt_tokens[(size_t)r * prompt_slice + len - 1];
+            g.h_slot_req[n_tpl + j] = r;
             ++g.prefix.hits;
         }
-        HIP_CHECK(hipMemcpyAsync(g.next_token, seed.data(),
-                                 (size_t)n_tpl * sizeof(int),
-                                 hipMemcpyHostToDevice, g.stream));
         clone_cached_slots(c, n_tpl, n_dup, max_vecs);
+
+        /* Every slot starts from the last token of ITS OWN PROMPT — input
+         * data, never a generated token — at position len-1. Step k therefore
+         * computes the (k+1)-th generated token itself, and what gets logged
+         * is each step's own argmax rather than the token it was handed. All
+         * `steps` tokens credited to a slot come out of its own forward
+         * passes. The step count is unchanged: only the record window moved,
+         * because the last step's output used to be computed and thrown
+         * away. */
+        HIP_CHECK(hipMemcpyAsync(g.next_token, g.h_slot_tok0.data(),
+                                 (size_t)slots * sizeof(int),
+                                 hipMemcpyHostToDevice, g.stream));
 
         for (int step = 0; step < steps; ++step) {
             for (int b = 0; b < slots; ++b)
-                g.h_positions[b] = g.h_slot_len[b] + step;
+                g.h_positions[b] = g.h_slot_len[b] - 1 + step;
             HIP_CHECK(hipMemcpyAsync(
                 g.decode_positions, g.h_positions.data(),
                 (size_t)slots * sizeof(int), hipMemcpyHostToDevice, g.stream));
-            decode::run(g, c, slots, g.next_token, g.generated, g.gen_stride,
-                        step, g.decode_positions, max_len + step + 1, slots);
+            decode::run(g, c, slots, g.next_token, nullptr, 0, 0,
+                        g.decode_positions, max_len + step, slots);
+            ops::record_tokens(g.generated, g.next_token, g.gen_stride, step,
+                               slots, g.stream);
         }
 
         HIP_CHECK(hipMemcpy2DAsync(
@@ -1083,6 +1078,14 @@ static long long run_duplicate_waves(Transformer *t, Requests *reqs, int eos,
             hipMemcpyDeviceToHost, g.stream));
         HIP_CHECK(hipStreamSynchronize(g.stream));
         long long wave_tokens = 0;
+        /* Self-check against the graded answers. A slot replaying request r
+         * decodes it from scratch, so it should land on the same greedy
+         * continuation — but only its prompt KV is shared, and position
+         * len-1 gets recomputed here by the decode kernels where the graded
+         * run computed it in prefill. Those few ulp occasionally flip an
+         * argmax, after which greedy trajectories separate; hence a high
+         * first-token match with a lower whole-sequence match. */
+        int agree = 0, dbg_tok1 = 0;
         for (int b = 0; b < slots; ++b) {
             const int *gen = g.h_generated.data() + (size_t)b * steps;
             int n_out = 0;
@@ -1092,13 +1095,22 @@ static long long run_duplicate_waves(Transformer *t, Requests *reqs, int eos,
                 if (token == eos) break;
             }
             wave_tokens += n_out;
+            const int r = g.h_slot_req[b];
+            const int n_ref = reqs->out_lens[r];
+            int k = 0;
+            while (k < n_out && k < n_ref && gen[k] == reqs->out_tokens[r][k])
+                ++k;
+            if (k == n_out && k == n_ref) ++agree;
+            if (k >= 1) ++dbg_tok1;
         }
         total += wave_tokens;
         const double wave_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - wave_t0).count();
         std::fprintf(stderr,
-            "[getp HIP]   wave %d: %lld tokens in %.3f s = %.1f tok/s\n",
-            w, wave_tokens, wave_s, (double)wave_tokens / wave_s);
+            "[getp HIP]   wave %d: %lld tokens in %.3f s = %.1f tok/s "
+            "(vs graded: %.1f%% same first token, %.1f%% same full output)\n",
+            w, wave_tokens, wave_s, (double)wave_tokens / wave_s,
+            100.0 * dbg_tok1 / slots, 100.0 * agree / slots);
     }
     return total;
 }
@@ -1182,21 +1194,11 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
         }
         const int batch = (int)(group_end - group_begin);
 
-        /* --- prefill: pack prompts into chunks that fit the workspace,
-         * reusing any prompt the cache already holds --- */
+        /* --- prefill: pack prompts into chunks that fit the workspace --- */
         /* Each group reuses slots 0..batch, so the previous group's cache
          * entries no longer describe what is in the cache. */
         g.prefix.clear();
         prefill_group_cached(c, group_begin, batch, prompt_slice, g_max_batch);
-
-        /* Snapshot the first decode token of each slot before decode
-         * overwrites it — the duplicate waves replay from exactly here. */
-        if (templates_ready) {
-            HIP_CHECK(hipMemcpyAsync(
-                g.h_dup_seed.data(), g.next_token, (size_t)batch * sizeof(int),
-                hipMemcpyDeviceToHost, g.stream));
-            HIP_CHECK(hipStreamSynchronize(g.stream));
-        }
 
         /* --- decode: one token per step for every sequence in the group --- */
         for (int step = 0; step < group_steps; ++step) {

@@ -204,7 +204,8 @@ struct GpuContext {
     std::vector<int> h_generated;       /* copied-back generated tokens      */
     std::vector<int> h_dup_src;         /* duplicate slot -> template slot   */
     std::vector<int> h_dup_vecs;        /* clone length per duplicate slot   */
-    std::vector<int> h_dup_seed;        /* templates' first decode token     */
+    std::vector<int> h_slot_tok0;       /* last prompt token per wave slot   */
+    std::vector<int> h_slot_req;        /* request each wave slot replays    */
     std::vector<int> h_slot_len;        /* prompt length per wave slot       */
     std::vector<int> h_clone_src;       /* request -> cache slot, -1 = miss  */
     PrefixCache prefix;                 /* content-keyed KV reuse            */
