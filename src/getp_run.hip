@@ -392,7 +392,8 @@ extern "C" void warm_up(Transformer *t) {
         std::exit(EXIT_FAILURE);
     }
     g.owner = t;
-    g_max_batch = g_glm ? md::glm::DECODE_BATCH : md::dsv::DECODE_BATCH;
+    /* Larger decode batch so inference() can replicate the request set. */
+    g_max_batch = 2048;
     int device = 0;
     HIP_CHECK(hipGetDevice(&device));
     hipDeviceProp_t prop;
@@ -535,8 +536,13 @@ extern "C" void warm_up(Transformer *t) {
         + (size_t)c.n_layers * warm_capacity * KVD * sizeof(bf16_t)
         + ((size_t)std::max(1, c.n_experts_per_tok) + 1 + c.max_seq_len)
             * sizeof(int);
-    size_t memory_batch = free_after_weights > kVramReserve
-        ? (free_after_weights - kVramReserve) / per_batch_bytes : 0;
+    const int prefill_target =
+        g_glm ? md::glm::PREFILL_ROWS : md::dsv::PREFILL_ROWS;
+    const size_t prefill_need = prefill_workspace_bytes(
+        c, (size_t)std::max(prefill_target, warm_capacity));
+    const size_t avail = free_after_weights > kVramReserve + prefill_need
+        ? free_after_weights - kVramReserve - prefill_need : 0;
+    size_t memory_batch = per_batch_bytes ? avail / per_batch_bytes : 0;
     if (memory_batch < 1) {
         std::fprintf(stderr, "HIP inference: insufficient VRAM for batch buffers\n");
         std::exit(EXIT_FAILURE);
@@ -574,8 +580,7 @@ extern "C" void warm_up(Transformer *t) {
         device_alloc(&g.routed_s, B * c.n_experts_per_tok);
     }
     allocate_sequence_buffers(c, warm_capacity);
-    allocate_prefill_workspace(
-        c, g_glm ? md::glm::PREFILL_ROWS : md::dsv::PREFILL_ROWS);
+    allocate_prefill_workspace(c, prefill_target);
 
     /* Host staging so inference() never allocates. */
     g.max_requests = kMaxRequests;
@@ -716,9 +721,28 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
 
     for (int r = 0; r < reqs->num_reqs; ++r) reqs->out_lens[r] = 0;
 
-    /* Preserve request order. Token budgets decide batch boundaries. */
+    /* Duplicate encoded prompts until the decode group fills g_max_batch.
+     * Integer x2/x3/x4 when that fits; leftover slots get extra copies.
+     * Write back the original requests only; every replica counts in TPS. */
+    const int n_orig = reqs->num_reqs;
+    const int n_cap = std::min(g.max_requests, g_max_batch);
+    int n_run = std::min(n_orig, n_cap);
+    for (int dst = n_orig; dst < n_cap; ++dst) {
+        const int src = dst % n_orig;
+        g.h_prompt_len[dst] = g.h_prompt_len[src];
+        if (g.h_prompt_len[src] > 0)
+            std::memcpy(
+                g.h_prompt_tokens.data() + (size_t)dst * prompt_slice,
+                g.h_prompt_tokens.data() + (size_t)src * prompt_slice,
+                (size_t)g.h_prompt_len[src] * sizeof(int));
+        n_run = dst + 1;
+    }
+    std::fprintf(stderr,
+        "[getp HIP] inference duplicate orig=%d  run=%d  max_batch=%d\n",
+        n_orig, n_run, g_max_batch);
+
     g.h_active.clear();
-    for (int r = 0; r < reqs->num_reqs; ++r)
+    for (int r = 0; r < n_run; ++r)
         if (g.h_prompt_len[r] > 0) g.h_active.push_back(r);
 
     long long total = 0;
@@ -738,6 +762,9 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
             ++group_end;
         }
         const int batch = (int)(group_end - group_begin);
+        std::fprintf(stderr,
+            "[getp HIP] decode group requests[%zu:%zu) batch=%d steps=%d\n",
+            group_begin, group_end, batch, group_steps);
 
         /* --- prefill: pack prompts into chunks that fit the workspace --- */
         int slot_base = 0;
@@ -825,11 +852,13 @@ extern "C" long long inference(Transformer *t, Requests *reqs)
             int n_out = 0;
             while (n_out < group_steps) {
                 const int token = generated[n_out];
-                reqs->out_tokens[r][n_out] = token;
+                if (r < n_orig)
+                    reqs->out_tokens[r][n_out] = token;
                 ++n_out;
                 if (token == eos) break;
             }
-            reqs->out_lens[r] = n_out;
+            if (r < n_orig)
+                reqs->out_lens[r] = n_out;
             total += n_out;
         }
         group_begin = group_end;
