@@ -9,6 +9,7 @@ namespace decode {
 
 namespace kt = utils::constants::kernel;
 using utils::types::bf16x4;
+using utils::types::bf16x8;
 using utils::types::fp32v4;
 
 __global__ void kv_norm_rope(bf16_t *cache, const float *comp, const bf16_t *norm,
@@ -326,26 +327,38 @@ __global__ void flash_attention_mfma(
     constexpr int WV = 8;                          /* waves per block     */
     constexpr int GRP = WV / MT;                   /* waves per M-tile     */
     constexpr int CTW = CT / GRP;                  /* context c-tiles/wave */
+    /* Score k-range split across SPL waves per M-tile. Holding all KT=36 Q
+     * fragments live across the kv loop costs 72 VGPRs, which blew the 128-VGPR
+     * budget of 2 blocks/CU and spilled 44 (dsv) / 56 (glm) of them to scratch
+     * *inside* the loop; it also left 1 of 8 waves doing every score MFMA while
+     * the rest idled at the barrier. Splitting halves q_reg and the score
+     * critical path for one extra partial-sum barrier. */
+    constexpr int SPL = 2;                         /* waves per score tile */
+    constexpr int KTW = KT / SPL;                  /* score k-tiles per wave */
     static_assert(KV_DIM % 16 == 0 && KV_RANK % 16 == 0, "MFMA tiles");
     static_assert(WV % MT == 0 && CT % GRP == 0, "even split");
+    static_assert(SPL >= 2 && GRP >= SPL && KT % SPL == 0, "score split");
 
     const int b = (int)blockIdx.x;
     if (b >= batch) return;
     const int kv_len = positions[b] + 1;
     const bf16_t *cache_b = cache + (size_t)b * capacity * KV_DIM;
 
-    /* sk (score, [key][k]) and svT (context, [col][key]) never coexist: the
-     * score consumes sk, then context restages svT into the SAME buffer. This
-     * ~halves LDS (40KB->21KB) so 2 blocks fit per CU (VGPR-capped) instead of
-     * 1 — the kernel was occupancy-bound (MemUnit 20% / VALU 12%). */
+    /* Single staging buffer sk [key][k]. The context MFMA's B operand wants
+     * V^T [col][key], which used to be re-read from global into a second LDS
+     * layout — that re-read was a strict SUBSET of sk (c < KV_RANK <= KV_DIM),
+     * i.e. 8192 of the 17408 staged elements per tile were pure duplicate HBM
+     * traffic plus 8192 transposing ds_write_b16. Instead the B fragment is
+     * gathered straight out of sk with 4 strided ds_read_u16 (2-way bank
+     * conflict, ~32 cycles/wave/tile). Drops one barrier and 2KB of LDS. */
     constexpr int SKW = KV_DIM + KP;            /* sk row stride  */
-    constexpr int SVW = BK + KP;                /* svT row stride */
-    constexpr int BUF = BK * SKW > KV_RANK * SVW ? BK * SKW : KV_RANK * SVW;
-    __shared__ bf16_t sbuf[BUF];                /* sk | svT (aliased) */
+    static_assert(KV_DIM % 8 == 0 && SKW % 4 == 0, "vectorized staging");
+    __shared__ bf16_t sbuf[BK * SKW];           /* sk [key][k] */
     __shared__ bf16_t sp[MT][16][BK + KP];      /* P [mtile][head][key] */
     __shared__ float sresc[MT][16];             /* per-head rescale     */
     __shared__ float sl[MT][16];                /* per-head running sum */
     __shared__ float sm[MT][16];                /* per-head running max */
+    __shared__ float spart[MT][SPL - 1][16][16]; /* score partials -> lead   */
 
     const int wave = (int)threadIdx.x / HIP_WAVE;
     const int lane = (int)threadIdx.x & (HIP_WAVE - 1);
@@ -357,14 +370,16 @@ __global__ void flash_attention_mfma(
     const bool lead = (local == 0);              /* computes score for mtile */
     const int h_base = mtile * 16;
 
-    /* Q registers (lead wave only): Q[h_base+a_row][k], A-layout. */
-    bf16x4 q_reg[KT];
-    if (lead) {
+    /* Q registers: wave `local` (< SPL) owns k-tiles [local*KTW, +KTW) of
+     * Q[h_base+a_row][k] in A-layout. */
+    const bool scorer = (local < SPL);
+    bf16x4 q_reg[KTW];
+    if (scorer) {
 #pragma unroll
-        for (int t = 0; t < KT; ++t)
+        for (int t = 0; t < KTW; ++t)
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const int k = t * 16 + k4 + j;
+                const int k = (local * KTW + t) * 16 + k4 + j;
                 const int h = h_base + a_row;
                 float f = 0.0f;
                 if (h < HEADS)
@@ -374,31 +389,58 @@ __global__ void flash_attention_mfma(
                                 (k - KV_RANK)];
                 q_reg[t][j] = (short)gpu_f32_to_bf16(f);
             }
-        if (lane < 16) { sm[mtile][lane] = -INFINITY; sl[mtile][lane] = 0.0f; }
     }
+    if (lead && lane < 16) { sm[mtile][lane] = -INFINITY; sl[mtile][lane] = 0.0f; }
     fp32v4 o_acc[CTW] = {};
     __syncthreads();
 
     for (int k0 = 0; k0 < kv_len; k0 += BK) {
-        /* stage sk [key][k] into sbuf */
-        for (int i = (int)threadIdx.x; i < BK * KV_DIM; i += (int)blockDim.x) {
-            const int key = i / KV_DIM, k = i - key * KV_DIM;
-            sbuf[key * SKW + k] = (k0 + key < kv_len)
-                ? cache_b[(size_t)(k0 + key) * KV_DIM + k] : (bf16_t)0;
+        /* stage sk [key][k]: move 8 bf16 per step (one global dwordx4 + two
+         * ds_write_b64) instead of one ushort — 18+18 memory ops per thread
+         * become ~2.3+4.6. cache rows are 1152B apart so the source is 16B
+         * aligned; SKW*2=1160 leaves the LDS side 8B aligned, hence b64 pairs. */
+        constexpr int KCH = KV_DIM / 8;         /* 8-wide chunks per key */
+        for (int i = (int)threadIdx.x; i < BK * KCH; i += (int)blockDim.x) {
+            const int key = i / KCH, k = (i - key * KCH) * 8;
+            short v[8] = {};
+            if (k0 + key < kv_len)
+                *reinterpret_cast<bf16x8 *>(v) =
+                    *reinterpret_cast<const bf16x8 *>(
+                        &cache_b[(size_t)(k0 + key) * KV_DIM + k]);
+            bf16_t *dst = &sbuf[key * SKW + k];
+            *reinterpret_cast<bf16x4 *>(dst) =
+                *reinterpret_cast<const bf16x4 *>(v);
+            *reinterpret_cast<bf16x4 *>(dst + 4) =
+                *reinterpret_cast<const bf16x4 *>(v + 4);
         }
         __syncthreads();
 
-        if (lead) {
-            fp32v4 sacc = {};
+        /* every scorer wave: partial S over its own k-tiles. C-layout:
+         * sacc[i] = S[row=4*(lane>>4)+i, col=a_row(=key)] */
+        fp32v4 sacc = {};
+        if (scorer) {
 #pragma unroll
-            for (int t = 0; t < KT; ++t)
+            for (int t = 0; t < KTW; ++t)
                 sacc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
                     q_reg[t],
                     *reinterpret_cast<const bf16x4 *>(
-                        &sbuf[a_row * SKW + t * 16 + k4]),
+                        &sbuf[a_row * SKW + (local * KTW + t) * 16 + k4]),
                     sacc, 0, 0, 0);
-            /* C-layout: sacc[i] = S[row=4*(lane>>4)+i, col=a_row(=key)] */
+            if (!lead)
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    spart[mtile][local - 1][4 * (lane >> 4) + i][a_row] =
+                        sacc[i];
+        }
+        __syncthreads();   /* partials visible to the lead wave */
+
+        if (lead) {
             const int key_pos = k0 + a_row;
+#pragma unroll
+            for (int s = 0; s < SPL - 1; ++s)
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    sacc[i] += spart[mtile][s][4 * (lane >> 4) + i][a_row];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int row = 4 * (lane >> 4) + i;   /* head within tile */
@@ -423,29 +465,26 @@ __global__ void flash_attention_mfma(
                 }
             }
         }
-        __syncthreads();   /* P + stats visible; sbuf(sk) done being read */
+        __syncthreads();   /* P + stats visible; sk stays live for the B gather */
 
-        /* restage svT [col][key] into sbuf (overwrites sk) */
-        for (int i = (int)threadIdx.x; i < BK * KV_RANK; i += (int)blockDim.x) {
-            const int key = i / KV_RANK, c = i - key * KV_RANK;
-            sbuf[c * SVW + key] = (k0 + key < kv_len)
-                ? cache_b[(size_t)(k0 + key) * KV_DIM + c] : (bf16_t)0;
-        }
-        __syncthreads();
-
-        /* every wave: rescale its o_acc slab, then O += P @ V for its c-tiles */
+        /* every wave: rescale its o_acc slab, then O += P @ V for its c-tiles.
+         * B[k=key][col=c] is gathered column-wise out of sk: keys k4..k4+3 of
+         * latent column c live at sk[k4+j][c], stride SKW. */
 #pragma unroll
         for (int ct = 0; ct < CTW; ++ct) {
 #pragma unroll
             for (int i = 0; i < 4; ++i)
                 o_acc[ct][i] *= sresc[mtile][4 * (lane >> 4) + i];
+            const int c = (c0 + ct) * 16 + a_row;
+            bf16x4 bv;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                bv[j] = (short)sbuf[(k4 + j) * SKW + c];
             o_acc[ct] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
                 *reinterpret_cast<const bf16x4 *>(&sp[mtile][a_row][k4]),
-                *reinterpret_cast<const bf16x4 *>(
-                    &sbuf[((c0 + ct) * 16 + a_row) * SVW + k4]),
-                o_acc[ct], 0, 0, 0);
+                bv, o_acc[ct], 0, 0, 0);
         }
-        __syncthreads();
+        __syncthreads();   /* context done reading sk before it is restaged */
     }
 
     /* epilogue: divide by running sum, store (C-layout) */
